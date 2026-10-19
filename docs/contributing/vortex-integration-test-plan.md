@@ -38,7 +38,7 @@ The existing experiment pins Vortex 0.88.0 / PyArrow 22.0.0 and provides focused
 
 ## Correct local reader: Phase 1
 
-Implemented files: `tests/io/test_vortex.py`, `tests/io/test_vortex_native_tasks.py`, and unit tests in `src/daft-vortex/`.
+Implemented files: `tests/io/test_vortex.py`, `tests/io/test_vortex_native_tasks.py`, `tests/io/test_vortex_lifecycle.py`, and unit tests in `src/daft-vortex/`.
 
 | ID | Case | Required result |
 | --- | --- | --- |
@@ -62,11 +62,11 @@ Use direct Rust tests for zero-column conversion, Arrow ownership/type conversio
 
 ### Resource lifecycle
 
-Test normal exhaustion, explicit close/drop, exception after a batch, a slow downstream consumer, and cancellation during a blocked read. Use events/barriers rather than timing-sensitive sleeps. Track created/dropped readers and outstanding read requests; after cancellation, assert that new reads stop and outstanding work/resources are released within the specified contract.
+Phase 1 tests direct-reader ownership on EOF, exact task-limit completion, drop, errors after a batch, slow consumption, and cancellation during a blocked asynchronous read. Use events/barriers and record started/completed/cancelled reads, concurrent request bytes, and reader drops. Verify eventual source cleanup and continued validity of retained output batches. Cancellation of already-running blocking filesystem reads is best-effort.
 
 For the Python reference, `asyncio.to_thread` cannot interrupt a running `next()`: wait for it before closing the generator on another thread. Check direct-iterator streaming, but document the existing bridge's unbounded receiver and measure its extra buffering. Do not call that path end-to-end memory bounded.
 
-For the native reader, instrument produced/consumed batches and buffered bytes. A stalled consumer must respect the configured read/cache budgets; `batch_size` is a row bound, not a byte/RSS bound. Repeat with several concurrent file tasks and check total outstanding bytes/requests as well as per-reader bounds. Cancellation tests must include both the reader stream and an end-to-end query consumer.
+For end-to-end query consumers, test close/drop and error cleanup separately. The existing native executor has an unbounded result channel, and closing a consumer can await query completion; Phase 1 does not promise immediate query cancellation. Report observed reader I/O and buffering, without treating these measurements or `batch_size` as a hard RSS, global queue, or cache budget. Enforced I/O budgets, bounded query buffering, and query-cancellation responsiveness are explicitly deferred to Phase 3's I/O and scheduling work.
 
 **Gate:** supported local queries are correct; direct task semantics pass; schema/feature/lifecycle contracts hold. No native predicate-pushdown speed claim is needed.
 

@@ -248,6 +248,18 @@ pub async fn stream_vortex(
         )));
     }
     let (session, file) = open_file(uri).await?;
+    stream_opened_vortex(uri, session, file, read_options, convert_options)
+}
+
+// The returned stream owns the opened file and session until EOF, an error,
+// its exact limit, or consumer cancellation.
+fn stream_opened_vortex(
+    uri: &str,
+    session: VortexSession,
+    file: VortexFile,
+    read_options: VortexReadOptions,
+    convert_options: VortexConvertOptions,
+) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let (arrow_schema, actual_schema) = schemas(uri, &session, file.dtype())?;
     validate_schema(uri, &convert_options.schema, &actual_schema)?;
     let predicate = convert_options
@@ -336,3 +348,7 @@ pub async fn stream_vortex(
     })
     .boxed())
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;

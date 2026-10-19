@@ -2,7 +2,7 @@
 
 **Scope:** the personal `AYUSHNSUT/Daft` fork, branch `poc/vortex-phase1`.
 
-**Status:** experimental local reader implemented and tested with Vortex enabled and disabled. The dependency-budget check fails and remains a review gate. See the [design](vortex-integration-design.md) and [acceptance plan](vortex-integration-test-plan.md).
+**Status:** Phase 1 acceptance complete for the experimental local-reader scope, including reader lifecycle and public-consumer cleanup checks. The fork owner accepted the experimental dependency cost on October 20, 2026. See the [design](vortex-integration-design.md) and [acceptance plan](vortex-integration-test-plan.md).
 
 ## Using the reader
 
@@ -54,6 +54,8 @@ The reader currently decodes all physical columns and applies Daft filters/proje
 
 Vortex uses its local opener on the caller's Tokio runtime. Daft byte/request metrics are unavailable for those reads. Batch size bounds requested rows rather than bytes; Vortex's per-worker concurrency and prefetch are not a fixed end-to-end memory bound. Stream ownership tests do not establish cancellation latency or prove all background I/O stops immediately.
 
+The existing native executor uses an unbounded result channel and does not apply the public iterator's `results_buffer_size` to that channel. Closing a query consumer follows its finish path and can wait for execution. Phase 1 tests reader cleanup and consumer cleanup separately; bounded query buffering and prompt query-cancellation behavior remain Phase 3 scheduling work. Vortex also creates split descriptors and registers segment requests ahead of consumption, so a lazy batch stream alone does not bound descriptor, cache, or total query memory.
+
 These are correctness checks using development builds and small fixtures. No performance improvement has been established.
 
 ## Validation
@@ -65,22 +67,28 @@ CARGO_BUILD_JOBS=2 cargo test --offline --locked \
   --no-default-features -p daft-vortex
 ```
 
-All **ten Rust tests passed**. They generate real Vortex files and cover primitive values/nulls, unsigned boundaries, NaN payloads and signed zero, retained batches, residual/filter/projection/limit order, zero-column and zero-field cardinality, projected-away schema/nullability mismatches, unsupported types, and pathful failures. A file-URL regression creates distinct literal-percent and decoded-space filenames and verifies the literal-percent file is read.
+All **17 Rust reader tests passed**. They generate real Vortex files and cover primitive values/nulls, unsigned boundaries, NaN payloads and signed zero, retained batches, residual/filter/projection/limit order, zero-column and zero-field cardinality, projected-away schema/nullability mismatches, unsupported types, and pathful failures. A file-URL regression creates distinct literal-percent and decoded-space filenames and verifies the literal-percent file is read.
+
+Seven of those tests observe real positional reads through a recording/gated adapter over `FileReadAt`. They run the production scan pipeline with a supplied footer and coalescing disabled so payload reads are independently observable. Counters and notifications verify eventual reader release at EOF, exact limit without another consumer poll, early drop, and a source error after earlier output. Aborting a consumer blocked on a gated async read cancels queued futures without opening the gate. Three separate files cancel independently and release their reader owners and outstanding async requests. Retained batches remain usable after cleanup.
+
+The controlled slow-consumer fixture on this 10-worker machine has 32 chunks: positional reads return 9,856 bytes and emitted batches sum to 2,048 bytes according to `RecordBatch::size_bytes()`, with peaks of 10 active reads and 3,080 in-flight requested bytes. Three concurrently blocked files register 3,696 in-flight requested bytes before cancellation. These are instrumented fixture observations, not disk-device I/O measurements or production byte limits: the normal opener can cache initial segments, coalescing can read neighboring segments, and Vortex creates split descriptors ahead of consumption.
 
 Public and direct task tests use the rebuilt extension:
 
 ```bash
 DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/pytest -n 0 -rs \
-  tests/io/test_vortex.py tests/io/test_vortex_native_tasks.py
+  tests/io/test_vortex.py tests/io/test_vortex_native_tasks.py tests/io/test_vortex_lifecycle.py
 ```
 
-The enabled Python API and direct-task suites passed **82 tests without skips**. Three focused Rust format/scan tests passed: enum ordinal compatibility, full-schema serialization with clean output metadata/unknown statistics, and explicit generic-glob rejection. The generic count suite passed **7 tests**, and the existing Phase 0 harness passed **53**.
+The enabled Python API, direct-task, and lifecycle suites passed **89 tests without skips**. Seven public-consumer cases cover explicit close, garbage-collected drop, consumer exceptions, EOF, and a later corrupt-file query. They verify executor plan-registry cleanup and retained Arrow values/buffer bytes without holding independent buffer owners that could mask lifetime errors. They do not claim immediate query cancellation.
 
-A final combined run with the restored Vortex-enabled extension passed **193 tests, with 5 deselected and none skipped**: the 82 Vortex cases, 7 count cases, 53 harness cases, and 51 existing native-task/join/Parquet regressions.
+Three focused Rust format/scan tests also passed: enum ordinal compatibility, full-schema serialization with clean output metadata/unknown statistics, and explicit generic-glob rejection, bringing Phase 1's focused Rust total to **20**. The generic count suite passed **7 tests**, and the existing Phase 0 harness passed **53**.
+
+A final combined run with the restored Vortex-enabled extension passed **200 tests, with 5 deselected and none skipped**: the 89 Vortex cases, 7 count cases, 53 harness cases, and 51 existing native-task/join/Parquet regressions.
 
 ```bash
 DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/pytest -n 0 -rs \
-  tests/io/test_vortex.py tests/io/test_vortex_native_tasks.py \
+  tests/io/test_vortex.py tests/io/test_vortex_native_tasks.py tests/io/test_vortex_lifecycle.py \
   tests/dataframe/test_count.py examples/vortex_eval \
   tests/io/test_native_tasks.py tests/io/test_datasource_join.py tests/io/test_parquet.py
 ```
@@ -96,7 +104,9 @@ DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/python examples/vortex_eval/bas
 
 Use your generated fixture manifest path if it differs from this recorded run.
 
-Existing I/O regressions ran with the enabled extension: **111 passed, 44 failed, 1 skipped, 5 deselected**. All native-task (11), data-source join (3), and Parquet (37) cases passed. ORC had 38 passes and 40 failures from `sysctlbyname('hw.l1dcachesize')`; the same error reproduces in a standalone PyArrow-only read. MCAP had 22 passes and four failures: one Hugging Face DNS lookup and three localhost socket-bind permission errors. Its S3 case was skipped because S3 configuration is absent. These restrictions remain failures, rather than counted as passes or disabled.
+The first agent-run I/O regressions reported **111 passed, 44 failed, 1 skipped, 5 deselected**. All native-task (11), data-source join (3), and Parquet (37) cases passed. The 44 ORC/MCAP failures hit agent-environment restrictions: macOS `sysctlbyname('hw.l1dcachesize')`, Hugging Face DNS, and localhost socket binding. The ORC error also reproduced in standalone PyArrow.
+
+The fork owner reran the complete ORC/MCAP selection in an unrestricted terminal: **104 passed, 1 skipped in 8.72 seconds**, with all 105 cases collected. The sole skip is the S3 case because S3 configuration is absent. The supplied `/tmp/daft-phase1-io.log` was reviewed; these results clear the earlier environment-related failures without changing or disabling tests.
 
 ```bash
 DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/pytest -n 0 -rs \
@@ -107,13 +117,13 @@ DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/pytest -n 0 \
   tests/dataframe/test_count.py examples/vortex_eval
 ```
 
-Both Python-extension configurations built successfully. Without the native feature, the same Vortex suites report **27 passed and 55 skipped**, with all skips explicitly requiring the disabled feature. A fresh process imported Daft, ran an ordinary query, and confirmed that a Vortex call raises the documented enablement error. The pure-Rust feature-off executor check also passed.
+Both Python-extension configurations were rebuilt successfully after the lifecycle changes. Without the native feature, the same Vortex suites report **27 passed and 62 skipped**, with all skips explicitly requiring the disabled feature. A fresh process imported Daft, ran an ordinary query, and confirmed that a Vortex call raises the documented enablement error. The pure-Rust feature-off executor check also passed.
 
 All applicable pre-commit hooks passed on the changed files, including strict mypy, pinned Ruff, formatting, dependency validation, and workspace/all-feature/all-target Clippy with `-D warnings`. The initial attempt failed in the dashboard frontend build because Turbopack could not bind a localhost socket. The successful retry used the existing debug option `DAFT_DASHBOARD_SKIP_BUILD=1`, omitting dashboard assets while retaining every Rust lint. The reader's separate all-target Clippy check also passed. `cargo machete` could not run because the tool is not installed.
 
 The complete workspace unit suite and complete Python suite were not run.
 
-Local diagnostic logs are under the ignored `examples/vortex_eval/artifacts/phase1/` directory. Resource tests establish retained-batch validity and safe reader ownership; explicit blocked-read cancellation timing, aggregate prefetch/memory instrumentation, and cloud-worker behavior remain unverified.
+Local diagnostic logs are under the ignored `examples/vortex_eval/artifacts/phase1/` directory, including `native-lifecycle-{tests,clippy}.log`, `closure-{enabled,disabled}-tests.log`, and the reviewed user-run `io-unrestricted.log`. Reader lifecycle and controlled request-byte instrumentation are verified. Hard end-to-end memory budgets, prompt query-cancellation latency, interruption of running blocking OS reads, and cloud-worker behavior are outside this phase's acceptance claim; the first two remain explicit Phase 3 work.
 
 ## Dependency impact and existing budget
 
@@ -121,7 +131,7 @@ The root lockfile was resolved offline while retaining the existing Azure SDK be
 
 Compared with the pre-Phase-1 root lock, resolution adds **106 external package/version/source identities** and removes **12**. This measures the actual workspace update, rather than the independently resolved standalone probe graph from Phase 0.
 
-The repository's existing dependency-budget script reports **107 added packages and 12 removed, a net 95**, because its current implementation also counts the new local reader package. That exceeds its limit of 25 and the check returns failure. The budget and workflow have not been weakened. A fork policy exception or a different dependency strategy remains a review decision before merging this feature.
+The repository's existing dependency-budget script reports **107 added packages and 12 removed, a net 95**, because its current implementation also counts the new local reader package. That exceeds its limit of 25 and the check returns failure. On October 20, 2026, the fork owner accepted this dependency cost for the experiment in `AYUSHNSUT/Daft` (PR #3). This is a documented fork-only review exception; it does not make the budget check pass or change its limit or workflow.
 
 ```bash
 .venv/bin/python .github/ci-scripts/rust_lockfile_diff.py \
