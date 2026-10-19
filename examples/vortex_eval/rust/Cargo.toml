@@ -1,0 +1,22 @@
+[package]
+name = "daft-vortex-compatibility-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately isolated: dependency experiments and this package's lockfile must
+# not change Daft's production workspace or feature graph.
+[workspace]
+resolver = "3"
+
+[dependencies]
+anyhow = "1.0"
+arrow-array = "=59.2.0"
+arrow-cast = "=59.2.0"
+arrow-schema = "=59.2.0"
+daft-recordbatch = { path = "../../../src/daft-recordbatch", default-features = false }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+vortex = { version = "=0.88.0", default-features = false, features = ["files", "tokio", "zstd"] }

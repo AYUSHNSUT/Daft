@@ -1,0 +1,3 @@
+# Optional Phase 0 tools only; not Daft runtime dependencies.
+vortex-data==0.88.0
+pyarrow==22.0.0
