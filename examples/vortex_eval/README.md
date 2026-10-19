@@ -1,9 +1,10 @@
 # Vortex evaluation: Phase 0
 
-This personal-fork experiment checks fixture correctness, an optional Python
-reader, and native Vortex-to-Daft batch compatibility. It does **not** implement a
-native Daft Vortex connector. Results and outstanding checks are recorded in the
+The Phase 0 tools check fixture correctness, an optional Python reader, and
+native Vortex-to-Daft batch compatibility. Their historical results are in the
 [Phase 0 report](../../docs/contributing/vortex-phase0-results.md).
+This branch also implements the experimental Phase 1 native connector; see
+[setup, validation, and limits](../../docs/contributing/vortex-phase1-results.md).
 
 Run the commands below from the repository root, using a working source-built
 Daft environment. See the [development guide](../../docs/contributing/development.md)
@@ -35,7 +36,7 @@ files are read back before the completion manifest is written. The multiple-file
 layout starts with an empty file to exercise schema discovery. Use a new or empty
 output directory for each generation.
 
-## Capture the two baselines
+## Capture reader baselines
 
 ```bash
 DAFT_RUNNER=native .venv/bin/python examples/vortex_eval/baseline.py \
@@ -47,6 +48,12 @@ DAFT_RUNNER=native .venv/bin/python examples/vortex_eval/baseline.py \
   --manifest examples/vortex_eval/artifacts/fixtures/manifest.json \
   --source vortex-reference --batch-size 7 --repeats 5 \
   --output examples/vortex_eval/artifacts/vortex-reference.json
+
+# Requires the extension built with Rust features python,vortex.
+DAFT_RUNNER=native .venv/bin/python examples/vortex_eval/baseline.py \
+  --manifest examples/vortex_eval/artifacts/fixtures/manifest.json \
+  --source vortex-native --batch-size 7 --repeats 5 \
+  --output examples/vortex_eval/artifacts/vortex-native.json
 ```
 
 Each source runs a full scan, a filter with projection, and an aggregation over

@@ -1,0 +1,36 @@
+[dependencies]
+arrow-array = {workspace = true}
+arrow-schema = {workspace = true}
+common-error = {path = "../common/error", default-features = false}
+common-runtime = {path = "../common/runtime", default-features = false, optional = true}
+daft-core = {path = "../daft-core", default-features = false}
+daft-dsl = {path = "../daft-dsl", default-features = false}
+daft-recordbatch = {path = "../daft-recordbatch", default-features = false}
+futures = {workspace = true}
+pyo3 = {workspace = true, optional = true}
+tokio = {workspace = true}
+url = {workspace = true}
+vortex = {workspace = true}
+
+[dev-dependencies]
+arrow = {workspace = true}
+tempfile = "3.23.0"
+
+[features]
+python = [
+  "dep:pyo3",
+  "dep:common-runtime",
+  "common-error/python",
+  "common-runtime/python",
+  "daft-core/python",
+  "daft-dsl/python",
+  "daft-recordbatch/python"
+]
+
+[lints]
+workspace = true
+
+[package]
+edition = {workspace = true}
+name = "daft-vortex"
+version = {workspace = true}

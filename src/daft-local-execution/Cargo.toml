@@ -43,6 +43,7 @@ daft-scan = {path = "../daft-scan", default-features = false}
 daft-shuffles = {path = "../daft-shuffles", default-features = false}
 daft-warc = {path = "../daft-warc", default-features = false}
 daft-writers = {path = "../daft-writers", default-features = false}
+daft-vortex = {path = "../daft-vortex", default-features = false, optional = true}
 futures = {workspace = true}
 indexmap = {workspace = true}
 indicatif = {workspace = true}
@@ -67,6 +68,7 @@ sysinfo = {workspace = true}
 tikv-jemalloc-ctl = {version = "0.7.0", features = ["stats"]}
 
 [features]
+vortex = ["dep:daft-vortex", "daft-scan/vortex", "daft-logical-plan/vortex"]
 python = [
   "dep:pyo3",
   "dep:pyo3-async-runtimes",
@@ -86,6 +88,7 @@ python = [
   "daft-micropartition/python",
   "daft-partition-refs/python",
   "daft-scan/python",
+  "daft-vortex?/python",
   "daft-writers/python",
   "daft-text/python"
 ]

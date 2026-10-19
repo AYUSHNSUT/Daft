@@ -1,14 +1,14 @@
 # Vortex read support: design and delivery plan
 
-**Status:** Phase 0 complete for the recorded versions and primitive fixtures; see the [compatibility results](vortex-phase0-results.md). Native connector work has not started.
+**Status:** Phase 0 complete; the Phase 1 native local reader is implemented behind the experimental `vortex` feature. See the [compatibility results](vortex-phase0-results.md) and [Phase 1 implementation and validation](vortex-phase1-results.md), including the dependency cost accepted for this fork.
 
-**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, Phase 0 branch `poc/vortex-phase0`.
+**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, implementation branch `poc/vortex-phase1`.
 
 **Design baseline:** `d3cd974150ba93dbbe8efef8370b129538fcee4b`; reviewed October 20, 2026.
 
 **Companion:** [test and benchmark plan](vortex-integration-test-plan.md).
 
-**Current experiment:** [Phase 0 instructions](../../examples/vortex_eval/README.md) and [verified results / remaining gates](vortex-phase0-results.md).
+**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md) and [native reader setup, results, and limits](vortex-phase1-results.md).
 
 ## Summary
 
@@ -20,7 +20,7 @@ This is a plan for this personal fork, not an announced upstream feature. It fit
 
 ## Problem and expected benefit
 
-Daft has no built-in Vortex reader in this checkout; the Phase 0 reference lives outside the public API. Converting an entire dataset to Parquet or an in-memory Arrow table before giving it to Daft prevents us from evaluating Vortex as a scan source.
+At the design baseline, Daft had no built-in Vortex reader; the Phase 0 reference lives outside the public API. Converting an entire dataset to Parquet or an in-memory Arrow table before giving it to Daft prevents us from evaluating Vortex as a scan source. Phase 1 now provides that native scan boundary for local files.
 
 Vortex supplies file metadata, compressed encodings, scanning, and Arrow export. Daft should continue to own query planning, task scheduling, joins, aggregations, and downstream execution. The integration boundary is a stream of Arrow-compatible batches, not a replacement execution engine.
 
@@ -28,7 +28,7 @@ The hypothesis is that some workloads benefit from cheaper reads, selective colu
 
 ## Scope and proposed API
 
-The following is a proposed fork API, not an API available on this branch today:
+The experimental fork API is available when built with Rust features `python,vortex`:
 
 ```python
 import daft
@@ -39,7 +39,7 @@ result = df.where(col("value") >= 20).select("id").limit(100)
 result.show()
 ```
 
-Proposed signature: `read_vortex(path: str | list[str], io_config: IOConfig | None = None, batch_size: int = 131072) -> DataFrame`.
+Signature: `read_vortex(path: str | Path | list[str | Path], io_config: IOConfig | None = None, batch_size: int = 131072) -> DataFrame`. Explicit `io_config` is reserved for Phase 3 and currently rejected; use `None` for local reads.
 
 | Capability | First native milestone | Later phases |
 | --- | --- | --- |
@@ -105,7 +105,7 @@ Use Daft's existing [`RecordBatch::try_from(&arrow_array::RecordBatch)`](../../s
 
 Zero-column batches need an explicit row-count-preserving construction: the ordinary `RecordBatch::from_arrow` path rejects zero arrays. Cover `count_rows()`, literal-only projections, and empty results from the beginning.
 
-Keep Vortex sessions, open handles, and caches in worker-local execution state. Serialize paths/configuration and, later, row ranges; reopen the file on the worker. Use Daft's runtime and bounded native streams rather than creating a runtime or thread pool per batch. Dropping the stream must stop new reads and release outstanding work safely.
+Keep Vortex sessions, open handles, and caches in worker-local execution state. Serialize paths/configuration and, later, row ranges; reopen the file on the worker. Use Daft's runtime and native batch streams rather than creating a runtime or thread pool per batch. Dropping a direct reader stream must release its owners and cancel pending asynchronous work; already-running blocking reads may finish. Query-consumer close follows the existing executor finish path, which can await completion and does not establish prompt query cancellation or bounded result buffering.
 
 The current source wrapper collects task descriptors before execution. One task per file follows that behavior; it does not establish fully streaming file discovery or scalability to arbitrarily many tiny files.
 
@@ -119,7 +119,7 @@ Research on October 20 found **Vortex 0.88.0** as the latest release, published 
 | Native Arrow | Daft requests Arrow 59.0.0; Vortex's release manifest requests 59.2 | Confirm resolution to one compatible Arrow family and review lockfile changes |
 | Python Arrow | Daft permits PyArrow >=16,<26 | Verify the fixture tool's selected wheel/PyArrow combination separately |
 | Vortex API | Session-based file opens and scan APIs are available; library APIs evolve | Hide Vortex types behind the new reader crate and pin the tested version |
-| Storage/runtime | Both systems provide I/O scheduling and buffering | Set explicit concurrency/cache budgets; avoid multiplying thread pools |
+| Storage/runtime | Both systems provide I/O scheduling and buffering | Reuse Daft's runtime; measure concurrency in Phase 1 and enforce budgets in Phase 3 |
 
 The dependency and feature observations come from the [0.88.0 workspace manifest](https://github.com/vortex-data/vortex/blob/0.88.0/Cargo.toml) and [public crate manifest](https://github.com/vortex-data/vortex/blob/0.88.0/vortex/Cargo.toml). Vortex recommends external integrations depend on its public `vortex` crate rather than internal crates. [Architecture guidance](https://docs.vortex.dev/developer-guide/internals/architecture).
 
@@ -165,7 +165,7 @@ Use half-open row ranges for any future intra-file splits. Do not use byte offse
 
 ## Expected code changes
 
-These are proposed touchpoints, not files already modified by this design.
+Phase 1 implements the native-reader touchpoints below. Expression/I/O adapters, dedicated performance benchmarks, and public connector navigation remain later work.
 
 | Area | Files / responsibility |
 | --- | --- |
@@ -196,7 +196,7 @@ Keep the reader crate below the scan layer: it accepts reader-owned options and 
 | Library/API and encoding compatibility drift | Pin the tested release and writer options; maintain compatibility fixtures; isolate Vortex-specific types |
 | Conversion erases scan benefits | Measure scan, conversion, and end-to-end time separately; do not expand scope into compressed Daft operators |
 | Incorrect pruning, limits, or missing filter columns | Residual-first correctness contract and differential tests before optimization |
-| Reader/executor concurrency multiplies memory use | Explicit cache/read budgets; slow-consumer and cancellation tests; no unbounded queues in the native reader |
+| Reader/executor concurrency multiplies memory use | Measure reader concurrency and cleanup in Phase 1; define and enforce end-to-end budgets and cancellation behavior in Phase 3 |
 | New dependencies exceed existing CI budget | Inventory the graph in Phase 0; justify any fork-specific policy change explicitly |
 | One-task-per-file underuses a large single file | Use several files initially; compare equal parallelism; add tested row-range splitting only when measurements justify it |
 | Local success is mistaken for cloud/distributed support | Separate per-scheme and Ray gates; never serialize open handles or credentials into diagnostics |

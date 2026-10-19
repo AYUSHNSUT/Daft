@@ -7,6 +7,8 @@ use daft_io::{GetRange, IOStatsRef};
 use daft_json::{JsonConvertOptions, JsonParseOptions, JsonReadOptions};
 use daft_parquet::read::{ParquetReadOptions, ParquetSchemaInferenceOptions};
 use daft_recordbatch::RecordBatch;
+#[cfg(feature = "vortex")]
+use daft_scan::VortexSourceConfig;
 use daft_scan::{
     ChunkSpec, CsvSourceConfig, FileFormatConfig, JsonSourceConfig, McapSourceConfig,
     ParquetSourceConfig, ScanTask, SourceConfig, TextSourceConfig,
@@ -83,6 +85,15 @@ pub(crate) async fn read_scan_task(
             FileFormatConfig::Mcap(cfg) => {
                 read_mcap(scan_task, cfg, url, file_column_names, io_client, io_stats).await
             }
+            #[cfg(feature = "vortex")]
+            FileFormatConfig::Vortex(cfg) => {
+                read_vortex(scan_task, cfg, url, file_column_names).await
+            }
+            #[cfg(not(feature = "vortex"))]
+            FileFormatConfig::Vortex(_) => Err(common_error::DaftError::NotImplemented(
+                "Vortex support is not enabled in this build; rebuild Daft with the 'vortex' Cargo feature"
+                    .to_string(),
+            )),
         },
         #[cfg(feature = "python")]
         SourceConfig::Database(cfg) => read_database(scan_task, cfg).await,
@@ -342,6 +353,30 @@ async fn read_mcap(
         limit: scan_task.pushdowns.limit,
     };
     daft_mcap::stream_mcap(url, io_client, io_stats, read_options, convert_options).await
+}
+
+#[cfg(feature = "vortex")]
+async fn read_vortex(
+    scan_task: &ScanTask,
+    cfg: &VortexSourceConfig,
+    url: &str,
+    file_column_names: Option<Vec<String>>,
+) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
+    if scan_task.pushdowns.aggregation.is_some() {
+        return Err(common_error::DaftError::NotImplemented(
+            "The experimental Vortex reader does not support aggregation pushdowns".to_string(),
+        ));
+    }
+    let read_options = daft_vortex::VortexReadOptions {
+        batch_size: cfg.batch_size,
+    };
+    let convert_options = daft_vortex::VortexConvertOptions {
+        schema: scan_task.schema.clone(),
+        predicate: scan_task.pushdowns.filters.clone(),
+        include_columns: file_column_names,
+        limit: scan_task.pushdowns.limit,
+    };
+    daft_vortex::stream_vortex(url, read_options, convert_options).await
 }
 
 async fn read_text(

@@ -245,13 +245,14 @@ class ResourceRequest:
 class FileFormat(Enum):
     """Format of a file."""
 
-    Parquet = 1
-    Csv = 2
-    Json = 3
-    Warc = 4
-    Text = 5
-    Mcap = 6
-    Avro = 7
+    Parquet = 0
+    Csv = 1
+    Json = 2
+    Warc = 3
+    Text = 4
+    Mcap = 5
+    Avro = 6
+    Vortex = 7
 
     def ext(self) -> str: ...
 
@@ -349,6 +350,13 @@ class McapSourceConfig:
         topics: list[str] | None = None,
     ) -> None: ...
 
+class VortexSourceConfig:
+    """Experimental native Vortex source configuration."""
+
+    batch_size: int
+
+    def __init__(self, batch_size: int = 131072) -> None: ...
+
 class DatabaseSourceConfig:
     """Configuration of a database data source."""
 
@@ -386,6 +394,7 @@ class FileFormatConfig:
         | TextSourceConfig
         | AvroSourceConfig
         | McapSourceConfig
+        | VortexSourceConfig
     )
 
     @staticmethod
@@ -408,6 +417,10 @@ class FileFormatConfig:
     def from_mcap_config(config: McapSourceConfig) -> FileFormatConfig:
         """Create an MCAP file format config."""
         ...
+
+    @staticmethod
+    def from_vortex_config(config: VortexSourceConfig) -> FileFormatConfig:
+        """Create an experimental Vortex file format config."""
 
     @staticmethod
     def from_avro_config(config: AvroSourceConfig) -> FileFormatConfig:
@@ -1318,6 +1331,21 @@ class PyDataSourceTask:
         stats: PyRecordBatch | None = None,
         storage_config: StorageConfig | None = None,
     ) -> PyDataSourceTask: ...
+    @staticmethod
+    def vortex(
+        path: str,
+        schema: PySchema,
+        *,
+        vortex_config: VortexSourceConfig | None = None,
+        pushdowns: PyPushdowns | None = None,
+        num_rows: int | None = None,
+        size_bytes: int | None = None,
+        stats: PyRecordBatch | None = None,
+        storage_config: StorageConfig | None = None,
+    ) -> PyDataSourceTask: ...
+
+def read_vortex_schema(path: str) -> PySchema:
+    """Infer a supported local Vortex schema; available with the vortex feature."""
 
 class ScanOperatorHandle:
     """A handle to a scan operator."""

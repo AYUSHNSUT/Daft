@@ -18,7 +18,7 @@ from daft.daft import (
     logical_plan_table_scan,
 )
 from daft.daft import LogicalPlanBuilder as _LogicalPlanBuilder
-from daft.expressions import Expression, col
+from daft.expressions import Expression, col, lit
 from daft.logical.schema import Schema
 
 if TYPE_CHECKING:
@@ -206,12 +206,19 @@ class LogicalPlanBuilder:
         return LogicalPlanBuilder(builder)
 
     def count(self) -> LogicalPlanBuilder:
-        cheapest_col_name = self.schema()._schema.min_estimated_size_column()
+        schema = self.schema()
+        builder = self._builder
+        cheapest_col_name = schema._schema.min_estimated_size_column()
         if cheapest_col_name is None:
-            cheapest_col_name = self.schema().column_names()[0]
+            column_names = schema.column_names()
+            if column_names:
+                cheapest_col_name = column_names[0]
+            else:
+                cheapest_col_name = "count"
+                builder = builder.select([lit(1).alias(cheapest_col_name)._expr])
 
         cheapest_col = col(cheapest_col_name)
-        builder = self._builder.aggregate([cheapest_col.count(CountMode.All)._expr], [])
+        builder = builder.aggregate([cheapest_col.count(CountMode.All)._expr], [])
         builder = builder.select([cheapest_col.alias("count")._expr])
         return LogicalPlanBuilder(builder)
 

@@ -113,6 +113,11 @@ python = [
   "daft-writers/python"
 ]
 hdfs = ["daft-io/hdfs"]
+vortex = [
+  "daft-local-execution/vortex",
+  "daft-logical-plan/vortex",
+  "daft-scan/vortex"
+]
 
 [lib]
 crate-type = ["cdylib"]
@@ -238,6 +243,7 @@ members = [
   "src/daft-shuffles",
   "src/daft-sketch",
   "src/daft-sql",
+  "src/daft-vortex",
   "src/daft-recordbatch",
   "src/daft-warc",
   "src/daft-writers",
@@ -317,6 +323,7 @@ daft-scan = {path = "src/daft-scan"}
 daft-schema = {path = "src/daft-schema"}
 daft-session = {path = "src/daft-session"}
 daft-sql = {path = "src/daft-sql"}
+daft-vortex = {path = "src/daft-vortex", default-features = false}
 dashmap = "6.2"
 educe = "0.6.0"
 futures = "0.3.30"
@@ -387,6 +394,7 @@ typetag = "0.2.21"
 rustfft = "6"
 url = "2.4.0"
 uuid = {version = "1.19.0", features = ["v4", "v7", "serde", "fast-rng"]}
+vortex = {version = "=0.88.0", default-features = false, features = ["files", "tokio", "zstd"]}
 xxhash-rust = {version = "0.8.15", features = ["const_xxh3", "const_xxh64", "const_xxh32", "xxh64", "xxh3", "xxh32"]}
 libc = {version = "^0.2.150", default-features = false}
 hex = "0.4.3"

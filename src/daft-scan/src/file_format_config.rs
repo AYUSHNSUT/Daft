@@ -26,6 +26,7 @@ pub enum FileFormatConfig {
     Text(TextSourceConfig),
     Avro(AvroSourceConfig),
     Mcap(McapSourceConfig),
+    Vortex(VortexSourceConfig),
 }
 #[cfg(not(debug_assertions))]
 impl std::fmt::Debug for FileFormatConfig {
@@ -50,6 +51,7 @@ impl FileFormatConfig {
             Self::Text(_) => "Text".to_string(),
             Self::Avro(_) => "Avro".to_string(),
             Self::Mcap(_) => "Mcap".to_string(),
+            Self::Vortex(_) => "Vortex".to_string(),
         }
     }
 
@@ -63,6 +65,7 @@ impl FileFormatConfig {
             Self::Text(source) => source.multiline_display(),
             Self::Avro(source) => source.multiline_display(),
             Self::Mcap(source) => source.multiline_display(),
+            Self::Vortex(source) => source.multiline_display(),
         }
     }
 }
@@ -77,6 +80,7 @@ impl From<&FileFormatConfig> for FileFormat {
             FileFormatConfig::Text(_) => Self::Text,
             FileFormatConfig::Avro(_) => Self::Avro,
             FileFormatConfig::Mcap(_) => Self::Mcap,
+            FileFormatConfig::Vortex(_) => Self::Vortex,
         }
     }
 }
@@ -527,6 +531,47 @@ impl McapSourceConfig {
 }
 
 impl_bincode_py_state_serialization!(McapSourceConfig);
+
+/// Configuration for the experimental native Vortex data source.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(
+    feature = "python",
+    pyclass(module = "daft.daft", get_all, from_py_object)
+)]
+pub struct VortexSourceConfig {
+    pub batch_size: usize,
+}
+
+impl Default for VortexSourceConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 131_072,
+        }
+    }
+}
+
+impl VortexSourceConfig {
+    #[must_use]
+    pub fn multiline_display(&self) -> Vec<String> {
+        vec![format!("Batch size = {}", self.batch_size)]
+    }
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl VortexSourceConfig {
+    #[new]
+    #[pyo3(signature = (batch_size=131_072))]
+    fn new(batch_size: usize) -> PyResult<Self> {
+        if batch_size == 0 {
+            return Err(PyValueError::new_err("Vortex batch_size must be positive"));
+        }
+        Ok(Self { batch_size })
+    }
+}
+
+impl_bincode_py_state_serialization!(VortexSourceConfig);
 
 /// Configuration for a Text data source.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]

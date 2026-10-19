@@ -9,6 +9,7 @@ from daft.daft import McapSourceConfig, ParquetSourceConfig, PyDataSourceTask, S
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
+    from daft.daft import VortexSourceConfig
     from daft.dataframe import DataFrame
     from daft.io.clustering import ClusteringKeys
     from daft.io.partitioning import PartitionField
@@ -245,6 +246,41 @@ class DataSourceTask(ABC):
             storage_config=storage_config,
         )
 
+        return _RustDataSourceTask(inner)
+
+    @staticmethod
+    def vortex(
+        path: str,
+        schema: Schema,
+        *,
+        vortex_config: VortexSourceConfig | None = None,
+        pushdowns: Pushdowns | None = None,
+        num_rows: int | None = None,
+        size_bytes: int | None = None,
+        stats: RecordBatch | None = None,
+        storage_config: StorageConfig | None = None,
+    ) -> DataSourceTask:
+        """Create an experimental native Vortex task for a local file.
+
+        Requires a ``python,vortex`` build and the native runner. Pass the full
+        schema inferred by ``daft.daft.read_vortex_schema``, preserving its
+        reserved nullability metadata. Predicates are residual Daft filters;
+        columns needed by them are retained alongside projected output.
+        """
+        from daft.io._vortex import _require_native_runner, _require_vortex
+
+        _require_native_runner()
+        _require_vortex()
+        inner = PyDataSourceTask.vortex(
+            path=path,
+            schema=schema._schema,
+            vortex_config=vortex_config,
+            pushdowns=pushdowns._to_pypushdowns() if pushdowns is not None else None,
+            num_rows=num_rows,
+            size_bytes=size_bytes,
+            stats=stats._recordbatch if stats is not None else None,
+            storage_config=storage_config,
+        )
         return _RustDataSourceTask(inner)
 
 

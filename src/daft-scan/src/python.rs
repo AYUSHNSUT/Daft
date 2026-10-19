@@ -19,8 +19,8 @@ pub use wrappers::{PyDataSourceTaskWrapper, PyDataSourceWrapper};
 use crate::{
     CsvSourceConfig, DataSourceRef, DataSourceTaskRef, FileFormatConfig, JsonSourceConfig,
     McapSourceConfig, ParquetSourceConfig, ScanSource, ScanSourceKind, ScanTask, SourceConfig,
-    TextSourceConfig, WarcSourceConfig, clustering::PyClusteringKeys, source::ShimSourceTask,
-    storage_config::StorageConfig,
+    TextSourceConfig, VortexSourceConfig, WarcSourceConfig, clustering::PyClusteringKeys,
+    source::ShimSourceTask, storage_config::StorageConfig,
 };
 
 /// A Rust [`DataSource`] exposed as a Python object.
@@ -213,6 +213,98 @@ impl PyDataSourceTask {
             None,
         )
     }
+
+    /// Create a task that reads a local Vortex file using the native reader.
+    #[allow(clippy::too_many_arguments)]
+    #[staticmethod]
+    #[pyo3(signature = (
+        path,
+        schema,
+        *,
+        vortex_config = None,
+        pushdowns = None,
+        num_rows = None,
+        size_bytes = None,
+        stats = None,
+        storage_config = None,
+    ))]
+    fn vortex(
+        path: String,
+        schema: PySchema,
+        vortex_config: Option<VortexSourceConfig>,
+        pushdowns: Option<pylib_scan_info::PyPushdowns>,
+        num_rows: Option<i64>,
+        size_bytes: Option<u64>,
+        stats: Option<PyRecordBatch>,
+        storage_config: Option<StorageConfig>,
+    ) -> PyResult<Self> {
+        #[cfg(not(feature = "vortex"))]
+        {
+            let _ = (
+                path,
+                schema,
+                vortex_config,
+                pushdowns,
+                num_rows,
+                size_bytes,
+                stats,
+                storage_config,
+            );
+            Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "Vortex support is not enabled in this build; rebuild Daft with the 'vortex' Cargo feature",
+            ))
+        }
+        #[cfg(feature = "vortex")]
+        {
+            let vortex_config = vortex_config.unwrap_or_default();
+            if vortex_config.batch_size == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Vortex batch_size must be positive",
+                ));
+            }
+            let (source_type, _) =
+                daft_io::parse_url(&path).map_err(common_error::DaftError::from)?;
+            if source_type != daft_io::SourceType::File {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "The experimental Vortex reader supports local files only",
+                ));
+            }
+            if storage_config
+                .as_ref()
+                .is_some_and(|config| config.io_config.is_some())
+            {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "The experimental Vortex reader does not support IOConfig",
+                ));
+            }
+            if num_rows.is_some() || stats.is_some() {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "The experimental Vortex reader does not support row-count or column statistics metadata",
+                ));
+            }
+            if pushdowns
+                .as_ref()
+                .is_some_and(|pushdowns| pushdowns.0.aggregation.is_some())
+            {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "The experimental Vortex reader does not support aggregation pushdowns",
+                ));
+            }
+            // Keep the complete inferred schema, including source nullability metadata.
+            Self::new_file_task(
+                path,
+                schema,
+                FileFormatConfig::Vortex(vortex_config),
+                pushdowns,
+                None,
+                size_bytes,
+                None,
+                None,
+                storage_config,
+                None,
+            )
+        }
+    }
 }
 
 /// Configuration for parsing a particular file format.
@@ -269,6 +361,12 @@ impl PyFileFormatConfig {
         Self(Arc::new(FileFormatConfig::Avro(config)))
     }
 
+    /// Create a Vortex file format config.
+    #[staticmethod]
+    fn from_vortex_config(config: VortexSourceConfig) -> Self {
+        Self(Arc::new(FileFormatConfig::Vortex(config)))
+    }
+
     /// Get the underlying data source config.
     #[getter]
     fn get_config(&self, py: Python) -> PyResult<Py<PyAny>> {
@@ -298,6 +396,10 @@ impl PyFileFormatConfig {
                 .into_pyobject(py)
                 .map(|c| c.unbind().into_any()),
             FileFormatConfig::Mcap(config) => config
+                .clone()
+                .into_pyobject(py)
+                .map(|c| c.unbind().into_any()),
+            FileFormatConfig::Vortex(config) => config
                 .clone()
                 .into_pyobject(py)
                 .map(|c| c.unbind().into_any()),

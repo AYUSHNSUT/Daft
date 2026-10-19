@@ -1,6 +1,7 @@
 # corner cases for df.count()
 from __future__ import annotations
 
+import pyarrow as pa
 import pytest
 
 import daft
@@ -35,3 +36,14 @@ def test_count_int() -> None:
     df = daft.from_pydict({"a": [1, 2, 3, 4], "b": [1, None, 3, None]})
     res = df.count(1).to_pydict()
     assert res == {"count": [4]}
+
+
+@pytest.mark.parametrize("num_rows", [0, 5])
+def test_count_zero_columns(num_rows: int) -> None:
+    table = pa.table({"a": pa.array(range(num_rows), type=pa.int64())})
+    # The empty projection preserves rows and exercises lazy counting rather than cached cardinality.
+    df = daft.from_arrow(table).select()
+
+    assert df.column_names == []
+    assert df.count_rows() == num_rows
+    assert df.count("*").to_pydict() == {"count": [num_rows]}

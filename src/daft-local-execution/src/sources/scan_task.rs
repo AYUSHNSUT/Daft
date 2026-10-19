@@ -262,6 +262,7 @@ impl Source for ScanTaskSource {
                     FileFormatConfig::Text(_) => "Read Text".into(),
                     FileFormatConfig::Avro(_) => "Read Avro".into(),
                     FileFormatConfig::Mcap(_) => "Read MCAP".into(),
+                    FileFormatConfig::Vortex(_) => "Read Vortex".into(),
                 },
                 #[cfg(feature = "python")]
                 SourceConfig::Database(_) => "Read Database".into(),

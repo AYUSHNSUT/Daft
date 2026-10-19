@@ -24,6 +24,7 @@ pub enum FileFormat {
     Text,
     Mcap,
     Avro,
+    Vortex,
 }
 
 #[cfg(feature = "python")]
@@ -38,6 +39,7 @@ impl FileFormat {
             Self::Text => "txt",
             Self::Mcap => "mcap",
             Self::Avro => "avro",
+            Self::Vortex => "vortex",
         }
     }
 }
@@ -46,7 +48,7 @@ impl FromStr for FileFormat {
     type Err = DaftError;
 
     fn from_str(file_format: &str) -> DaftResult<Self> {
-        use FileFormat::{Avro, Csv, Json, Mcap, Parquet, Text, Warc};
+        use FileFormat::{Avro, Csv, Json, Mcap, Parquet, Text, Vortex, Warc};
 
         if file_format.trim().eq_ignore_ascii_case("parquet") {
             Ok(Parquet)
@@ -62,6 +64,8 @@ impl FromStr for FileFormat {
             Ok(Avro)
         } else if file_format.trim().eq_ignore_ascii_case("mcap") {
             Ok(Mcap)
+        } else if file_format.trim().eq_ignore_ascii_case("vortex") {
+            Ok(Vortex)
         } else {
             Err(DaftError::TypeError(format!(
                 "FileFormat {file_format} not supported!"
@@ -100,3 +104,30 @@ impl FromStr for WriteMode {
 }
 
 impl_bincode_py_state_serialization!(WriteMode);
+
+#[cfg(test)]
+mod tests {
+    use common_py_serde::bincode;
+
+    use super::FileFormat;
+
+    #[test]
+    fn vortex_append_preserves_file_format_variant_numbers() {
+        for (index, format) in [
+            FileFormat::Parquet,
+            FileFormat::Csv,
+            FileFormat::Json,
+            FileFormat::Warc,
+            FileFormat::Text,
+            FileFormat::Mcap,
+            FileFormat::Avro,
+            FileFormat::Vortex,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let encoded = bincode::serde::encode_to_vec(format, bincode::config::legacy()).unwrap();
+            assert_eq!(encoded, (index as u32).to_le_bytes());
+        }
+    }
+}
