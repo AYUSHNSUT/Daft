@@ -1,6 +1,6 @@
 # Vortex integration: test and benchmark plan
 
-**Status:** acceptance plan for the [fork design](vortex-integration-design.md). The [Phase 0 experiment](../../examples/vortex_eval/README.md) now exists; [results](vortex-phase0-results.md) distinguish its verified capabilities from later work. Native connector paths and commands below remain proposed.
+**Status:** acceptance plan for the [fork design](vortex-integration-design.md). The [Phase 0 experiment](../../examples/vortex_eval/README.md) and experimental Phase 1 native local reader exist. Consult the [Phase 1 validation record](vortex-phase1-results.md) for executed checks and remaining limits; optimization, remote-storage, and performance commands remain future work.
 
 ## Test strategy
 
@@ -38,7 +38,7 @@ The existing experiment pins Vortex 0.88.0 / PyArrow 22.0.0 and provides focused
 
 ## Correct local reader: Phase 1
 
-Proposed files: `tests/io/test_vortex.py`, `tests/io/test_vortex_native_tasks.py`, and unit tests in `src/daft-vortex/`.
+Implemented files: `tests/io/test_vortex.py`, `tests/io/test_vortex_native_tasks.py`, and unit tests in `src/daft-vortex/`.
 
 | ID | Case | Required result |
 | --- | --- | --- |
@@ -51,7 +51,7 @@ Proposed files: `tests/io/test_vortex.py`, `tests/io/test_vortex_native_tasks.py
 | L7 | Task carrying a predicate directly | Reader honors it even without an outer Daft filter operator |
 | L8 | Zero-column and constant-only projection, `count_rows()`, `count(column)` | Preserve cardinality; distinguish total rows from non-null values |
 | L9 | Filter then limit across batches/files | Limit counts matching rows; global query output obeys Daft semantics |
-| L10 | Task/source/config serialization round-trip | Serialize descriptors, not readers/sessions; reopen successfully |
+| L10 | Native scan descriptor and Python source/config serialization round-trip | Rust `ScanTask` serde retains the full validation schema; restored Python sources create fresh native tasks. Generic `PyDataSourceTask` Python pickling and Ray transport remain Phase 3 work |
 | L11 | Absent optional dependency or disabled native feature | Ordinary import/test collection succeeds; reader call gives a clear enablement error |
 | L12 | Errors and schema diagnostics | Useful path and cause; no credentials in messages |
 | L13 | Filter-before-limit and limit-before-filter | Match each query's own reference result; the two operator orders are not equivalent |
@@ -158,19 +158,18 @@ There is no guaranteed improvement target. A useful result may be that Vortex he
 
 ## Execution and CI plan
 
-The following are commands for **after** the named native crate/tests/feature exist. They were not run for the Phase 0 harness. The `vortex` feature and proposed native paths are not present yet; use the [experiment instructions](../../examples/vortex_eval/README.md) for commands available now.
+The Phase 1 native crate, tests, and `vortex` feature now exist. The [implementation record](vortex-phase1-results.md) lists checks actually run. Commands for Phase 2 pushdowns, Phase 3 services, and Phase 4 benchmarks require those later paths to be implemented.
 
 Run from the repository root after the normal development setup (`make .venv`) has completed and the required dependencies are available.
 
 ```bash
-# Rebuild after Rust edits, enabling the proposed experimental feature.
+# Rebuild after Rust edits, enabling the experimental feature.
 make check-toolchain
 env -u CONDA_PREFIX PYO3_PYTHON=.venv/bin/python .venv/bin/maturin develop --uv --features python,vortex
 
 # Focused native-runner tests using the built extension.
 DAFT_RUNNER=native .venv/bin/pytest -n 0 \
-  tests/io/test_vortex.py tests/io/test_vortex_native_tasks.py \
-  tests/io/test_vortex_pushdowns.py
+  tests/io/test_vortex.py tests/io/test_vortex_native_tasks.py
 
 # Pure Rust reader behavior and the feature-enabled executor.
 cargo test --no-default-features -p daft-vortex
@@ -180,18 +179,18 @@ cargo check --no-default-features --features vortex -p daft-local-execution
 DAFT_RUNNER=native .venv/bin/pytest -n 0 \
   tests/io/test_native_tasks.py tests/io/test_datasource_join.py
 
-# Explicitly enable integration tests once local services are available.
+# Phase 3: implement these tests and start local services first.
 DAFT_RUNNER=native .venv/bin/pytest -n 0 -o addopts='' \
   -m integration tests/integration/io/vortex/
 
-# Release build before performance runs.
+# Phase 4: implement the benchmark suite and make a release build first.
 env -u CONDA_PREFIX PYO3_PYTHON=.venv/bin/python .venv/bin/maturin develop --release --uv --features python,vortex
 DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/pytest -n 0 \
   -o addopts='' -m benchmark benchmarking/vortex/ \
   --benchmark-json=/tmp/daft-vortex-benchmarks.json
 ```
 
-These build commands mirror the existing `make build` / `make build-release` recipes while explicitly adding the proposed feature. This checkout's Makefile does not forward a custom feature argument; either add that narrowly during implementation or keep the explicit Maturin invocation. Check actual feature activation in Phase 0.
+These build commands mirror the existing `make build` / `make build-release` recipes while explicitly adding the experimental feature. This checkout's Makefile does not forward a custom feature argument; use the explicit Maturin invocation. In an already configured environment, `--skip-install` can replace `--uv` to reuse installed Python dependencies; see the [tested offline command](vortex-phase1-results.md#using-the-reader).
 
 Run default builds without Vortex and all-feature checks as well as the targeted configuration. Follow repository pre-commit stages, dependency validation, Clippy, and unused-dependency checks. When the native integration is ready, run the broader Rust/Python CI matrix; run Ray and Python API doctests for capabilities actually claimed.
 

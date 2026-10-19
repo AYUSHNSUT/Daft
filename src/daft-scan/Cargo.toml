@@ -40,6 +40,7 @@ urlencoding = "2.1.3"
 tokio = {workspace = true, features = ["full"]}
 
 [features]
+vortex = []
 python = [
   "dep:pyo3",
   "dep:serde_json",

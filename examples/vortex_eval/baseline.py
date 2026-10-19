@@ -1,4 +1,4 @@
-"""Capture a correctness-checked Phase 0 baseline, not a throughput claim.
+"""Capture a correctness-checked reader baseline, not a throughput claim.
 
 Run this file from the repository root using its development environment.
 Each timed sample creates a fresh source and consumes its Arrow result. Fixture
@@ -128,6 +128,8 @@ def _query(source: str, paths: list[str], query: str, batch_size: int) -> Any:
 
     if source == "parquet":
         frame = daft.read_parquet(paths)
+    elif source == "vortex-native":
+        frame = daft.read_vortex(paths, batch_size=batch_size)
     else:
         from reference import read_vortex_reference
 
@@ -188,15 +190,15 @@ def run_baseline(
     repeats: int = 5,
     batch_size: int = 7,
 ) -> dict[str, Any]:
-    if source not in {"parquet", "vortex-reference"}:
-        raise ValueError("Source must be parquet or vortex-reference")
+    if source not in {"parquet", "vortex-reference", "vortex-native"}:
+        raise ValueError("Source must be parquet, vortex-reference, or vortex-native")
     if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 1:
         raise ValueError("repeats must be positive")
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("batch_size must be positive")
     os.environ.setdefault("DAFT_RUNNER", "native")
     if os.environ["DAFT_RUNNER"] != "native":
-        raise ValueError("Phase 0 baselines require DAFT_RUNNER=native")
+        raise ValueError("Vortex evaluation baselines require DAFT_RUNNER=native")
     manifest_path, output = manifest_path.resolve(), output.resolve()
     manifest, canonical = load_manifest(manifest_path)
     file_format = "parquet" if source == "parquet" else "vortex"
@@ -212,14 +214,14 @@ def run_baseline(
     report: dict[str, Any] = {
         "report_version": 1,
         "source": source,
-        "native_vortex_integration": False,
+        "native_vortex_integration": source == "vortex-native",
         "fixture_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
         "fixture_manifest": str(manifest_path),
         "environment": _environment(),
         "reader_settings": {
-            "batch_size_rows": batch_size if source == "vortex-reference" else None,
-            "batch_size_policy": "explicit Vortex reference setting"
-            if source == "vortex-reference"
+            "batch_size_rows": batch_size if source != "parquet" else None,
+            "batch_size_policy": "explicit Vortex batch-size setting"
+            if source != "parquet"
             else "Daft native Parquet reader defaults",
         },
         "timing": {
@@ -273,7 +275,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--source", choices=("parquet", "vortex-reference"), default="parquet")
+    parser.add_argument("--source", choices=("parquet", "vortex-reference", "vortex-native"), default="parquet")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=7)
     args = parser.parse_args()

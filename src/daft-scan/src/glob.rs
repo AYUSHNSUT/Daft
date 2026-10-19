@@ -160,6 +160,12 @@ impl GlobScanOperator {
         hive_partitioning: bool,
         skip_glob: bool,
     ) -> DaftResult<Self> {
+        if matches!(file_format_config.as_ref(), FileFormatConfig::Vortex(_)) {
+            return Err(DaftError::NotImplemented(
+                "Vortex files require daft.read_vortex(); generic glob scans are not supported"
+                    .to_string(),
+            ));
+        }
         let first_glob_path = match glob_paths.first() {
             None => Err(DaftError::ValueError(
                 "Cannot glob empty list of files".to_string(),
@@ -473,6 +479,11 @@ impl GlobScanOperator {
                 FileFormatConfig::Mcap(_) => {
                     return Err(DaftError::ValueError(
                         "MCAP schemas do not need to be inferred".to_string(),
+                    ));
+                }
+                FileFormatConfig::Vortex(_) => {
+                    return Err(DaftError::NotImplemented(
+                        "Vortex schema inference requires daft.read_vortex()".to_string(),
                     ));
                 }
             };

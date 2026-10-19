@@ -20,6 +20,7 @@ daft-functions-list = {path = "../daft-functions-list", default-features = false
 daft-functions-uri = {path = "../daft-functions-uri", default-features = false}
 daft-recordbatch = {path = "../daft-recordbatch", default-features = false}
 daft-schema = {path = "../daft-schema", default-features = false}
+daft-vortex = {path = "../daft-vortex", default-features = false, optional = true}
 educe = {workspace = true}
 indexmap = {workspace = true}
 itertools = {workspace = true}
@@ -42,6 +43,7 @@ rstest = {workspace = true}
 test-log = {workspace = true}
 
 [features]
+vortex = ["dep:daft-vortex", "daft-scan/vortex"]
 python = [
   "dep:pyo3",
   "common-checkpoint-config/python",
@@ -57,7 +59,8 @@ python = [
   "daft-functions/python",
   "daft-functions-list/python",
   "daft-scan/python",
-  "daft-schema/python"
+  "daft-schema/python",
+  "daft-vortex?/python"
 ]
 
 [lib]

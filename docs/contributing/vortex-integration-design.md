@@ -1,14 +1,14 @@
 # Vortex read support: design and delivery plan
 
-**Status:** Phase 0 complete for the recorded versions and primitive fixtures; see the [compatibility results](vortex-phase0-results.md). Native connector work has not started.
+**Status:** Phase 0 complete; the Phase 1 native local reader is implemented behind the experimental `vortex` feature. See the [compatibility results](vortex-phase0-results.md) and [Phase 1 implementation and validation](vortex-phase1-results.md), including the outstanding dependency-budget failure.
 
-**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, Phase 0 branch `poc/vortex-phase0`.
+**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, implementation branch `poc/vortex-phase1`.
 
 **Design baseline:** `d3cd974150ba93dbbe8efef8370b129538fcee4b`; reviewed October 20, 2026.
 
 **Companion:** [test and benchmark plan](vortex-integration-test-plan.md).
 
-**Current experiment:** [Phase 0 instructions](../../examples/vortex_eval/README.md) and [verified results / remaining gates](vortex-phase0-results.md).
+**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md) and [native reader setup, results, and limits](vortex-phase1-results.md).
 
 ## Summary
 
@@ -20,7 +20,7 @@ This is a plan for this personal fork, not an announced upstream feature. It fit
 
 ## Problem and expected benefit
 
-Daft has no built-in Vortex reader in this checkout; the Phase 0 reference lives outside the public API. Converting an entire dataset to Parquet or an in-memory Arrow table before giving it to Daft prevents us from evaluating Vortex as a scan source.
+At the design baseline, Daft had no built-in Vortex reader; the Phase 0 reference lives outside the public API. Converting an entire dataset to Parquet or an in-memory Arrow table before giving it to Daft prevents us from evaluating Vortex as a scan source. Phase 1 now provides that native scan boundary for local files.
 
 Vortex supplies file metadata, compressed encodings, scanning, and Arrow export. Daft should continue to own query planning, task scheduling, joins, aggregations, and downstream execution. The integration boundary is a stream of Arrow-compatible batches, not a replacement execution engine.
 
@@ -28,7 +28,7 @@ The hypothesis is that some workloads benefit from cheaper reads, selective colu
 
 ## Scope and proposed API
 
-The following is a proposed fork API, not an API available on this branch today:
+The experimental fork API is available when built with Rust features `python,vortex`:
 
 ```python
 import daft
@@ -39,7 +39,7 @@ result = df.where(col("value") >= 20).select("id").limit(100)
 result.show()
 ```
 
-Proposed signature: `read_vortex(path: str | list[str], io_config: IOConfig | None = None, batch_size: int = 131072) -> DataFrame`.
+Signature: `read_vortex(path: str | Path | list[str | Path], io_config: IOConfig | None = None, batch_size: int = 131072) -> DataFrame`. Explicit `io_config` is reserved for Phase 3 and currently rejected; use `None` for local reads.
 
 | Capability | First native milestone | Later phases |
 | --- | --- | --- |
@@ -165,7 +165,7 @@ Use half-open row ranges for any future intra-file splits. Do not use byte offse
 
 ## Expected code changes
 
-These are proposed touchpoints, not files already modified by this design.
+Phase 1 implements the native-reader touchpoints below. Expression/I/O adapters, dedicated performance benchmarks, and public connector navigation remain later work.
 
 | Area | Files / responsibility |
 | --- | --- |

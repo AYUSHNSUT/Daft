@@ -25,7 +25,7 @@ pub use daft_avro::AvroSourceConfig;
 pub use file_format_config::DatabaseSourceConfig;
 pub use file_format_config::{
     CsvSourceConfig, FileFormatConfig, JsonSourceConfig, McapSourceConfig, ParquetSourceConfig,
-    TextSourceConfig, WarcSourceConfig,
+    TextSourceConfig, VortexSourceConfig, WarcSourceConfig,
 };
 pub mod clustering;
 pub mod glob;
@@ -544,7 +544,7 @@ impl ScanTask {
 
     #[must_use]
     pub fn materialized_schema(&self) -> SchemaRef {
-        match (&self.generated_fields, &self.pushdowns.columns) {
+        let schema = match (&self.generated_fields, &self.pushdowns.columns) {
             (None, None) => {
                 if let Some(aggregation) = &self.pushdowns.aggregation {
                     Arc::new(Schema::new(vec![
@@ -586,6 +586,21 @@ impl ScanTask {
 
                 Arc::new(Schema::new(fields))
             }
+        };
+        if matches!(
+            self.source_config.as_ref(),
+            SourceConfig::File(FileFormatConfig::Vortex(_))
+        ) {
+            // Source nullability is needed only for the native reader's strict
+            // validation. Preserve it in self.schema, but keep output schemas
+            // clean, including empty partitions and Arrow/IPC exports.
+            Arc::new(Schema::new(schema.fields().iter().map(|field| {
+                let mut metadata = field.metadata.as_ref().clone();
+                metadata.remove("daft.vortex.nullable");
+                field.clone().with_metadata(metadata)
+            })))
+        } else {
+            schema
         }
     }
 
@@ -631,7 +646,7 @@ impl ScanTask {
             .or_else(|| {
                 // Otherwise, we fall back on estimations based on the file size
                 // use inflation factor from config and estimate number of rows from the schema
-                self.size_bytes_on_disk.map(|file_size| {
+                self.size_bytes_on_disk.and_then(|file_size| {
                     let config = config
                         .map_or_else(|| Cow::Owned(DaftExecutionConfig::default()), Cow::Borrowed);
                     let inflation_factor = match self.source_config.as_ref() {
@@ -649,6 +664,9 @@ impl ScanTask {
                             }
                             FileFormatConfig::Avro(_) => 1.5,
                             FileFormatConfig::Mcap(_) => 1.0,
+                            // Vortex compression ratios are not a row-count estimate.
+                            // Leave planning statistics unknown until metadata support exists.
+                            FileFormatConfig::Vortex(_) => return None,
                         },
                         #[cfg(feature = "python")]
                         SourceConfig::Database(_) | SourceConfig::PythonFunction { .. } => 1.0,
@@ -661,7 +679,7 @@ impl ScanTask {
                     } else {
                         self.schema.estimate_row_size_bytes()
                     };
-                    in_mem_size / read_row_size
+                    Some(in_mem_size / read_row_size)
                 })
             });
 
@@ -938,7 +956,7 @@ mod test {
 
     use crate::{
         FileFormatConfig, ParquetSourceConfig, Pushdowns, ScanOperator, ScanSource, ScanSourceKind,
-        ScanTask, SourceConfig, WarcSourceConfig, glob::GlobScanOperator,
+        ScanTask, SourceConfig, VortexSourceConfig, WarcSourceConfig, glob::GlobScanOperator,
         storage_config::StorageConfig,
     };
 
@@ -974,6 +992,134 @@ mod test {
             Pushdowns::default(),
             None,
         )
+    }
+
+    #[test]
+    fn vortex_scan_preserves_full_schema_metadata_and_unknown_statistics() {
+        use common_py_serde::bincode;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64).with_metadata(BTreeMap::from([
+                ("daft.vortex.nullable".to_string(), "false".to_string()),
+                ("application".to_string(), "preserved".to_string()),
+            ])),
+            Field::new("value", DataType::Int64).with_metadata(BTreeMap::from([(
+                "daft.vortex.nullable".to_string(),
+                "true".to_string(),
+            )])),
+        ]));
+        let task = ScanTask::new(
+            vec![ScanSource {
+                size_bytes: Some(1024),
+                metadata: None,
+                statistics: None,
+                partition_spec: None,
+                kind: ScanSourceKind::File {
+                    path: "fixture.vortex".to_string(),
+                    chunk_spec: None,
+                    iceberg_delete_files: None,
+                    parquet_metadata: None,
+                },
+            }],
+            Arc::new(SourceConfig::File(FileFormatConfig::Vortex(
+                VortexSourceConfig { batch_size: 17 },
+            ))),
+            schema,
+            Arc::new(StorageConfig::default()),
+            Pushdowns {
+                columns: Some(Arc::new(vec!["id".to_string()])),
+                limit: Some(5),
+                ..Default::default()
+            },
+            None,
+        );
+        let encoded = bincode::serde::encode_to_vec(&task, bincode::config::legacy()).unwrap();
+        let (decoded, consumed): (ScanTask, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.schema.len(), 2);
+        assert_eq!(decoded.materialized_schema().len(), 1);
+        assert!(
+            !decoded
+                .materialized_schema()
+                .get_field("id")
+                .unwrap()
+                .metadata
+                .contains_key("daft.vortex.nullable")
+        );
+        assert_eq!(
+            decoded
+                .materialized_schema()
+                .get_field("id")
+                .unwrap()
+                .metadata
+                .get("application"),
+            Some(&"preserved".to_string())
+        );
+        assert_eq!(
+            decoded
+                .schema
+                .get_field("id")
+                .unwrap()
+                .metadata
+                .get("daft.vortex.nullable"),
+            Some(&"false".to_string())
+        );
+        assert_eq!(
+            decoded
+                .schema
+                .get_field("value")
+                .unwrap()
+                .metadata
+                .get("daft.vortex.nullable"),
+            Some(&"true".to_string())
+        );
+        assert!(matches!(
+            decoded.source_config.as_ref(),
+            SourceConfig::File(FileFormatConfig::Vortex(VortexSourceConfig {
+                batch_size: 17
+            }))
+        ));
+        assert_eq!(decoded.num_rows(), None);
+        assert_eq!(decoded.approx_num_rows(None), None);
+        assert_eq!(decoded.estimate_in_memory_size_bytes(None), None);
+        assert_eq!(decoded.size_bytes_on_disk(), Some(1024));
+
+        let mut other_format = decoded;
+        other_format.source_config = Arc::new(SourceConfig::File(FileFormatConfig::Parquet(
+            ParquetSourceConfig::default(),
+        )));
+        assert!(
+            other_format
+                .materialized_schema()
+                .get_field("id")
+                .unwrap()
+                .metadata
+                .contains_key("daft.vortex.nullable")
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_glob_rejects_vortex_before_accessing_files() {
+        for infer_schema in [false, true] {
+            let result = GlobScanOperator::try_new(
+                vec!["missing.vortex".to_string()],
+                Arc::new(FileFormatConfig::Vortex(VortexSourceConfig::default())),
+                Arc::new(StorageConfig::default()),
+                infer_schema,
+                Some(Arc::new(Schema::empty())),
+                None,
+                false,
+                false,
+            )
+            .await;
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("daft.read_vortex()")
+            );
+        }
     }
 
     async fn make_glob_scan_operator(num_sources: usize, infer_schema: bool) -> GlobScanOperator {
