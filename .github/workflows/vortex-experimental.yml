@@ -201,6 +201,12 @@ jobs:
         set -euo pipefail
         cargo test --release --locked --no-default-features -p daft-vortex -p daft-scan --lib \
           2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/native-vortex.log
+    - name: Check S3 connection reuse, proxy, and timeout behavior
+      if: matrix.mode == 'enabled'
+      run: |
+        set -euo pipefail
+        cargo test --release --locked --no-default-features -p daft-io --lib test_s3_http_client_ \
+          2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/s3-pooling.log
     - name: Check benchmark harness and remote-helper ownership
       if: matrix.mode == 'enabled'
       run: |
