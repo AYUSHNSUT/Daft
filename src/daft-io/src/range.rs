@@ -88,6 +88,67 @@ impl GetRange {
     }
 }
 
+/// Validate a positional HTTP/S3 response before exposing its body. Byte count
+/// alone cannot identify a same-length response from the wrong object offset.
+pub(crate) fn validate_content_range(
+    requested: &GetRange,
+    content_range: Option<&str>,
+    content_length: Option<usize>,
+) -> crate::Result<()> {
+    let invalid = |reason: &str| crate::Error::InvalidArgument {
+        msg: format!("Invalid byte-range response: {reason}"),
+    };
+    let content_range = content_range
+        .and_then(|value| value.split_once(' '))
+        .filter(|(unit, _)| unit.eq_ignore_ascii_case("bytes"))
+        .map(|(_, range)| range)
+        .ok_or_else(|| invalid("missing or malformed Content-Range"))?;
+    let (bounds, total) = content_range
+        .split_once('/')
+        .ok_or_else(|| invalid("malformed Content-Range"))?;
+    let (start, end) = bounds
+        .split_once('-')
+        .ok_or_else(|| invalid("malformed Content-Range interval"))?;
+    let start = start
+        .parse::<usize>()
+        .map_err(|_| invalid("invalid start"))?;
+    let end = end.parse::<usize>().map_err(|_| invalid("invalid end"))?;
+    if start > end {
+        return Err(invalid("invalid interval"));
+    }
+    let expected = if total == "*" {
+        // RFC 9110 permits an unknown total. An exact bounded response is
+        // still verifiable; EOF-clamped, offset and suffix requests need the
+        // total size to establish their expected end/start.
+        requested
+            .validate()
+            .map_err(|_| invalid("invalid requested interval"))?;
+        let GetRange::Bounded(range) = requested else {
+            return Err(invalid("total size required for offset or suffix range"));
+        };
+        range.clone()
+    } else {
+        let total = total
+            .parse::<usize>()
+            .map_err(|_| invalid("invalid total size"))?;
+        if end >= total {
+            return Err(invalid("interval is outside the object"));
+        }
+        requested
+            .as_range(total)
+            .map_err(|_| invalid("invalid requested interval"))?
+    };
+    if start != expected.start || end.checked_add(1) != Some(expected.end) {
+        return Err(invalid(
+            "Content-Range does not match the requested interval",
+        ));
+    }
+    if content_length.is_some_and(|length| length != expected.len()) {
+        return Err(invalid("Content-Length does not match Content-Range"));
+    }
+    Ok(())
+}
+
 impl Display for GetRange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -119,7 +180,33 @@ impl<T: RangeBounds<usize>> From<T> for GetRange {
 mod tests {
     use std::ops::Bound::{Excluded, Included, Unbounded};
 
-    use crate::range::GetRange;
+    use crate::range::{GetRange, validate_content_range};
+
+    #[test]
+    fn range_response_accepts_unknown_totals_only_for_exact_bounded_intervals() {
+        let bounded = GetRange::Bounded(5..10);
+        for header in ["bytes 5-9/*", "Bytes 5-9/*", "BYTES 5-9/20"] {
+            validate_content_range(&bounded, Some(header), Some(5)).unwrap();
+        }
+        for (header, length) in [
+            ("bytes 4-8/*", 5),
+            ("bytes 5-8/*", 4),
+            ("bytes 5-10/*", 6),
+            ("bytes 5-9/*", 6),
+            ("bytes 5-9/9", 5),
+            ("items 5-9/*", 5),
+        ] {
+            assert!(validate_content_range(&bounded, Some(header), Some(length)).is_err());
+        }
+        for requested in [GetRange::Offset(5), GetRange::Suffix(5)] {
+            assert!(validate_content_range(&requested, Some("bytes 5-9/*"), Some(5)).is_err());
+        }
+        validate_content_range(&GetRange::Bounded(5..20), Some("bytes 5-9/10"), Some(5)).unwrap();
+        assert!(
+            validate_content_range(&GetRange::Bounded(5..20), Some("bytes 5-9/*"), Some(5))
+                .is_err()
+        );
+    }
 
     #[test]
     fn get_range_str() {

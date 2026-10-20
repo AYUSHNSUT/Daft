@@ -16,7 +16,7 @@ use reqwest_middleware::{
     reqwest::header::{self, CONTENT_LENGTH, RANGE},
 };
 use reqwest_retry::{Jitter, RetryTransientMiddleware, policies::ExponentialBackoff};
-use snafu::{IntoError, ResultExt, Snafu};
+use snafu::{ResultExt, Snafu};
 use url::Position;
 
 use super::object_io::{GetResult, ObjectSource};
@@ -50,12 +50,6 @@ enum Error {
 
     #[snafu(display("Unable to determine size of {}", path))]
     UnableToDetermineSize { path: String },
-
-    #[snafu(display("Unable to read data from {}: {}", path, source))]
-    UnableToReadBytes {
-        path: String,
-        source: reqwest_middleware::reqwest::Error,
-    },
 
     #[snafu(display("Unable to create Http Client {}", source))]
     UnableToCreateClient {
@@ -265,26 +259,10 @@ pub(crate) fn classify_middleware_error(
 
 impl From<Error> for super::Error {
     fn from(error: Error) -> Self {
-        use Error::{UnableToConnect, UnableToDetermineSize, UnableToOpenFile, UnableToReadBytes};
+        use Error::{UnableToConnect, UnableToDetermineSize, UnableToOpenFile};
         match error {
             UnableToOpenFile { path, source } => classify_reqwest_error(path, source),
             UnableToConnect { path, source } => classify_middleware_error(path, source),
-            UnableToReadBytes { path, source } => {
-                // Stream/body read failures are transient; treat timeouts as
-                // ReadTimeout and everything else as a SocketError so callers
-                // get a DaftTransientError subclass on the Python side.
-                if source.is_timeout() {
-                    Self::ReadTimeout {
-                        path,
-                        source: source.into(),
-                    }
-                } else {
-                    Self::SocketError {
-                        path,
-                        source: source.into(),
-                    }
-                }
-            }
             UnableToDetermineSize { path } => Self::UnableToDetermineSize { path },
             _ => Self::Generic {
                 store: super::SourceType::Http,
@@ -342,6 +320,53 @@ impl HttpSource {
     }
 }
 
+/// A response to a Range request must identify the exact selected interval.
+/// Checking body length alone cannot detect a same-length response at offset 0.
+fn validate_range_response(
+    requested: &GetRange,
+    status: reqwest::StatusCode,
+    headers: &header::HeaderMap,
+) -> super::Result<()> {
+    let invalid = |reason: &str| super::Error::InvalidArgument {
+        msg: format!("Invalid HTTP range response: {reason}"),
+    };
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(invalid("server did not return 206 Partial Content"));
+    }
+    let content_range = headers
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok());
+    let content_length = headers
+        .get(CONTENT_LENGTH)
+        .map(|length| {
+            length
+                .to_str()
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| invalid("invalid Content-Length"))
+        })
+        .transpose()?;
+    crate::range::validate_content_range(requested, content_range, content_length)
+}
+
+fn redacted_http_uri(uri: &str) -> String {
+    let Ok(mut url) = url::Url::parse(uri) else {
+        return "<invalid HTTP URL>".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn without_middleware_url(error: reqwest_middleware::Error) -> reqwest_middleware::Error {
+    match error {
+        reqwest_middleware::Error::Reqwest(error) => error.without_url().into(),
+        other => other,
+    }
+}
+
 #[async_trait]
 impl ObjectSource for HttpSource {
     async fn supports_range(&self, uri: &str) -> super::Result<bool> {
@@ -372,7 +397,7 @@ impl ObjectSource for HttpSource {
         io_stats: Option<IOStatsRef>,
     ) -> super::Result<GetResult> {
         let request = self.client.get(uri);
-        let request = match range {
+        let request = match &range {
             None => request,
             Some(range) => {
                 range.validate().context(InvalidRangeRequestSnafu)?;
@@ -380,26 +405,24 @@ impl ObjectSource for HttpSource {
             }
         };
 
-        let response = request
-            .send()
-            .await
-            .context(UnableToConnectSnafu::<String> { path: uri.into() })?;
+        let safe_uri = redacted_http_uri(uri);
+        let response = request.send().await.map_err(|error| {
+            classify_middleware_error(safe_uri.clone(), without_middleware_url(error))
+        })?;
         let response = response
             .error_for_status()
-            .context(UnableToOpenFileSnafu::<String> { path: uri.into() })?;
+            .map_err(|error| classify_reqwest_error(safe_uri.clone(), error.without_url()))?;
         if let Some(is) = io_stats.as_ref() {
             is.mark_get_requests(1);
         }
+        if let Some(range) = &range {
+            validate_range_response(range, response.status(), response.headers())?;
+        }
         let size_bytes = response.content_length().map(|s| s as usize);
         let stream = response.bytes_stream();
-        let owned_string = uri.to_owned();
-        let stream = stream.map_err(move |e| {
-            UnableToReadBytesSnafu::<String> {
-                path: owned_string.clone(),
-            }
-            .into_error(e)
-            .into()
-        });
+        let owned_string = safe_uri;
+        let stream =
+            stream.map_err(move |e| classify_reqwest_error(owned_string.clone(), e.without_url()));
         Ok(GetResult::Stream(
             io_stats_on_bytestream(stream, io_stats),
             size_bytes,
@@ -419,13 +442,13 @@ impl ObjectSource for HttpSource {
 
     async fn get_size(&self, uri: &str, io_stats: Option<IOStatsRef>) -> super::Result<usize> {
         let request = self.client.head(uri);
-        let response = request
-            .send()
-            .await
-            .context(UnableToConnectSnafu::<String> { path: uri.into() })?;
+        let safe_uri = redacted_http_uri(uri);
+        let response = request.send().await.map_err(|error| {
+            classify_middleware_error(safe_uri.clone(), without_middleware_url(error))
+        })?;
         let response = response
             .error_for_status()
-            .context(UnableToOpenFileSnafu::<String> { path: uri.into() })?;
+            .map_err(|error| classify_reqwest_error(safe_uri.clone(), error.without_url()))?;
 
         if let Some(is) = io_stats.as_ref() {
             is.mark_head_requests(1);
@@ -435,14 +458,18 @@ impl ObjectSource for HttpSource {
         match headers.get(CONTENT_LENGTH) {
             Some(v) => {
                 let size_bytes = String::from_utf8(v.as_bytes().to_vec()).with_context(|_| {
-                    UnableToParseUtf8HeaderSnafu::<String> { path: uri.into() }
+                    UnableToParseUtf8HeaderSnafu::<String> {
+                        path: safe_uri.clone(),
+                    }
                 })?;
 
                 Ok(size_bytes
                     .parse()
-                    .with_context(|_| UnableToParseIntegerSnafu::<String> { path: uri.into() })?)
+                    .with_context(|_| UnableToParseIntegerSnafu::<String> {
+                        path: safe_uri.clone(),
+                    })?)
             }
-            None => Err(Error::UnableToDetermineSize { path: uri.into() }.into()),
+            None => Err(Error::UnableToDetermineSize { path: safe_uri }.into()),
         }
     }
 
@@ -533,6 +560,93 @@ mod tests {
     use std::default;
 
     use crate::{HttpSource, Result, integrations::test_full_get, object_io::ObjectSource};
+
+    fn range_headers(
+        content_range: &str,
+        content_length: Option<&str>,
+    ) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_RANGE,
+            content_range.parse().unwrap(),
+        );
+        if let Some(length) = content_length {
+            headers.insert(reqwest::header::CONTENT_LENGTH, length.parse().unwrap());
+        }
+        headers
+    }
+
+    #[test]
+    fn range_response_requires_partial_content_and_matching_interval() {
+        use reqwest::StatusCode;
+
+        use super::validate_range_response;
+        use crate::GetRange;
+        let requested = GetRange::Bounded(5..10);
+        let valid = range_headers("bytes 5-9/20", Some("5"));
+        validate_range_response(&requested, StatusCode::PARTIAL_CONTENT, &valid).unwrap();
+        assert!(validate_range_response(&requested, StatusCode::OK, &valid).is_err());
+        for range in ["bytes 5-9/*", "Bytes 5-9/*", "BYTES 5-9/20"] {
+            validate_range_response(
+                &requested,
+                StatusCode::PARTIAL_CONTENT,
+                &range_headers(range, Some("5")),
+            )
+            .unwrap();
+        }
+        for (range, length) in [
+            ("bytes 0-4/20", "5"), // equal length but wrong offset
+            ("bytes 5-8/20", "4"),
+            ("bytes 5-10/20", "6"),
+            ("bytes 5-9/20", "6"),
+            ("bytes 5-9/9", "5"),
+            ("bytes 9-5/20", "5"),
+            ("bytes 4-8/*", "5"),
+            ("bytes 5-8/*", "4"),
+            ("bytes 5-9/*", "6"),
+            ("items 5-9/20", "5"),
+        ] {
+            assert!(
+                validate_range_response(
+                    &requested,
+                    StatusCode::PARTIAL_CONTENT,
+                    &range_headers(range, Some(length))
+                )
+                .is_err(),
+                "accepted {range}"
+            );
+        }
+        assert!(
+            validate_range_response(&requested, StatusCode::PARTIAL_CONTENT, &Default::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn range_response_checks_offset_suffix_and_eof_clamping() {
+        use reqwest::StatusCode;
+
+        use super::validate_range_response;
+        use crate::GetRange;
+        let valid = range_headers("bytes 5-9/10", None);
+        for requested in [
+            GetRange::Offset(5),
+            GetRange::Suffix(5),
+            GetRange::Bounded(5..20),
+        ] {
+            validate_range_response(&requested, StatusCode::PARTIAL_CONTENT, &valid).unwrap();
+        }
+        assert!(
+            validate_range_response(&GetRange::Suffix(4), StatusCode::PARTIAL_CONTENT, &valid)
+                .is_err()
+        );
+        assert_eq!(
+            super::redacted_http_uri(
+                "https://user:password@example.test/data?signature=secret#fragment"
+            ),
+            "https://example.test/data"
+        );
+    }
 
     #[tokio::test]
     async fn test_full_get_from_http() -> Result<()> {

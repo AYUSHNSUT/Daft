@@ -13,7 +13,6 @@ use crate::{
     FileFormat,
     local::{LocalFile, collect_file},
     stats::IOStatsRef,
-    stream_utils::io_stats_on_bytestream,
 };
 
 pub struct StreamingRetryParams {
@@ -134,8 +133,8 @@ impl GetResult {
         match self {
             Self::File(..) => self,
             Self::Stream(s, size, permit, _) => {
-                let resumable = ResumableByteStream::new(s, params).into_stream();
-                Self::Stream(resumable, size, permit, None)
+                let resumable = ResumableByteStream::new(s, params, permit).into_stream();
+                Self::Stream(resumable, size, None, None)
             }
         }
     }
@@ -149,15 +148,23 @@ struct ResumableByteStream {
     delivered: usize,
     retry: StreamingRetryParams,
     attempt: u64,
+    // A connection belongs to the current response body, not the whole retry
+    // operation. Release it before reacquiring one for a resumed request.
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ResumableByteStream {
-    fn new(inner: BoxStream<'static, super::Result<Bytes>>, retry: StreamingRetryParams) -> Self {
+    fn new(
+        inner: BoxStream<'static, super::Result<Bytes>>,
+        retry: StreamingRetryParams,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
         Self {
             inner,
             delivered: 0,
             retry,
             attempt: 0,
+            permit,
         }
     }
 
@@ -196,6 +203,11 @@ impl ResumableByteStream {
                             | super::Error::UnableToReadBytes { .. }
                             | super::Error::UnableToOpenFile { .. }
                             | super::Error::MiscTransient { .. } => {
+                                // Drop the failed body and connection before the
+                                // backoff; a one-connection pool must be able to
+                                // issue the resumed request.
+                                self.inner = futures::stream::empty().boxed();
+                                self.permit = None;
                                 self.attempt += 1;
                                 if self.attempt > MAX_NUM_TRIES {
                                     yield Err(e);
@@ -212,9 +224,12 @@ impl ResumableByteStream {
                                 self.attempt, MAX_NUM_TRIES, backoff_ms, range);
 
                                 match self.retry.source.get(&self.retry.input, range, self.retry.io_stats.clone()).await {
-                                    Ok(GetResult::Stream(s2, _size2, _permit2, _)) => {
-                                        let wrapped = io_stats_on_bytestream(s2, self.retry.io_stats.clone());
-                                        self.inner = wrapped;
+                                    Ok(GetResult::Stream(s2, _size2, permit2, _)) => {
+                                        // ObjectSource::get counts its own body
+                                        // stream. Wrapping it again double-counts
+                                        // every byte delivered after a retry.
+                                        self.inner = s2;
+                                        self.permit = permit2;
                                     }
                                     Ok(_) => {
                                         yield Err(e);
@@ -303,6 +318,8 @@ pub trait ObjectSource: Sync + Send {
     }
 
     /// Return the bytes with given range.
+    /// Streaming implementations account for bytes and requests in `io_stats`;
+    /// callers must not wrap the returned stream in a second statistics counter.
     /// Will return [`Error::InvalidRangeRequest`] if range start is greater than range end
     /// or range start is greater than object size.
     async fn get(
