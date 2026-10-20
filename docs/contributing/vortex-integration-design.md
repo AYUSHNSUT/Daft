@@ -6,7 +6,11 @@ Phase 3 is complete for its declared I/O, resource-control, and worker scope, in
 
 Phase 5's [bounded metadata plan](vortex-phase5-design.md) is implemented and has completed local/user-terminal validation, including shared S3 connection reuse and MCAP HTTP compatibility. Its [results](vortex-phase5-results.md) separate same-build concurrency comparisons, the original local measurement build and final remote acceptance. Remaining Parquet regressions and unverified final GitHub/Linux execution are explicit.
 
-**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, current implementation branch `poc/vortex-phase5`, review base `poc/vortex-phase4`.
+The [Phase 6 plan](vortex-phase6-design.md) adds bounded remote read merging,
+ordered parallel discovery and query-stage diagnostics. Implementation and
+validation are in progress; no Phase 6 performance result is claimed yet.
+
+**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, current implementation branch `poc/vortex-phase6`, review base `poc/vortex-phase5`.
 
 **Design baseline:** `d3cd974150ba93dbbe8efef8370b129538fcee4b`; reviewed October 20, 2026.
 

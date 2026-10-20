@@ -9,6 +9,7 @@
 use daft_core::prelude::SchemaRef;
 use daft_dsl::ExprRef;
 
+mod diagnostics;
 mod io;
 mod plan;
 mod read;
@@ -37,6 +38,12 @@ pub struct VortexReadOptions {
     /// read fails; returned buffers, caches, decoded output and blocking reads
     /// finishing after cancellation are not charged.
     pub max_in_flight_bytes: usize,
+    /// Merge nearby remote segment reads. Local reads retain their existing policy.
+    pub enable_read_coalescing: bool,
+    /// Maximum gap between remote reads eligible for merging.
+    pub read_coalesce_gap_bytes: usize,
+    /// Maximum actual merged request size, also capped by the request byte budget.
+    pub read_coalesce_max_bytes: usize,
 }
 
 impl Default for VortexReadOptions {
@@ -47,6 +54,9 @@ impl Default for VortexReadOptions {
             enable_filter_pushdown: true,
             max_concurrent_requests: 8,
             max_in_flight_bytes: 64 * 1024 * 1024,
+            enable_read_coalescing: true,
+            read_coalesce_gap_bytes: 64 * 1024,
+            read_coalesce_max_bytes: 4 * 1024 * 1024,
         }
     }
 }

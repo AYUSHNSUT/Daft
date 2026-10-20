@@ -260,9 +260,17 @@ impl PyDataSourceTask {
             if vortex_config.batch_size == 0
                 || vortex_config.max_concurrent_requests == 0
                 || vortex_config.max_in_flight_bytes == 0
+                || vortex_config.read_coalesce_max_bytes == 0
             {
                 return Err(pyo3::exceptions::PyValueError::new_err(
-                    "Vortex batch_size and request budgets must be positive",
+                    "Vortex batch_size, request budgets, and read_coalesce_max_bytes must be positive",
+                ));
+            }
+            if vortex_config.read_coalesce_gap_bytes > isize::MAX as usize
+                || vortex_config.read_coalesce_max_bytes > isize::MAX as usize
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Vortex read coalescing sizes exceed the platform limit",
                 ));
             }
             let (source_type, _) = daft_io::parse_url(&path).map_err(|_| {

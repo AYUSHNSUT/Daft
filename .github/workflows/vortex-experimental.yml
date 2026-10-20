@@ -3,7 +3,7 @@ name: Vortex experimental
 # This is a personal-fork acceptance workflow, not an upstream feature gate.
 on:
   push:
-    branches: [poc/vortex-phase4, poc/vortex-phase5]
+    branches: [poc/vortex-phase4, poc/vortex-phase5, poc/vortex-phase6, 'poc/vortex-phase6-*']
     paths:
     - .github/workflows/vortex-experimental.yml
     - Cargo.toml
@@ -33,7 +33,7 @@ on:
     - docs/install.md
     - docs/SUMMARY.md
   pull_request:
-    branches: [poc/vortex-phase3, poc/vortex-phase4]
+    branches: [poc/vortex-phase3, poc/vortex-phase4, poc/vortex-phase5, poc/vortex-phase6, 'poc/vortex-phase6-*']
     paths:
     - .github/workflows/vortex-experimental.yml
     - Cargo.toml
@@ -91,10 +91,13 @@ jobs:
       github.repository == 'AYUSHNSUT/Daft' &&
       ((github.event_name == 'pull_request' &&
         ((github.head_ref == 'poc/vortex-phase4' && github.base_ref == 'poc/vortex-phase3') ||
-         (github.head_ref == 'poc/vortex-phase5' && github.base_ref == 'poc/vortex-phase4')) &&
+         (github.head_ref == 'poc/vortex-phase5' && github.base_ref == 'poc/vortex-phase4') ||
+         (startsWith(github.head_ref, 'poc/vortex-phase6') &&
+          (github.base_ref == 'poc/vortex-phase5' || startsWith(github.base_ref, 'poc/vortex-phase6')))) &&
         github.event.pull_request.head.repo.full_name == 'AYUSHNSUT/Daft') ||
        (github.event_name != 'pull_request' &&
-        (github.ref == 'refs/heads/poc/vortex-phase4' || github.ref == 'refs/heads/poc/vortex-phase5')))
+        (github.ref == 'refs/heads/poc/vortex-phase4' || github.ref == 'refs/heads/poc/vortex-phase5' ||
+         startsWith(github.ref, 'refs/heads/poc/vortex-phase6'))))
     name: Vortex ${{ matrix.mode }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
@@ -165,6 +168,8 @@ jobs:
         enabled = os.environ["VORTEX_EXPECT_ENABLED"] == "enabled"
         assert hasattr(native, "read_vortex_schema") == enabled
         assert hasattr(native, "read_vortex_metadata_bulk") == enabled
+        assert hasattr(native, "_vortex_diagnostics_start") == enabled
+        assert callable(native._io_glob_bulk)
         assert callable(daft.read_vortex)
         assert daft.get_build_type() == "release"
         assert daft.from_pydict({"id": [1, 2]}).select("id").to_pydict() == {"id": [1, 2]}
@@ -186,6 +191,8 @@ jobs:
           tests/io/test_vortex_lifecycle.py \
           tests/io/test_vortex_pushdowns.py \
           tests/io/test_vortex_statistics.py \
+          tests/io/test_vortex_diagnostic_capture.py \
+          tests/io/test_vortex_discovery.py \
           tests/io/test_vortex_phase3.py 2>&1 | \
           tee examples/vortex_eval/artifacts/phase4-ci/correctness.log
     - name: Require enabled coverage without feature or writer skips
@@ -218,6 +225,7 @@ jobs:
           --junitxml=examples/vortex_eval/artifacts/phase4-ci/harness.xml \
           benchmarking/vortex/test_*.py examples/vortex_eval/test_phase4_services.py \
           examples/vortex_eval/test_phase5_services.py \
+          examples/vortex_eval/test_phase6_services.py \
           2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/harness.log
     - name: Check existing native, Parquet, count, and iterator behavior
       run: |
@@ -262,6 +270,12 @@ jobs:
           --output examples/vortex_eval/artifacts/phase4-ci/metadata-report \
           --orders sorted --layouts multi --rounds 1 --warmups 0 --allow-dev 2>&1 | \
           tee examples/vortex_eval/artifacts/phase4-ci/metadata-smoke.log
+        .venv/bin/python -m benchmarking.vortex.remote_eval \
+          --manifest examples/vortex_eval/artifacts/phase4-ci/data/manifest.json \
+          --output examples/vortex_eval/artifacts/phase4-ci/remote-smoke \
+          --stage tune --orders sorted --layouts multi \
+          --rounds 1 --warmups 0 --allow-dev --diagnostics 2>&1 | \
+          tee examples/vortex_eval/artifacts/phase4-ci/remote-smoke.log
     - name: Install real service prerequisites
       if: matrix.mode == 'enabled' && (github.event_name != 'workflow_dispatch' || inputs.services)
       run: uv pip install --python .venv/bin/python 'ray[data,client]==2.59.0'
@@ -290,4 +304,5 @@ jobs:
           examples/vortex_eval/artifacts/phase4-ci/*.xml
           examples/vortex_eval/artifacts/phase4-ci/report/
           examples/vortex_eval/artifacts/phase4-ci/metadata-report/
+          examples/vortex_eval/artifacts/phase4-ci/remote-smoke/
           examples/vortex_eval/artifacts/phase4-ci/data/manifest.json

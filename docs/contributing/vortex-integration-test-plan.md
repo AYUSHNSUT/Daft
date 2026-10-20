@@ -13,6 +13,11 @@ passes with 20 existing ignores. The shared S3 connector and MCAP HTTP fallback
 regressions are corrected. Final GitHub/Linux execution remains separately
 unverified.
 
+The [Phase 6 plan](vortex-phase6-design.md) requires bounded remote read merging,
+ordered discovery outcomes, whole-query diagnostic coverage and separate frozen
+same-build comparisons. Its completion gate is lower Vortex medians than Parquet
+in all five declared remote cases; implementation and validation are in progress.
+
 ## Test strategy
 
 Use the same fixtures and query cases for the optional Python reference, native Vortex with optimizations disabled, native Vortex with optimizations enabled, and existing native Parquet. The primary correctness oracle is a canonical in-memory Daft table with independently specified expected values. A shared conversion bug must not make two readers incorrectly agree.

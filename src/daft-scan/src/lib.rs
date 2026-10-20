@@ -1046,6 +1046,9 @@ mod test {
         assert!(defaults.enable_filter_pushdown);
         assert_eq!(defaults.max_concurrent_requests, 8);
         assert_eq!(defaults.max_in_flight_bytes, 64 * 1024 * 1024);
+        assert!(defaults.enable_read_coalescing);
+        assert_eq!(defaults.read_coalesce_gap_bytes, 65_536);
+        assert_eq!(defaults.read_coalesce_max_bytes, 4_194_304);
         for enable_projection_pushdown in [false, true] {
             for enable_filter_pushdown in [false, true] {
                 let config = VortexSourceConfig {
@@ -1054,6 +1057,9 @@ mod test {
                     enable_filter_pushdown,
                     max_concurrent_requests: 3,
                     max_in_flight_bytes: 1_048_576,
+                    enable_read_coalescing: enable_projection_pushdown,
+                    read_coalesce_gap_bytes: 17,
+                    read_coalesce_max_bytes: 524_288,
                 };
                 let encoded =
                     bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
@@ -1167,6 +1173,9 @@ mod test {
                     enable_filter_pushdown: true,
                     max_concurrent_requests: 2,
                     max_in_flight_bytes: 4_194_304,
+                    enable_read_coalescing: false,
+                    read_coalesce_gap_bytes: 0,
+                    read_coalesce_max_bytes: 131_072,
                 },
             ))),
             schema,
@@ -1237,6 +1246,9 @@ mod test {
                 enable_filter_pushdown: true,
                 max_concurrent_requests: 2,
                 max_in_flight_bytes: 4_194_304,
+                enable_read_coalescing: false,
+                read_coalesce_gap_bytes: 0,
+                read_coalesce_max_bytes: 131_072,
             }))
         ));
         assert_eq!(decoded.storage_config, task.storage_config);

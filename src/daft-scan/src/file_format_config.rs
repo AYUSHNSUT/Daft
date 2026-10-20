@@ -545,6 +545,9 @@ pub struct VortexSourceConfig {
     pub enable_filter_pushdown: bool,
     pub max_concurrent_requests: usize,
     pub max_in_flight_bytes: usize,
+    pub enable_read_coalescing: bool,
+    pub read_coalesce_gap_bytes: usize,
+    pub read_coalesce_max_bytes: usize,
 }
 
 impl Default for VortexSourceConfig {
@@ -555,6 +558,9 @@ impl Default for VortexSourceConfig {
             enable_filter_pushdown: true,
             max_concurrent_requests: 8,
             max_in_flight_bytes: 64 * 1024 * 1024,
+            enable_read_coalescing: true,
+            read_coalesce_gap_bytes: 64 * 1024,
+            read_coalesce_max_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -576,6 +582,18 @@ impl VortexSourceConfig {
             format!(
                 "Maximum in-flight request bytes = {}",
                 self.max_in_flight_bytes
+            ),
+            format!(
+                "Enable remote read coalescing = {}",
+                self.enable_read_coalescing
+            ),
+            format!(
+                "Remote read coalesce gap bytes = {}",
+                self.read_coalesce_gap_bytes
+            ),
+            format!(
+                "Maximum remote coalesced request bytes = {}",
+                self.read_coalesce_max_bytes
             ),
         ]
     }
@@ -607,8 +625,27 @@ fn strict_vortex_budget(value: &pyo3::Bound<'_, PyAny>) -> PyResult<usize> {
 }
 
 #[cfg(feature = "python")]
+fn strict_vortex_coalesce_gap(value: &pyo3::Bound<'_, PyAny>) -> PyResult<usize> {
+    use pyo3::types::{PyBool, PyInt};
+
+    if value.is_instance_of::<PyBool>() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "Vortex read_coalesce_gap_bytes must be an integer, not bool",
+        ));
+    }
+    let gap = value.cast::<PyInt>()?.extract::<usize>()?;
+    if gap > isize::MAX as usize {
+        return Err(PyValueError::new_err(
+            "Vortex read_coalesce_gap_bytes exceeds the platform limit",
+        ));
+    }
+    Ok(gap)
+}
+
+#[cfg(feature = "python")]
 #[pymethods]
 impl VortexSourceConfig {
+    #[allow(clippy::too_many_arguments)]
     #[new]
     #[pyo3(signature = (
         batch_size=131_072,
@@ -617,6 +654,9 @@ impl VortexSourceConfig {
         enable_filter_pushdown=true,
         max_concurrent_requests=8,
         max_in_flight_bytes=67_108_864,
+        enable_read_coalescing=true,
+        read_coalesce_gap_bytes=65_536,
+        read_coalesce_max_bytes=4_194_304,
     ))]
     fn new(
         batch_size: usize,
@@ -624,6 +664,9 @@ impl VortexSourceConfig {
         #[pyo3(from_py_with = strict_vortex_bool)] enable_filter_pushdown: bool,
         #[pyo3(from_py_with = strict_vortex_budget)] max_concurrent_requests: usize,
         #[pyo3(from_py_with = strict_vortex_budget)] max_in_flight_bytes: usize,
+        #[pyo3(from_py_with = strict_vortex_bool)] enable_read_coalescing: bool,
+        #[pyo3(from_py_with = strict_vortex_coalesce_gap)] read_coalesce_gap_bytes: usize,
+        #[pyo3(from_py_with = strict_vortex_budget)] read_coalesce_max_bytes: usize,
     ) -> PyResult<Self> {
         if batch_size == 0 {
             return Err(PyValueError::new_err("Vortex batch_size must be positive"));
@@ -638,12 +681,20 @@ impl VortexSourceConfig {
                 "Vortex max_in_flight_bytes exceeds the supported request budget",
             ));
         }
+        if read_coalesce_max_bytes > isize::MAX as usize {
+            return Err(PyValueError::new_err(
+                "Vortex read_coalesce_max_bytes exceeds the platform limit",
+            ));
+        }
         Ok(Self {
             batch_size,
             enable_projection_pushdown,
             enable_filter_pushdown,
             max_concurrent_requests,
             max_in_flight_bytes,
+            enable_read_coalescing,
+            read_coalesce_gap_bytes,
+            read_coalesce_max_bytes,
         })
     }
 }

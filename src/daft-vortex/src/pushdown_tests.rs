@@ -202,6 +202,7 @@ impl ColumnFile {
                 include_columns: Some(output.iter().map(|name| (*name).to_string()).collect()),
                 limit: None,
             },
+            None,
         )
         .unwrap();
         assert!(observed.lock().unwrap().ranges.is_empty());

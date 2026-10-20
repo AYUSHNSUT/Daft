@@ -4,8 +4,12 @@ pub use py::register_modules;
 mod py {
     use common_error::DaftResult;
     use common_runtime::get_io_runtime;
-    use futures::TryStreamExt;
-    use pyo3::{prelude::*, types::PyDict};
+    use futures::{StreamExt, TryStreamExt};
+    use pyo3::{
+        exceptions::{PyTypeError, PyValueError},
+        prelude::*,
+        types::{PyBool, PyDict, PyInt},
+    };
 
     use crate::{get_io_client, parse_url, s3_like, stats::IOStatsContext};
 
@@ -64,6 +68,98 @@ mod py {
             to_rtn.push(dict);
         }
         Ok(to_rtn)
+    }
+
+    type PyGlobBatch<'py> = (Vec<Bound<'py, PyDict>>, Option<Bound<'py, PyDict>>);
+
+    fn strict_discovery_concurrency(value: &Bound<'_, PyAny>) -> PyResult<usize> {
+        if value.is_instance_of::<PyBool>() {
+            return Err(PyTypeError::new_err(
+                "max_concurrent_inputs must be an integer, not bool",
+            ));
+        }
+        let value = value.cast::<PyInt>()?.extract::<usize>()?;
+        if !(1..=64).contains(&value) {
+            return Err(PyValueError::new_err(
+                "max_concurrent_inputs must be from 1 through 64",
+            ));
+        }
+        Ok(value)
+    }
+
+    /// Ordered, bounded discovery with independent per-input failures.
+    #[pyfunction(signature = (inputs, io_config=None, *, max_concurrent_inputs=8, collect_metrics=false))]
+    fn _io_glob_bulk(
+        py: Python<'_>,
+        inputs: Vec<String>,
+        io_config: Option<common_io_config::python::IOConfig>,
+        #[pyo3(from_py_with = strict_discovery_concurrency)] max_concurrent_inputs: usize,
+        collect_metrics: bool,
+    ) -> PyResult<PyGlobBatch<'_>> {
+        let num_inputs = inputs.len();
+        let stats = collect_metrics.then(|| IOStatsContext::new("Vortex discovery"));
+        let stats_handle = stats.clone();
+        let started = collect_metrics.then(std::time::Instant::now);
+        let outcomes: DaftResult<Vec<crate::Result<Vec<crate::object_io::FileMetadata>>>> = py
+            .detach(|| {
+                let client = get_io_client(true, io_config.unwrap_or_default().config.into())?;
+                get_io_runtime(true).block_on_current_thread(async {
+                    Ok(futures::stream::iter(inputs.into_iter().map(|input| {
+                        let client = client.clone();
+                        let stats = stats_handle.clone();
+                        async move {
+                            let (_, path) = parse_url(&input)?;
+                            let source = client.get_source(&input).await?;
+                            source
+                                .glob(path.as_ref(), None, None, None, stats, None)
+                                .await?
+                                .try_collect()
+                                .await
+                        }
+                    }))
+                    .buffered(max_concurrent_inputs)
+                    .collect()
+                    .await)
+                })
+            });
+        let mut results = Vec::with_capacity(num_inputs);
+        for outcome in outcomes? {
+            let result = PyDict::new(py);
+            match outcome {
+                Ok(files) => {
+                    let mut entries = Vec::with_capacity(files.len());
+                    for file in files {
+                        let entry = PyDict::new(py);
+                        entry.set_item("type", format!("{:?}", file.filetype))?;
+                        entry.set_item("path", file.filepath)?;
+                        entry.set_item("size", file.size)?;
+                        entries.push(entry);
+                    }
+                    result.set_item("files", entries)?;
+                }
+                Err(error) => {
+                    result.set_item(
+                        "error",
+                        PyErr::from(common_error::DaftError::from(error)).into_value(py),
+                    )?;
+                }
+            }
+            results.push(result);
+        }
+        let metrics = if let Some(stats) = stats {
+            let metrics = PyDict::new(py);
+            metrics.set_item("num_inputs", num_inputs)?;
+            metrics.set_item("max_concurrent_inputs", max_concurrent_inputs)?;
+            metrics.set_item("elapsed_seconds", started.unwrap().elapsed().as_secs_f64())?;
+            metrics.set_item("head_requests", stats.load_head_requests())?;
+            metrics.set_item("get_requests", stats.load_get_requests())?;
+            metrics.set_item("list_requests", stats.load_list_requests())?;
+            metrics.set_item("bytes_read", stats.load_bytes_read())?;
+            Some(metrics)
+        } else {
+            None
+        };
+        Ok((results, metrics))
     }
 
     /// Creates an S3Config from the current environment, auto-discovering variables such as
@@ -137,6 +233,7 @@ mod py {
     pub fn register_modules(parent: &Bound<PyModule>) -> PyResult<()> {
         common_io_config::python::register_modules(parent)?;
         parent.add_function(wrap_pyfunction!(io_glob, parent)?)?;
+        parent.add_function(wrap_pyfunction!(_io_glob_bulk, parent)?)?;
         parent.add_function(wrap_pyfunction!(s3_config_from_env, parent)?)?;
         parent.add_function(wrap_pyfunction!(io_put, parent)?)?;
         Ok(())

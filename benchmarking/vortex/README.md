@@ -227,3 +227,125 @@ It takes snapshots before and after the evaluation without polling during
 trials. A failed trial still fails the comparison; diagnostics add no retries or
 pauses between trials. Use a new output directory for each attempt so failed
 runs remain available.
+
+## Phase 6 remote read policies
+
+`remote_eval.py` keeps Phase 4/5 reports and behavior separate. It compares the
+normal Parquet reader with explicit Vortex discovery/coalescing controls in the
+same enabled release build. All configurations retain metadata concurrency 8,
+both pushdowns, batches of 131,072 rows, and the existing request/byte budgets.
+Use the attested release build and `DAFT_VORTEX_BENCH_BUILD_COMMAND` described
+above; production comparisons require a clean tracked checkout.
+
+For tuning alone, use authenticated local MinIO after all builds/tests stop.
+The one-command acceptance flow below also runs this tuning stage automatically.
+
+```bash
+.venv/bin/python -m examples.vortex_eval.run_phase6_services \
+  --manifest examples/vortex_eval/artifacts/phase4/remote-fixtures/manifest.json \
+  --output examples/vortex_eval/artifacts/phase6/tuning \
+  --docker-image draft-vortex-minio:phase3 \
+  --stage tune --rounds 20 --warmups 1 --diagnostics
+```
+
+The fixed tuning grid includes Parquet and four coalescing policies at discovery
+caps 1 and 8: off, 16 KiB gap / 1 MiB maximum range, 64 KiB / 4 MiB, and
+256 KiB / 4 MiB. All five cases are mandatory for production runs: narrow scan,
+1% range, 1% equality, join and full value reduction. This gives 945 performance
+trials for one dataset, plus 45 separate diagnostic queries when requested.
+
+The report ranks policies by the worst case Vortex/Parquet median ratio, then
+geometric mean elapsed time, total execution-source returned bytes and stable
+configuration ID. `selected-policy.json` recommends one policy among discovery-8
+configurations for every case. Its identity and tuning-report hash are saved.
+An off policy can win this selection. No case gets its own tuned policy.
+`--selection` verifies the adjacent tuning report's hash, completed trial grid,
+ranking and winner controls. Production reuse requires the same source/native
+build; final remote acceptance also requires the same fixture manifest. The
+local guard may use its separate local fixture manifest.
+
+Run a separate local regression guard with the same three configurations and
+the existing one/eight-file, sorted/shuffled corpus:
+
+```bash
+.venv/bin/python -m benchmarking.vortex.remote_eval \
+  --manifest examples/vortex_eval/artifacts/phase4/fixtures-1g/manifest.json \
+  --output examples/vortex_eval/artifacts/phase6/local-guard \
+  --stage guard --orders sorted shuffled --layouts single multi \
+  --rounds 20 --warmups 1 --candidate-policy 64k_4m
+```
+
+The guard accepts local fixture paths only, requires at least 20 measured rounds
+and one warmup, and requires every candidate median to be at most 1.05 times
+the Phase 5 equivalent median. Parquet remains a contemporaneous comparator;
+the local guard does not require beating it. Use `--selection` to freeze the
+tuned policy instead of the explicit preset. The final remote performance gate
+below retains its stricter candidate-below-Parquet criterion.
+
+Final acceptance freezes Parquet, the Phase 5 equivalent (coalescing off,
+discovery 1), and one candidate policy at discovery 8. It requires exactly
+50 measured rounds and 3 warmups: 795 performance trials plus 15 separate
+diagnostic queries for one dataset. Every candidate median must be strictly
+below the contemporary Parquet median. A tie, regression, trial error, changed
+provenance, or incomplete requested diagnostic capture prevents acceptance.
+This median gate does not establish statistical significance or a universal win.
+
+Run the complete terminal acceptance with one command after the enabled release
+build and local checks are finished:
+
+```bash
+.venv/bin/python -m examples.vortex_eval.run_phase6_acceptance \
+  --manifest examples/vortex_eval/artifacts/phase4/remote-fixtures/manifest.json \
+  --local-manifest examples/vortex_eval/artifacts/phase4/fixtures-1g/manifest.json \
+  --output "examples/vortex_eval/artifacts/phase6/acceptance-$(date -u +%Y%m%dT%H%M%SZ)" \
+  --docker-image draft-vortex-minio:phase3 \
+  --tune
+```
+
+This terminal helper does not rebuild/install the Python extension. It runs
+20-round/one-warmup tuning with diagnostics, validates the saved winner, then
+passes that frozen selection to the 50-round/three-warmup final comparison with
+diagnostics. Both use the same temporary MinIO server and remote fixture manifest.
+With `--local-manifest`, it next runs the same frozen selection through the local
+guard for all four order/layout datasets, with 20 measured rounds, one warmup and
+separate diagnostics. This adds 1,260 performance trials and 60 diagnostic queries.
+All three stages run sequentially before any test processes. A tuning failure,
+invalid selection, or source/native change blocks the dependent final comparison
+and local guard and is preserved as a failed acceptance; the correctness checks
+still run. A final performance miss does not block the independent local guard.
+The helper then runs
+strict HTTP/MinIO/Ray services with a persistent zero-skip JUnit gate,
+ORC/MCAP, focused Vortex/harness tests, S3 TCP pooling tests and the full
+unfiltered Rust workspace; Cargo may compile test binaries after timing finishes.
+It preserves logs, exit markers, parsed counts and
+`acceptance.json`, and continues checks after a final performance miss. Optional
+`--expected-source` and `--expected-native-sha` guard the exact tested build.
+It removes only its temporary buckets/container. To reuse a separately completed
+tuning run, replace `--tune` with `--selection PATH/selected-policy.json`; these
+options are mutually exclusive. For a final comparison without
+the additional acceptance tests, use `run_phase6_services --stage final` with
+the same selection. `--candidate-policy` instead freezes an explicit preset
+before timing; its default is `64k_4m`.
+
+The direct harness is `python -m benchmarking.vortex.remote_eval`, with
+`--storage-root`, `--orders` and `--layouts` matching the existing harness.
+Service helpers use `--order`/`--layout`. `--allow-dev --rounds 1 --warmups 0`
+permits correctness smoke only; such a run cannot satisfy the final gate or
+produce a selection accepted by a production final run.
+
+Each `--diagnostics` capture wraps one executed source-construction/collection
+query in its own child **after** the performance schedule. The recorder finishes
+before cached-output validation or the separate explain query. Native/Python
+events and logical I/O counters are saved separately, with explicit dropped or
+unfinished-event flags. Nested and concurrent durations overlap; summing them
+would not produce a query latency breakdown. `batch_wait_decode` includes I/O
+wait. Parquet captures cover outer source creation and collection only; missing internal phases/request
+counters are unavailable, not zero cost. Physical transport retries remain
+unavailable. Diagnostic measurements
+never enter the performance summaries.
+
+Fresh children, seeded interleaving, independent result oracles, plans,
+CPU/process-high-water RSS, returned source bytes, hashes, UTC timestamps and
+redacted stderr are retained for every trial. No trial is retried or omitted,
+and there is no inter-trial pacing. The local Docker service is not an AWS/WAN
+benchmark; caches are retained, and client RSS excludes MinIO/Docker resources.

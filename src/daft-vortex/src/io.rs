@@ -5,7 +5,14 @@
 //! Cancellation releases these async-call permits; an already dispatched
 //! blocking filesystem read can finish afterward outside these bounds.
 
-use std::{ops::Range, path::Path, sync::Arc};
+use std::{
+    ops::Range,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use common_error::{DaftError, DaftResult};
 use daft_io::{GetRange, GetResult, IOClient, IOStatsRef};
@@ -15,10 +22,13 @@ use vortex::{
     array::buffer::BufferHandle,
     buffer::{Alignment, ByteBuffer, ByteBufferMut},
     error::{VortexError, VortexResult, vortex_err},
-    io::VortexReadAt,
+    io::{CoalesceConfig, ReadAtRequest, ReadAtStream, VortexReadAt},
 };
 
-use crate::VortexReadOptions;
+use crate::{
+    VortexReadOptions,
+    diagnostics::{self, Phase},
+};
 
 /// Never put URL credentials or signed query parameters into reader diagnostics.
 pub(crate) fn display_uri(uri: &str) -> String {
@@ -66,7 +76,68 @@ pub(crate) fn validate_options(options: &VortexReadOptions) -> DaftResult<()> {
             (u32::MAX as usize).min(Semaphore::MAX_PERMITS)
         )));
     }
+    if options.read_coalesce_gap_bytes > isize::MAX as usize
+        || options.read_coalesce_max_bytes == 0
+        || options.read_coalesce_max_bytes > isize::MAX as usize
+    {
+        return Err(DaftError::ValueError(
+            "Vortex read_coalesce_gap_bytes must be in 0..=isize::MAX and read_coalesce_max_bytes in 1..=isize::MAX".into(),
+        ));
+    }
     Ok(())
+}
+
+fn remote_coalescing(options: &VortexReadOptions, remote: bool) -> Option<CoalesceConfig> {
+    if !remote || !options.enable_read_coalescing {
+        return None;
+    }
+    let actual_cap = options
+        .read_coalesce_max_bytes
+        .min(options.max_in_flight_bytes);
+    Some(CoalesceConfig::new(
+        options.read_coalesce_gap_bytes as u64,
+        actual_cap as u64,
+    ))
+}
+
+struct ReadGroup {
+    requests: Vec<ReadAtRequest>,
+    offset: u64,
+    length: usize,
+    alignment: Alignment,
+}
+
+fn group_reads(requests: &[ReadAtRequest], config: Option<CoalesceConfig>) -> Vec<ReadGroup> {
+    let mut requests = requests.to_vec();
+    if config.is_some() {
+        requests.sort_by_key(|request| request.offset);
+    }
+    let mut groups: Vec<ReadGroup> = Vec::new();
+    for request in requests {
+        if let Some(config) = config
+            && let Some(group) = groups.last_mut()
+            && let Some(current_end) = group.offset.checked_add(group.length as u64)
+            && let Some(request_end) = request.offset.checked_add(request.length as u64)
+            && request.offset <= current_end.saturating_add(config.distance)
+            && let Some(length) = request_end.max(current_end).checked_sub(group.offset)
+            && length <= config.max_size
+            && let Ok(length) = usize::try_from(length)
+        {
+            group.length = length;
+            group.alignment = group.alignment.max(request.alignment);
+            group.requests.push(request);
+            continue;
+        }
+        // Existing individual segments retain their original interval, even if
+        // larger than the coalescing cap. read_at still enforces its byte budget.
+        groups.push(ReadGroup {
+            requests: vec![request],
+            offset: request.offset,
+            length: request.length,
+            alignment: request.alignment,
+        });
+    }
+    groups
 }
 
 // Keep untrusted nested backend messages out of the Vortex error chain: HTTP
@@ -101,7 +172,7 @@ trait RangeReader: Send + Sync + 'static {
 
 struct ClientReader {
     client: Arc<IOClient>,
-    uri: String,
+    uri: Arc<str>,
     stats: IOStatsRef,
 }
 
@@ -112,7 +183,7 @@ impl RangeReader for ClientReader {
         let stats = self.stats.clone();
         async move {
             client
-                .single_url_get(uri, Some(GetRange::Bounded(range)), Some(stats))
+                .single_url_get(uri.to_string(), Some(GetRange::Bounded(range)), Some(stats))
                 .await
         }
         .boxed()
@@ -122,43 +193,74 @@ impl RangeReader for ClientReader {
 pub(crate) struct DaftReadAt {
     backend: Arc<dyn RangeReader>,
     uri: Arc<str>,
+    diagnostic_uri: Arc<str>,
     file_size: u64,
     stats: IOStatsRef,
     requests: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     max_requests: usize,
     max_bytes: usize,
+    coalescing: Option<CoalesceConfig>,
+    diagnostic_phase: AtomicU8,
 }
 
 impl DaftReadAt {
+    #[cfg(test)]
     pub(crate) async fn new(
         uri: String,
         client: Arc<IOClient>,
         stats: IOStatsRef,
         options: &VortexReadOptions,
     ) -> DaftResult<Self> {
+        Self::new_with_phase(uri, client, stats, options, Phase::Data).await
+    }
+
+    pub(crate) async fn new_with_phase(
+        uri: String,
+        client: Arc<IOClient>,
+        stats: IOStatsRef,
+        options: &VortexReadOptions,
+        phase: Phase,
+    ) -> DaftResult<Self> {
         validate_options(options)?;
         let redacted = display_uri(&uri);
+        let remote = !Path::new(&uri).is_absolute()
+            && url::Url::parse(&uri)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "s3"));
         // Each open gets fresh metadata. There is no cross-file/footer cache.
-        let file_size = client
+        let trace = diagnostics::begin(phase, "head", Some(&uri));
+        let size = client
             .single_url_get_size(uri.clone(), Some(stats.clone()))
-            .await
+            .await;
+        diagnostics::complete(trace, size.is_err());
+        let file_size = size
             .map_err(|error| DaftError::ComputeError(io_error(&redacted, &error).to_string()))?
             as u64;
+        // The transport and diagnostics share this URI allocation; disabled
+        // diagnostics do not allocate an additional URL copy.
+        let diagnostic_uri: Arc<str> = Arc::from(uri);
         Ok(Self {
             backend: Arc::new(ClientReader {
                 client,
-                uri,
+                uri: diagnostic_uri.clone(),
                 stats: stats.clone(),
             }),
             uri: redacted.into(),
+            diagnostic_uri,
             file_size,
             stats,
             requests: Arc::new(Semaphore::new(options.max_concurrent_requests)),
             bytes: Arc::new(Semaphore::new(options.max_in_flight_bytes)),
             max_requests: options.max_concurrent_requests,
             max_bytes: options.max_in_flight_bytes,
+            coalescing: remote_coalescing(options, remote),
+            diagnostic_phase: AtomicU8::new(phase as u8),
         })
+    }
+
+    pub(crate) fn mark_data_phase(&self) {
+        self.diagnostic_phase
+            .store(Phase::Data as u8, Ordering::Relaxed);
     }
 }
 
@@ -167,8 +269,12 @@ impl VortexReadAt for DaftReadAt {
         Some(&self.uri)
     }
 
-    // Disable coalescing so unrelated gaps do not spend the configured budget.
-    // The default VortexReadAt coalesce_config is None.
+    fn coalesce_config(&self) -> Option<CoalesceConfig> {
+        // The file driver expands even a single read to its global alignment.
+        // Keep it off: read_ranges merges actual intervals without that padding.
+        None
+    }
+
     fn concurrency(&self) -> usize {
         self.max_requests
     }
@@ -185,12 +291,17 @@ impl VortexReadAt for DaftReadAt {
     ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
         let backend = self.backend.clone();
         let uri = self.uri.clone();
+        let diagnostic_uri = self.diagnostic_uri.clone();
         let stats = self.stats.clone();
         let requests = self.requests.clone();
         let bytes = self.bytes.clone();
         let file_size = self.file_size;
         let max_bytes = self.max_bytes;
+        let phase = Phase::from_u8(self.diagnostic_phase.load(Ordering::Relaxed));
         async move {
+            let mut trace = diagnostics::begin(phase, "range", Some(&diagnostic_uri));
+            if let Some(trace) = &mut trace { trace.range(offset, length); }
+            let result = async {
             let end = offset
                 .checked_add(length as u64)
                 .filter(|end| *end <= file_size)
@@ -205,17 +316,82 @@ impl VortexReadAt for DaftReadAt {
             let end = usize::try_from(end)
                 .map_err(|_| vortex_err!("Vortex range end does not fit usize for {uri:?}"))?;
             if length == 0 {
+                if let Some(trace) = &mut trace { trace.returned(0); }
                 return Ok(BufferHandle::new_host(ByteBuffer::empty_aligned(alignment)));
             }
             let _request = requests.acquire_owned().await
                 .map_err(|_| vortex_err!("Vortex request budget closed"))?;
+            if let Some(trace) = &mut trace { trace.request_wait(); }
             let _bytes = bytes.acquire_many_owned(length as u32).await
                 .map_err(|_| vortex_err!("Vortex byte budget closed"))?;
-            let result = backend.get(start..end).await.map_err(|error| io_error(&uri, &error))?;
-            let buffer = collect_exact(result, length, alignment, &stats, &uri).await?;
+            if let Some(trace) = &mut trace { trace.byte_wait(); }
+            let response = backend.get(start..end).await;
+            if let Some(trace) = &mut trace { trace.headers(); }
+            let result = response.map_err(|error| io_error(&uri, &error))?;
+            let collected = collect_exact(result, length, alignment, &stats, &uri).await;
+            if let Some(trace) = &mut trace { trace.body(); }
+            let buffer = collected?;
+            if let Some(trace) = &mut trace { trace.returned(length); }
             Ok(BufferHandle::new_host(buffer))
+            }.await;
+            diagnostics::complete(trace, result.is_err());
+            result
         }
         .boxed()
+    }
+
+    fn read_ranges(&self, requests: Arc<[ReadAtRequest]>) -> ReadAtStream {
+        let Some(config) = self.coalescing else {
+            // Match the pinned Vortex default path for local and disabled reads.
+            let reads = requests
+                .iter()
+                .copied()
+                .map(|request| {
+                    let read = self.read_at(request.offset, request.length, request.alignment);
+                    async move { (request, read.await) }
+                })
+                .collect::<Vec<_>>();
+            return futures::stream::iter(reads)
+                .buffer_unordered(self.concurrency().max(1))
+                .boxed();
+        };
+        let reads = group_reads(&requests, Some(config))
+            .into_iter()
+            .map(|group| {
+                let read = self.read_at(group.offset, group.length, group.alignment);
+                async move {
+                    if group.requests.len() == 1 {
+                        return vec![(group.requests[0], read.await)];
+                    }
+                    match read.await.and_then(|buffer| buffer.try_into_host_sync()) {
+                        Ok(buffer) => group
+                            .requests
+                            .into_iter()
+                            .map(|request| {
+                                let start = usize::try_from(request.offset - group.offset).unwrap();
+                                // Logical starts need not share the merged buffer's alignment.
+                                let bytes = buffer
+                                    .slice_unaligned(start..start + request.length)
+                                    .aligned(request.alignment);
+                                (request, Ok(BufferHandle::new_host(bytes)))
+                            })
+                            .collect::<Vec<_>>(),
+                        Err(error) => {
+                            let message = error.to_string();
+                            group
+                                .requests
+                                .into_iter()
+                                .map(|request| (request, Err(vortex_err!("{message}"))))
+                                .collect()
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        futures::stream::iter(reads)
+            .buffer_unordered(self.max_requests)
+            .flat_map(futures::stream::iter)
+            .boxed()
     }
 }
 

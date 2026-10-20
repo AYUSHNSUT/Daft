@@ -14,7 +14,7 @@ query over Vortex-encoded arrays.
 ## Install from the fork
 
 Use Python 3.11 and the Rust toolchain pinned in `rust-toolchain.toml`
-(`nightly-2026-05-27`). From a checkout of the fork's `poc/vortex-phase5` branch:
+(`nightly-2026-05-27`). From a checkout of the fork's `poc/vortex-phase6` branch:
 
 ```bash
 uv venv --python 3.11 .venv
@@ -144,6 +144,10 @@ df = daft.read_vortex(
     max_concurrent_requests=8,
     max_in_flight_bytes=64 * 1024 * 1024,
     metadata_concurrency=8,
+    discovery_concurrency=8,
+    enable_read_coalescing=True,
+    read_coalesce_gap_bytes=65536,
+    read_coalesce_max_bytes=4 * 1024 * 1024,
 )
 ```
 
@@ -164,6 +168,29 @@ and defaults to 8; use 1 for a serial comparison. Each concurrently opened file
 has its own request/byte budget, so the aggregate can multiply by this setting.
 It is independent of execution scan-task concurrency. Reused and pickled sources
 refresh counts on every materialization; execution reopens and validates files.
+
+Remote input discovery uses ordered windows of at most `discovery_concurrency`
+inputs, a strict integer from 1 through 64. Local inputs keep their original
+discovery path. Directory fallback, first-error ordering and deduplication are
+preserved. Set this option to 1 to compare with serial discovery.
+
+Read coalescing joins nearby HTTP/S3 segment requests into one contiguous read.
+The gap is a nonnegative integer and the merge cap is a positive integer; both
+reject Booleans and values beyond the platform's signed integer maximum. The
+actual merged span, including unused bytes between segments, must fit the merge
+cap and the existing in-flight byte budget. Individual requests keep their
+existing bounds, even when larger than the merge cap. Each logical result retains
+its requested slice and alignment. Local-file reads, HEAD requests and initial
+footer reads are not merged. Merging can increase returned bytes and memory;
+it is not guaranteed to reduce latency.
+Only requests submitted in the same native batch can merge. With the pinned
+driver, `max_concurrent_requests=1` produces singleton batches and leaves no
+merging opportunity.
+
+The Phase 5-equivalent comparison uses `enable_read_coalescing=False`,
+`discovery_concurrency=1`, and `metadata_concurrency=8`. The
+[Phase 6 plan](../contributing/vortex-phase6-design.md) describes diagnostics and
+the performance gate; implementation and acceptance are still in progress.
 
 Each file creates one Daft task. A large single file is not split into independent
 Daft scan tasks. Native result delivery honors `results_buffer_size`, but that

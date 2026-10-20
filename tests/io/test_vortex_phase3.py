@@ -33,6 +33,21 @@ def vortex_writer():
     return pytest.importorskip("vortex", reason="optional vortex-data package is needed only to write test fixtures")
 
 
+def _patch_discovery(monkeypatch, glob):
+    def bulk(inputs, *, io_config, **_kwargs):
+        outcomes = []
+        for path in inputs:
+            try:
+                infos = glob(path, file_format=None, io_config=io_config)
+                outcomes.append({"files": [{"path": value, "size": None} for value in infos.file_paths]})
+            except Exception as error:
+                outcomes.append({"error": error})
+        return outcomes, None
+
+    monkeypatch.setattr(_vortex, "glob_path_with_stats", glob)
+    monkeypatch.setattr(_native, "_io_glob_bulk", bulk, raising=False)
+
+
 @pytest.mark.parametrize("name", ["max_concurrent_requests", "max_in_flight_bytes"])
 @pytest.mark.parametrize("value", [0, -1, True, False, 1.5, "8", None, np.int64(8)])
 def test_vortex_request_budgets_validate_before_io(name: str, value) -> None:
@@ -69,6 +84,9 @@ def test_vortex_native_config_budget_pickle_without_reader_feature() -> None:
         enable_filter_pushdown=True,
         max_concurrent_requests=3,
         max_in_flight_bytes=2 * 1024 * 1024,
+        enable_read_coalescing=False,
+        read_coalesce_gap_bytes=7,
+        read_coalesce_max_bytes=1024,
     )
     restored = cloudpickle.loads(cloudpickle.dumps(config))
     assert restored.batch_size == 5
@@ -76,6 +94,9 @@ def test_vortex_native_config_budget_pickle_without_reader_feature() -> None:
     assert restored.enable_filter_pushdown is True
     assert restored.max_concurrent_requests == 3
     assert restored.max_in_flight_bytes == 2 * 1024 * 1024
+    assert restored.enable_read_coalescing is False
+    assert restored.read_coalesce_gap_bytes == 7
+    assert restored.read_coalesce_max_bytes == 1024
 
 
 @pytest.mark.parametrize("name", ["max_concurrent_requests", "max_in_flight_bytes"])
@@ -176,7 +197,7 @@ def test_vortex_missing_http_diagnostics_redact_credentials(
             raise FileNotFoundError(f"404 not found: {path}")
         return SimpleNamespace(file_paths=[])
 
-    monkeypatch.setattr(_vortex, "glob_path_with_stats", glob)
+    _patch_discovery(monkeypatch, glob)
     with pytest.raises(FileNotFoundError) as failure:
         _vortex._resolve_vortex_paths([path], None)
     for secret in ["sentinel-user", "sentinel-password", "sentinel-query"]:
@@ -228,7 +249,7 @@ def test_vortex_remote_listing_deduplicates_overlaps_and_escapes_http_query(monk
             files = [path]
         return SimpleNamespace(file_paths=files)
 
-    monkeypatch.setattr(_vortex, "glob_path_with_stats", glob)
+    _patch_discovery(monkeypatch, glob)
     assert _vortex._resolve_vortex_paths([first, "s3://bucket", url, url], io_config) == [first, second, url]
     assert all(config is io_config for _, config in calls)
     assert ("s3://bucket/**/*.vortex", io_config) in calls
@@ -246,7 +267,7 @@ def test_vortex_http_discovery_rejects_html_child_urls(monkeypatch: pytest.Monke
         calls.append(discovery_path)
         return SimpleNamespace(file_paths=children)
 
-    monkeypatch.setattr(_vortex, "glob_path_with_stats", glob)
+    _patch_discovery(monkeypatch, glob)
     with pytest.raises(ValueError, match="exact original file URL") as failure:
         _vortex._resolve_vortex_paths([path], None)
     assert len(calls) == 1
@@ -262,7 +283,7 @@ def test_vortex_http_discovery_preserves_ipv6_authority(monkeypatch: pytest.Monk
         calls.append(discovery_path)
         return SimpleNamespace(file_paths=[path])
 
-    monkeypatch.setattr(_vortex, "glob_path_with_stats", glob)
+    _patch_discovery(monkeypatch, glob)
     assert _vortex._resolve_vortex_paths([path], None) == [path]
     assert calls == ["http://[::1]/data.vortex\\?fixture=1"]
 
@@ -293,13 +314,21 @@ def test_vortex_io_config_and_budgets_reach_discovery_schema_and_tasks(monkeypat
         observed["task"] = kwargs
         return object()
 
-    monkeypatch.setattr(_vortex, "glob_path_with_stats", glob)
+    _patch_discovery(monkeypatch, glob)
     monkeypatch.setattr(_native, "read_vortex_schema", infer, raising=False)
     monkeypatch.setattr(_native, "read_vortex_metadata_bulk", metadata, raising=False)
     monkeypatch.setattr(_native, "VortexSourceConfig", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(DataSourceTask, "vortex", staticmethod(task))
     source = _vortex.VortexSource(
-        [path], io_config, 3, metadata_concurrency=3, max_concurrent_requests=2, max_in_flight_bytes=4096
+        [path],
+        io_config,
+        3,
+        metadata_concurrency=3,
+        max_concurrent_requests=2,
+        max_in_flight_bytes=4096,
+        enable_read_coalescing=False,
+        read_coalesce_gap_bytes=7,
+        read_coalesce_max_bytes=1024,
     )
 
     async def tasks():
@@ -312,6 +341,9 @@ def test_vortex_io_config_and_budgets_reach_discovery_schema_and_tasks(monkeypat
         "io_config": io_config,
         "max_concurrent_requests": 2,
         "max_in_flight_bytes": 4096,
+        "enable_read_coalescing": False,
+        "read_coalesce_gap_bytes": 7,
+        "read_coalesce_max_bytes": 1024,
     }
     assert observed["metadata_paths"] == [path]
     assert observed["metadata_options"] == {**observed["schema_options"], "max_concurrent_files": 3}
@@ -322,6 +354,9 @@ def test_vortex_io_config_and_budgets_reach_discovery_schema_and_tasks(monkeypat
     assert task["storage_config"].io_config.__getstate__() == io_config.__getstate__()
     assert task["vortex_config"].max_concurrent_requests == 2
     assert task["vortex_config"].max_in_flight_bytes == 4096
+    assert task["vortex_config"].enable_read_coalescing is False
+    assert task["vortex_config"].read_coalesce_gap_bytes == 7
+    assert task["vortex_config"].read_coalesce_max_bytes == 1024
     assert b"daft.vortex.nullable" in source._scan_schema.to_pyarrow_schema().field("id").metadata
     assert b"daft.vortex.nullable" not in (source.schema.to_pyarrow_schema().field("id").metadata or {})
 
@@ -374,6 +409,9 @@ def test_vortex_flotilla_plan_transport_keeps_request_budget(
             enable_filter_pushdown=config.enable_filter_pushdown,
             max_concurrent_requests=config.max_concurrent_requests,
             max_in_flight_bytes=1,
+            enable_read_coalescing=config.enable_read_coalescing,
+            read_coalesce_gap_bytes=config.read_coalesce_gap_bytes,
+            read_coalesce_max_bytes=config.read_coalesce_max_bytes,
         )
         return original_task(**kwargs)
 

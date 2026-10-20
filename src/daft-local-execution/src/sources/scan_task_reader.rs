@@ -375,6 +375,9 @@ async fn read_vortex(
         enable_filter_pushdown: cfg.enable_filter_pushdown,
         max_concurrent_requests: cfg.max_concurrent_requests,
         max_in_flight_bytes: cfg.max_in_flight_bytes,
+        enable_read_coalescing: cfg.enable_read_coalescing,
+        read_coalesce_gap_bytes: cfg.read_coalesce_gap_bytes,
+        read_coalesce_max_bytes: cfg.read_coalesce_max_bytes,
     };
     let convert_options = daft_vortex::VortexConvertOptions {
         schema: scan_task.schema.clone(),

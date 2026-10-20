@@ -24,6 +24,7 @@ use vortex::{
 
 use crate::{
     VortexConvertOptions, VortexReadOptions,
+    diagnostics::{self, Phase},
     io::{DaftReadAt, display_uri, validate_options},
     plan::plan_scan,
 };
@@ -118,20 +119,30 @@ async fn open_file(
     io_client: Arc<IOClient>,
     io_stats: IOStatsRef,
     options: &VortexReadOptions,
+    phase: Phase,
 ) -> DaftResult<(VortexSession, VortexFile)> {
     validate_options(options)?;
     let uri = input_uri(uri)?;
     tokio::runtime::Handle::try_current()
         .map_err(|error| read_error(&uri, "requires an active Tokio runtime", error))?;
-    let session = VortexSession::default().with_tokio();
-    let reader = Arc::new(DaftReadAt::new(uri.clone(), io_client, io_stats, options).await?);
-    let file = session
-        .open_options()
-        .with_initial_read_size(options.max_in_flight_bytes.min(65535))
-        .open(reader)
-        .await
-        .map_err(|error| read_error(&uri, "open", error))?;
-    Ok((session, file))
+    let trace = diagnostics::begin(phase, "open", Some(&uri));
+    let result: DaftResult<_> = async {
+        let session = VortexSession::default().with_tokio();
+        let reader = Arc::new(
+            DaftReadAt::new_with_phase(uri.clone(), io_client, io_stats, options, phase).await?,
+        );
+        let file = session
+            .open_options()
+            .with_initial_read_size(options.max_in_flight_bytes.min(65535))
+            .open(reader.clone())
+            .await
+            .map_err(|error| read_error(&uri, "open", error))?;
+        reader.mark_data_phase();
+        Ok((session, file))
+    }
+    .await;
+    diagnostics::complete(trace, result.is_err());
+    result
 }
 
 /// Build the Arrow export schema and the full Daft scan schema separately, so
@@ -272,9 +283,11 @@ pub async fn read_vortex_schema(
     io_stats: IOStatsRef,
     read_options: VortexReadOptions,
 ) -> DaftResult<SchemaRef> {
-    Ok(read_vortex_metadata(uri, io_client, io_stats, read_options)
-        .await?
-        .0)
+    Ok(
+        read_metadata(uri, io_client, io_stats, read_options, Phase::Schema)
+            .await?
+            .0,
+    )
 }
 
 /// Read schema and unfiltered row count from the footer without decoding rows.
@@ -287,7 +300,24 @@ pub async fn read_vortex_metadata(
     io_stats: IOStatsRef,
     read_options: VortexReadOptions,
 ) -> DaftResult<(SchemaRef, u64)> {
-    let (session, file) = open_file(uri, io_client, io_stats, &read_options).await?;
+    read_metadata(
+        uri,
+        io_client,
+        io_stats,
+        read_options,
+        Phase::PlanningMetadata,
+    )
+    .await
+}
+
+pub(crate) async fn read_metadata(
+    uri: &str,
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+    phase: Phase,
+) -> DaftResult<(SchemaRef, u64)> {
+    let (session, file) = open_file(uri, io_client, io_stats, &read_options, phase).await?;
     Ok((
         schemas(&display_uri(uri), &session, file.dtype())?.1,
         file.row_count(),
@@ -333,6 +363,7 @@ struct ScanState {
     projection: Option<Vec<usize>>,
     remaining: Option<usize>,
     uri: String,
+    first_batch: Option<diagnostics::Span>,
 }
 
 /// Stream one file. Validate the complete schema first, then apply the
@@ -350,13 +381,23 @@ pub async fn stream_vortex(
             display_uri(uri)
         )));
     }
-    let (session, file) = open_file(uri, io_client, io_stats, &read_options).await?;
+    let uri = input_uri(uri)?;
+    let first_batch = diagnostics::begin(Phase::Execution, "first_batch", Some(&uri));
+    let (session, file) = open_file(
+        &uri,
+        io_client,
+        io_stats,
+        &read_options,
+        Phase::ExecutionOpen,
+    )
+    .await?;
     stream_opened_vortex(
-        &display_uri(uri),
+        &uri,
         session,
         file,
         read_options,
         convert_options,
+        first_batch,
     )
 }
 
@@ -368,6 +409,7 @@ fn stream_opened_vortex(
     file: VortexFile,
     read_options: VortexReadOptions,
     convert_options: VortexConvertOptions,
+    first_batch: Option<diagnostics::Span>,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let (arrow_schema, actual_schema) = schemas(uri, &session, file.dtype())?;
     validate_schema(uri, &convert_options.schema, &actual_schema)?;
@@ -407,21 +449,32 @@ fn stream_opened_vortex(
         projection: Some(plan.output_indices),
         remaining: convert_options.limit,
         uri: uri.to_string(),
+        first_batch,
     };
     Ok(futures::stream::try_unfold(state, |mut state| async move {
         loop {
             let Some(source) = state.batches.as_mut() else {
                 return Ok(None);
             };
-            let Some(arrow) = source.try_next().await? else {
+            // Awaiting the next batch includes remote I/O and decode work.
+            let trace = diagnostics::begin(Phase::Execution, "batch_wait_decode", Some(&state.uri));
+            let decoded = source.try_next().await;
+            diagnostics::complete(trace, decoded.is_err());
+            let Some(arrow) = decoded? else {
                 return Ok(None);
             };
-            let mut batch = to_daft(&arrow)
-                .map_err(|error| read_error(&state.uri, "Arrow conversion", error))?;
+            let trace = diagnostics::begin(Phase::Execution, "arrow_conversion", Some(&state.uri));
+            let converted = to_daft(&arrow);
+            diagnostics::complete(trace, converted.is_err());
+            let mut batch =
+                converted.map_err(|error| read_error(&state.uri, "Arrow conversion", error))?;
             if let Some(predicate) = &state.predicate {
-                batch = batch
-                    .filter(std::slice::from_ref(predicate))
-                    .map_err(|error| read_error(&state.uri, "residual filter", error))?;
+                let trace =
+                    diagnostics::begin(Phase::Execution, "residual_filter", Some(&state.uri));
+                let filtered = batch.filter(std::slice::from_ref(predicate));
+                diagnostics::complete(trace, filtered.is_err());
+                batch =
+                    filtered.map_err(|error| read_error(&state.uri, "residual filter", error))?;
             }
             if batch.is_empty() {
                 continue;
@@ -445,6 +498,7 @@ fn stream_opened_vortex(
                     state.reader = None;
                 }
             }
+            diagnostics::complete(state.first_batch.take(), false);
             return Ok(Some((batch, state)));
         }
     })

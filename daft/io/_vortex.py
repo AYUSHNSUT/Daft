@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NoReturn
 from urllib.parse import urlsplit, urlunsplit
 
 from daft import daft as _native
@@ -38,11 +38,25 @@ def _validate_metadata_concurrency(value: int) -> None:
         )
 
 
+def _validate_read_controls(enabled: bool, gap: int, maximum: int, discovery: int) -> None:
+    if not isinstance(enabled, bool):
+        raise TypeError(f"enable_read_coalescing must be a bool, received {enabled!r}")
+    for name, value, minimum in (
+        ("read_coalesce_gap_bytes", gap, 0),
+        ("read_coalesce_max_bytes", maximum, 1),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= sys.maxsize:
+            raise ValueError(f"{name} must be an integer from {minimum} through {sys.maxsize}, received {value!r}")
+    if isinstance(discovery, bool) or not isinstance(discovery, int) or not 1 <= discovery <= 64:
+        raise ValueError(f"discovery_concurrency must be an integer from 1 through 64, received {discovery!r}")
+
+
 def _require_vortex() -> None:
     if (
         not hasattr(_native, "read_vortex_schema")
         or not hasattr(_native, "read_vortex_metadata")
         or not hasattr(_native, "read_vortex_metadata_bulk")
+        or not hasattr(_native, "_io_glob_bulk")
         or not hasattr(_native.PyDataSourceTask, "vortex")
     ):
         raise ImportError(_FEATURE_ERROR)
@@ -72,17 +86,59 @@ def _discover(path: str, discovery_path: str, io_config: IOConfig | None) -> Fil
     try:
         return glob_path_with_stats(discovery_path, file_format=None, io_config=io_config)
     except Exception as error:
-        if urlsplit(path).scheme not in {"http", "https", "s3"}:
-            raise
-        # Preserve useful backend status text without exposing a signed query
-        # or URL userinfo when discovery fails before native reader creation.
-        message = str(error).replace(discovery_path, _display_path(path)).replace(path, _display_path(path))
-        parsed = urlsplit(path)
-        for secret in (parsed.query, parsed.fragment, parsed.username, parsed.password):
-            if secret:
-                message = message.replace(secret, "<redacted>")
-        error_type = FileNotFoundError if isinstance(error, FileNotFoundError) else OSError
-        raise error_type(f"Vortex discovery for {_display_path(path)!r}: {message}") from None
+        _raise_discovery_error(path, discovery_path, error)
+
+
+def _raise_discovery_error(path: str, discovery_path: str, error: Exception) -> NoReturn:
+    if urlsplit(path).scheme not in {"http", "https", "s3"}:
+        raise error
+    # Sanitize only when consuming this outcome, preserving original error order.
+    message = str(error).replace(discovery_path, _display_path(path)).replace(path, _display_path(path))
+    parsed = urlsplit(path)
+    for secret in (parsed.query, parsed.fragment, parsed.username, parsed.password):
+        if secret:
+            message = message.replace(secret, "<redacted>")
+    error_type = FileNotFoundError if isinstance(error, FileNotFoundError) else OSError
+    raise error_type(f"Vortex discovery for {_display_path(path)!r}: {message}") from None
+
+
+def _discovery_path(path: str) -> str:
+    if urlsplit(path).scheme not in {"http", "https"}:
+        return path
+    authority_end = path.index("://") + 3 + len(urlsplit(path).netloc)
+    return path[:authority_end] + "".join(
+        f"\\{character}" if character in "\\*?{}[]" else character for character in path[authority_end:]
+    )
+
+
+def _bulk_discover(
+    paths: list[str], io_config: IOConfig | None, concurrency: int, *, display_paths: list[str] | None = None
+) -> list[dict[str, Any]]:
+    from daft.io import _vortex_diagnostics as diagnostics
+
+    discovery_paths = [_discovery_path(path) for path in paths]
+    capture_token = diagnostics.capture_token()
+    try:
+        outcomes, metrics = _native._io_glob_bulk(
+            discovery_paths,
+            io_config=io_config,
+            max_concurrent_inputs=concurrency,
+            collect_metrics=capture_token is not None,
+        )
+    except Exception as error:
+        _raise_discovery_error((display_paths or paths)[0], discovery_paths[0], error)
+    if metrics is not None:
+        diagnostics.record_discovery(metrics, token=capture_token)
+    return outcomes
+
+
+def _discovery_infos(path: str, outcome: dict[str, Any], discovery_path: str | None = None) -> FileInfos:
+    if "error" in outcome:
+        _raise_discovery_error(path, discovery_path or _discovery_path(path), outcome["error"])
+    files = {entry["path"]: entry for entry in outcome["files"]}
+    return FileInfos.from_infos(
+        file_paths=list(files), file_sizes=[entry["size"] for entry in files.values()], num_rows=[None] * len(files)
+    )
 
 
 def _local_path(path: str) -> str:
@@ -148,28 +204,44 @@ def _input_paths(path: str | Path | list[str | Path]) -> list[str]:
     return paths
 
 
-def _resolve_vortex_paths(paths: list[str], io_config: IOConfig | None) -> list[str]:
+def _resolve_vortex_paths(paths: list[str], io_config: IOConfig | None, discovery_concurrency: int = 8) -> list[str]:
+    from daft.io import _vortex_diagnostics as diagnostics
+
+    with diagnostics.stage("discovery"):
+        return _resolve_vortex_paths_inner(paths, io_config, discovery_concurrency)
+
+
+def _resolve_vortex_paths_inner(paths: list[str], io_config: IOConfig | None, discovery_concurrency: int) -> list[str]:
     resolved = []
     seen = set()
-    for path in paths:
+    remote_outcomes: Iterator[dict[str, Any]] = iter(())
+    remote_remaining = 0
+    for index, path in enumerate(paths):
         scheme = urlsplit(path).scheme
-        # Exact HTTP URLs can contain query delimiters that the shared globber
-        # would otherwise interpret as wildcard syntax. Its literal-escape
-        # path removes these escapes before invoking the HTTP size request.
-        discovery_path = path
-        if scheme in {"http", "https"}:
-            # IPv6 authority brackets are URL syntax, not glob metacharacters.
-            authority_end = path.index("://") + 3 + len(urlsplit(path).netloc)
-            discovery_path = path[:authority_end] + "".join(
-                f"\\{character}" if character in "\\*?{}[]" else character for character in path[authority_end:]
-            )
-        infos = _discover(path, discovery_path, io_config)
+        remote = scheme in {"http", "https", "s3"}
+        if remote:
+            if remote_remaining == 0:
+                window = []
+                for candidate in paths[index : index + discovery_concurrency]:
+                    if urlsplit(candidate).scheme not in {"http", "https", "s3"}:
+                        break
+                    window.append(candidate)
+                remote_outcomes = iter(_bulk_discover(window, io_config, discovery_concurrency))
+                remote_remaining = len(window)
+            infos = _discovery_infos(path, next(remote_outcomes))
+            remote_remaining -= 1
+        else:
+            infos = _discover(path, path, io_config)
         is_glob = any(character in path for character in "*?[{")
-        remote = urlsplit(path).scheme in {"http", "https", "s3"}
         is_file = len(infos.file_paths) == 1 and _normalize_vortex_path(infos.file_paths[0]) == path
         if not is_glob and not is_file and urlsplit(path).scheme not in {"http", "https"}:
             directory_glob = f"{path.rstrip('/')}/**/*.vortex"
-            infos = _discover(path, directory_glob, io_config)
+            if remote:
+                # Resolve this earlier input's fallback before observing later errors.
+                outcome = _bulk_discover([directory_glob], io_config, discovery_concurrency, display_paths=[path])[0]
+                infos = _discovery_infos(path, outcome, directory_glob)
+            else:
+                infos = _discover(path, directory_glob, io_config)
         if not infos.file_paths:
             raise FileNotFoundError(f"No Vortex files found for {_display_path(path)!r}")
         if scheme in {"http", "https"} and not is_file:
@@ -199,6 +271,10 @@ def read_vortex(
     max_concurrent_requests: int = 8,
     max_in_flight_bytes: int = 64 * 1024 * 1024,
     metadata_concurrency: int = 8,
+    enable_read_coalescing: bool = True,
+    read_coalesce_gap_bytes: int = 65536,
+    read_coalesce_max_bytes: int = 4194304,
+    discovery_concurrency: int = 8,
 ) -> DataFrame:
     """Read Vortex files with the experimental native reader.
 
@@ -234,6 +310,13 @@ def read_vortex(
             footer metadata, from 1 through 64. Default 8. Each open has its
             own request/byte budget; this is independent of scan-task execution
             concurrency and does not establish a query-wide memory bound.
+        enable_read_coalescing: Merge nearby Vortex reads within each opened reader. Default True.
+        read_coalesce_gap_bytes: Maximum gap eligible for merging, from 0 through the platform's signed integer maximum.
+            Default 65536. Validated even when coalescing is disabled.
+        read_coalesce_max_bytes: Maximum merged request size, default 4194304. Must be a positive signed-platform integer.
+            The reader clamps this to its request-byte budget. This is not a decoded-memory bound.
+        discovery_concurrency: Maximum concurrent remote input discoveries, from 1 through 64. Default 8.
+            Results and errors retain input order; local discovery remains sequential.
 
     Note:
         Requires a build with Rust features ``python,vortex``. The Python
@@ -266,6 +349,9 @@ def read_vortex(
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         raise ValueError(f"batch_size must be a positive integer, received {batch_size!r}")
     _validate_metadata_concurrency(metadata_concurrency)
+    _validate_read_controls(
+        enable_read_coalescing, read_coalesce_gap_bytes, read_coalesce_max_bytes, discovery_concurrency
+    )
     for name, value in (
         ("max_concurrent_requests", max_concurrent_requests),
         ("max_in_flight_bytes", max_in_flight_bytes),
@@ -293,6 +379,10 @@ def read_vortex(
         max_concurrent_requests=max_concurrent_requests,
         max_in_flight_bytes=max_in_flight_bytes,
         metadata_concurrency=metadata_concurrency,
+        enable_read_coalescing=enable_read_coalescing,
+        read_coalesce_gap_bytes=read_coalesce_gap_bytes,
+        read_coalesce_max_bytes=read_coalesce_max_bytes,
+        discovery_concurrency=discovery_concurrency,
     ).read()
 
 
@@ -308,9 +398,16 @@ class VortexSource(DataSource):
         max_concurrent_requests: int = 8,
         max_in_flight_bytes: int = 64 * 1024 * 1024,
         metadata_concurrency: int = 8,
+        enable_read_coalescing: bool = True,
+        read_coalesce_gap_bytes: int = 65536,
+        read_coalesce_max_bytes: int = 4194304,
+        discovery_concurrency: int = 8,
     ) -> None:
         _validate_metadata_concurrency(metadata_concurrency)
-        self._paths = _resolve_vortex_paths(paths, io_config)
+        _validate_read_controls(
+            enable_read_coalescing, read_coalesce_gap_bytes, read_coalesce_max_bytes, discovery_concurrency
+        )
+        self._paths = _resolve_vortex_paths(paths, io_config, discovery_concurrency)
         self._batch_size = batch_size
         self._io_config = io_config
         self._enable_projection_pushdown = enable_projection_pushdown
@@ -318,6 +415,10 @@ class VortexSource(DataSource):
         self._max_concurrent_requests = max_concurrent_requests
         self._max_in_flight_bytes = max_in_flight_bytes
         self._metadata_concurrency = metadata_concurrency
+        self._enable_read_coalescing = enable_read_coalescing
+        self._read_coalesce_gap_bytes = read_coalesce_gap_bytes
+        self._read_coalesce_max_bytes = read_coalesce_max_bytes
+        self._discovery_concurrency = discovery_concurrency
         # Preserve native metadata: it carries original field nullability for
         # strict matching, which Daft's logical types alone cannot represent.
         self._scan_schema = Schema._from_pyschema(
@@ -326,6 +427,9 @@ class VortexSource(DataSource):
                 io_config=io_config,
                 max_concurrent_requests=max_concurrent_requests,
                 max_in_flight_bytes=max_in_flight_bytes,
+                enable_read_coalescing=enable_read_coalescing,
+                read_coalesce_gap_bytes=read_coalesce_gap_bytes,
+                read_coalesce_max_bytes=read_coalesce_max_bytes,
             )
         )
         public_fields = []
@@ -359,6 +463,9 @@ class VortexSource(DataSource):
                 max_concurrent_files=self._metadata_concurrency,
                 max_concurrent_requests=self._max_concurrent_requests,
                 max_in_flight_bytes=self._max_in_flight_bytes,
+                enable_read_coalescing=self._enable_read_coalescing,
+                read_coalesce_gap_bytes=self._read_coalesce_gap_bytes,
+                read_coalesce_max_bytes=self._read_coalesce_max_bytes,
             )
             row_counts = [num_rows for _, num_rows in metadata]
             del metadata
@@ -375,6 +482,9 @@ class VortexSource(DataSource):
                         enable_filter_pushdown=self._enable_filter_pushdown,
                         max_concurrent_requests=self._max_concurrent_requests,
                         max_in_flight_bytes=self._max_in_flight_bytes,
+                        enable_read_coalescing=self._enable_read_coalescing,
+                        read_coalesce_gap_bytes=self._read_coalesce_gap_bytes,
+                        read_coalesce_max_bytes=self._read_coalesce_max_bytes,
                     ),
                     pushdowns=pushdowns,
                     storage_config=StorageConfig(multithreaded_io=True, io_config=self._io_config),

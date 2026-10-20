@@ -51,12 +51,16 @@ experimental binary; no persisted native-plan compatibility is promised.
 
 ### Bounded remote read merging
 
-Use the pinned Vortex 0.88 positional-reader coalescing API. The actual merged
-range, including unused gaps and alignment prefix, must fit the existing
-per-reader byte budget. Vortex adds up to `max_alignment - 1` to the configured
-merge limit. Reserve its maximum accepted serialized alignment padding before
-passing the limit to Vortex; if no positive merge window remains, use the
-existing unmerged path. A larger individual request retains its existing error.
+Use the pinned Vortex 0.88 positional-reader batch API to merge actual requested
+spans. Keep its automatic coalescing configuration disabled: that implementation
+aligns starts down using the global segment alignment, including for an
+individual segment, which can push a previously valid request over its budget.
+Join nearby requests only when their actual contiguous span, including gaps,
+fits both the configured merge cap and the existing request-byte budget. Split
+the returned buffer into correctly aligned results for each original request.
+Individual requests retain their existing bounds and error behavior, including
+requests larger than the merge cap. Group futures retain the existing request
+and byte semaphores and are owned by the returned stream, not detached tasks.
 
 Merging affects data-segment requests, not HEAD requests or the standard initial
 65,535-byte footer read. Do not predict footer-count savings from this change.

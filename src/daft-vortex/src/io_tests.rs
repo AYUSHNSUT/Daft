@@ -8,13 +8,256 @@ use std::{
 
 use bytes::Bytes;
 use daft_io::{GetResult, IOClient, IOStatsContext};
-use futures::{FutureExt, StreamExt, poll};
+use futures::{FutureExt, StreamExt, future::join_all, poll};
 use tempfile::NamedTempFile;
 use tokio::sync::Semaphore;
-use vortex::{buffer::Alignment, io::VortexReadAt};
+use vortex::{
+    VortexSessionDefault,
+    buffer::Alignment,
+    file::{
+        SegmentSpec,
+        segments::{FileSegmentSource, RequestMetrics},
+    },
+    io::{ReadAtRequest, VortexReadAt, session::RuntimeSessionExt},
+    layout::segments::SegmentSource,
+    metrics::DefaultMetricsRegistry,
+    session::VortexSession,
+};
 
 use super::{DaftReadAt, RangeReader, display_uri, validate_options};
 use crate::VortexReadOptions;
+
+struct RangeBytesReader {
+    data: Bytes,
+    calls: Mutex<Vec<Range<usize>>>,
+}
+
+impl RangeReader for RangeBytesReader {
+    fn get(
+        &self,
+        range: Range<usize>,
+    ) -> futures::future::BoxFuture<'static, daft_io::Result<GetResult>> {
+        self.calls.lock().unwrap().push(range.clone());
+        let bytes = self.data.slice(range);
+        let length = bytes.len();
+        async move {
+            Ok(GetResult::Stream(
+                futures::stream::iter([Ok(bytes)]).boxed(),
+                Some(length),
+                None,
+                None,
+            ))
+        }
+        .boxed()
+    }
+}
+
+fn range_adapter(
+    options: &VortexReadOptions,
+    remote: bool,
+) -> (Arc<DaftReadAt>, Arc<RangeBytesReader>) {
+    let backend = Arc::new(RangeBytesReader {
+        data: Bytes::from((0..256).map(|index| index as u8).collect::<Vec<_>>()),
+        calls: Mutex::new(Vec::new()),
+    });
+    (
+        Arc::new(DaftReadAt {
+            backend: backend.clone(),
+            uri: "https://example.test/data".into(),
+            diagnostic_uri: "https://example.test/data".into(),
+            file_size: 256,
+            stats: IOStatsContext::new("coalescing fixture"),
+            requests: Arc::new(Semaphore::new(options.max_concurrent_requests)),
+            bytes: Arc::new(Semaphore::new(options.max_in_flight_bytes)),
+            max_requests: options.max_concurrent_requests,
+            max_bytes: options.max_in_flight_bytes,
+            coalescing: super::remote_coalescing(options, remote),
+            diagnostic_phase: std::sync::atomic::AtomicU8::new(
+                crate::diagnostics::Phase::Data as u8,
+            ),
+        }),
+        backend,
+    )
+}
+
+async fn read_driver_segments(reader: Arc<DaftReadAt>, segments: &[SegmentSpec]) {
+    let session = VortexSession::default().with_tokio();
+    let registry = DefaultMetricsRegistry::default();
+    let source = FileSegmentSource::open(
+        Arc::from(segments),
+        reader,
+        session.handle(),
+        RequestMetrics::new(&registry, Vec::new()),
+    );
+    let reads = segments
+        .iter()
+        .enumerate()
+        .map(|(index, _)| source.request(index.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let results = tokio::time::timeout(std::time::Duration::from_secs(5), join_all(reads))
+        .await
+        .expect("coalescing driver stalled");
+    for (result, segment) in results.into_iter().zip(segments) {
+        let buffer = result.unwrap().unwrap_host();
+        let expected = (segment.offset..segment.offset + u64::from(segment.length))
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(buffer.as_slice(), expected);
+        assert!(segment.alignment.is_ptr_aligned(buffer.as_ptr()));
+    }
+}
+
+#[tokio::test]
+async fn real_file_driver_coalesces_remote_intervals_without_alignment_expansion() {
+    let segments = [
+        SegmentSpec {
+            offset: 3,
+            length: 6,
+            alignment: Alignment::none(),
+        },
+        SegmentSpec {
+            offset: 12,
+            length: 5,
+            alignment: Alignment::new(4),
+        },
+        SegmentSpec {
+            offset: 32,
+            length: 8,
+            alignment: Alignment::new(8),
+        },
+    ];
+    for (enabled, remote, max_requests, expected_calls) in [
+        (true, true, 1, 3),
+        (true, true, 3, 1),
+        (true, true, 8, 1),
+        (false, true, 8, 3),
+        (true, false, 8, 3),
+    ] {
+        let options = VortexReadOptions {
+            enable_read_coalescing: enabled,
+            max_concurrent_requests: max_requests,
+            read_coalesce_gap_bytes: 64,
+            read_coalesce_max_bytes: 64,
+            max_in_flight_bytes: 64,
+            ..Default::default()
+        };
+        let (reader, backend) = range_adapter(&options, remote);
+        assert!(
+            reader.coalesce_config().is_none(),
+            "SDK alignment expansion must remain disabled"
+        );
+        read_driver_segments(reader, &segments).await;
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(calls.len(), expected_calls);
+        if expected_calls == 1 {
+            assert_eq!(*calls, vec![3..40]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn coalescing_respects_tight_budgets_gaps_and_original_large_segments() {
+    let segments = [
+        SegmentSpec {
+            offset: 3,
+            length: 16,
+            alignment: Alignment::none(),
+        },
+        SegmentSpec {
+            offset: 64,
+            length: 4,
+            alignment: Alignment::new(64),
+        },
+    ];
+    for coalesce_max in [8, 128] {
+        let options = VortexReadOptions {
+            max_in_flight_bytes: 16,
+            read_coalesce_gap_bytes: 128,
+            read_coalesce_max_bytes: coalesce_max,
+            ..Default::default()
+        };
+        let (reader, backend) = range_adapter(&options, true);
+        read_driver_segments(reader, &segments).await;
+        let calls = backend.calls.lock().unwrap();
+        assert_eq!(*calls, vec![3..19, 64..68]);
+        assert!(calls.iter().all(|range| range.len() <= 16));
+    }
+    let (reader, backend) = range_adapter(
+        &VortexReadOptions {
+            read_coalesce_gap_bytes: 0,
+            read_coalesce_max_bytes: 128,
+            ..Default::default()
+        },
+        true,
+    );
+    read_driver_segments(reader, &segments).await;
+    assert_eq!(backend.calls.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn merged_reads_cancel_and_fail_without_leaking_budgets_or_secrets() {
+    let requests: Arc<[ReadAtRequest]> = Arc::from([
+        ReadAtRequest::new(0, 4, Alignment::none()),
+        ReadAtRequest::new(4, 4, Alignment::new(4)),
+    ]);
+    let (mut reader, backend) = mock_reader(
+        vec![Bytes::from_static(b"12345678")],
+        Some(8),
+        true,
+        false,
+        2,
+        8,
+    );
+    reader.coalescing = super::remote_coalescing(
+        &VortexReadOptions {
+            max_in_flight_bytes: 8,
+            read_coalesce_gap_bytes: 0,
+            ..Default::default()
+        },
+        true,
+    );
+    let mut reads = reader.read_ranges(requests.clone());
+    assert!(poll!(reads.next()).is_pending());
+    assert_eq!(backend.active.load(Ordering::SeqCst), 1);
+    assert_eq!(*backend.calls.lock().unwrap(), vec![0..8]);
+    drop(reads);
+    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    assert_eq!(reader.requests.available_permits(), 2);
+    assert_eq!(reader.bytes.available_permits(), 8);
+
+    let (mut reader, backend) = mock_reader(vec![], None, false, true, 2, 8);
+    reader.coalescing = super::remote_coalescing(
+        &VortexReadOptions {
+            max_in_flight_bytes: 8,
+            ..Default::default()
+        },
+        true,
+    );
+    let results = reader.read_ranges(requests).collect::<Vec<_>>().await;
+    assert_eq!(results.len(), 2);
+    assert_eq!(backend.calls.lock().unwrap().len(), 1);
+    for (_, result) in results {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("response body/socket error"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("hidden"));
+    }
+    assert_eq!(reader.requests.available_permits(), 2);
+    assert_eq!(reader.bytes.available_permits(), 8);
+}
+
+#[test]
+fn coalescing_options_are_checked_even_when_disabled() {
+    for (gap, max_bytes) in [(0, 0), (usize::MAX, 1), (0, usize::MAX)] {
+        let options = VortexReadOptions {
+            enable_read_coalescing: false,
+            read_coalesce_gap_bytes: gap,
+            read_coalesce_max_bytes: max_bytes,
+            ..Default::default()
+        };
+        assert!(validate_options(&options).is_err());
+    }
+}
 
 struct MockReader {
     chunks: Vec<Bytes>,
@@ -92,12 +335,17 @@ fn mock_reader(
         DaftReadAt {
             backend: backend.clone(),
             uri: "https://example.test/data".into(),
+            diagnostic_uri: "https://example.test/data".into(),
             file_size: 128,
             stats: IOStatsContext::new("mock Vortex reader"),
             requests: Arc::new(Semaphore::new(max_requests)),
             bytes: Arc::new(Semaphore::new(max_bytes)),
             max_requests,
             max_bytes,
+            coalescing: None,
+            diagnostic_phase: std::sync::atomic::AtomicU8::new(
+                crate::diagnostics::Phase::Data as u8,
+            ),
         },
         backend,
     )

@@ -123,6 +123,7 @@ impl SegmentedFile {
                 include_columns: None,
                 limit,
             },
+            None,
         )
         .unwrap();
         assert_eq!(
