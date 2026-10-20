@@ -2,9 +2,9 @@
 
 **Scope:** experimental `AYUSHNSUT/Daft` fork, branch `poc/vortex-phase3`, based on Phase 2 commit `c7c8324a05cc475c5bace6c85c28722375cb81da`. Review base: `poc/vortex-phase2`.
 
-**Status:** implementation and local acceptance are complete; real HTTP/S3/Ray service checks remain pending. The fork review PR remains unopened until that gate passes. The [design](vortex-phase3-design.md) was committed before implementation.
+**Status:** complete for the declared I/O, resource-control, HTTP/S3-compatible, and worker scope. Local checks and all 14 real service tests pass. The service suite ran in the user's terminal, and its saved log was inspected before opening the fork review PR against `poc/vortex-phase2`. The [design](vortex-phase3-design.md) was committed before implementation.
 
-Implementation commits separate shared I/O (`a684aeb03`), native result scheduling (`de52a015a`), the configured Vortex reader (`24191370d`), and service acceptance (`21555b4c7`).
+Final implementation/test commit: `853825768dcf38f31677d388b855e9be68d5e064`. Shared I/O, native scheduling, the configured reader, and service acceptance are separate commits for review.
 
 ## Reader behavior
 
@@ -49,7 +49,7 @@ Local plan round-trip tests and actual Ray execution are separate gates. The ser
 
 ## Validation
 
-Environment: macOS arm64, Python 3.11.15, Rust nightly `2026-05-27`, PyArrow 22.0.0, and Vortex 0.88.0. Builds use the development profile. No release-performance claim is made.
+Environment: macOS arm64, Python 3.11.15, Rust nightly `2026-05-27`, PyArrow 22.0.0, Vortex 0.88.0, Ray 2.59.0, and Docker 29.0.1. Builds use the development profile. No release-performance claim is made.
 
 | Check | Result |
 | --- | --- |
@@ -69,8 +69,8 @@ Environment: macOS arm64, Python 3.11.15, Rust nightly `2026-05-27`, PyArrow 22.
 | Feature-off Vortex/lifecycle selection | 137 passed; 288 skipped because Vortex is disabled |
 | Workspace/all-feature/all-target Clippy with `-D warnings` | Passed |
 | Full applicable contribution hooks | Passed |
-| Real HTTP, MinIO, and Ray acceptance | Pending; 14 tests collected |
-| Disposable MinIO image build | User reported success |
+| Real HTTP, MinIO, and Ray acceptance | 14 passed, zero skipped, in the user's terminal |
+| Disposable MinIO image build and startup | Passed in the user's terminal |
 
 Focused Rust checks:
 
@@ -113,7 +113,9 @@ DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/pytest -n 0 -rs \
 
 Offline builds require cached dependencies. The existing `DAFT_DASHBOARD_SKIP_BUILD=1` debug option skips dashboard assets in this environment; Rust linting remains enabled. Rebuild with `--features python` for feature-off checks, then restore `python,vortex`.
 
-The [service runner](../../examples/vortex_eval/README.md#phase-3-service-acceptance) requires an enabled extension, loopback permission, Docker or a supplied MinIO endpoint, and the optional fixture/worker dependencies. It rejects skipped tests and cleans its own container and temporary buckets. This agent session cannot bind loopback or access Docker's socket, even with the user's daemon running; service acceptance must execute in the user's terminal. Collection alone is not acceptance.
+The [service runner](../../examples/vortex_eval/README.md#phase-3-service-acceptance) requires an enabled extension, loopback permission, Docker or a supplied MinIO endpoint, and the optional fixture/worker dependencies. It rejects skipped tests and cleans its own container and temporary buckets. This agent session cannot bind loopback or access Docker's socket, even with the user's daemon running. The user executed the real suite in their terminal: `service-acceptance.log` records **14 passed in 21.42 seconds**, followed by the runner's zero-skip acceptance confirmation.
+
+That run covers authenticated HTTP ranges, signed-query preservation/redaction, resumed truncated bodies, rejected ignored/wrong ranges, corrupt/missing inputs, MinIO exact/directory/glob discovery, source pickling, wrong-secret rejection with valid-read recovery, and actual Ray local-file/HTTP/S3 execution. Worker queries compare expected rows and require a UDF PID different from the driver. These checks establish actual service and worker behavior beyond plan serialization.
 
 Generated data and command logs live under ignored `examples/vortex_eval/artifacts/phase3/`. Full workspace unit tests and the entire Python suite are not represented by these focused checks.
 
@@ -123,10 +125,12 @@ The final enabled Python selections report 683 passes in total, with five cases 
 
 The root lockfile comparison against Phase 2 reports **zero added and zero removed external Cargo packages**. `daft-vortex` now depends on existing workspace I/O/configuration crates and uses existing `bytes` in tests. Dependency validation passes; the accepted Phase 1 graph cost is unchanged.
 
-Support remains the pinned Vortex release and flat primitive types with strict matching schemas. Files must not change between planning and execution. No intra-file Daft task splits were added. HTTP/S3 and actual worker support remain subject to their service acceptance gate. Resource controls do not establish a total RSS bound or encoded execution through Daft operators.
+Support remains the pinned Vortex release and flat primitive types with strict matching schemas. Files must not change between planning and execution. Accepted remote behavior is exact HTTP URLs and the tested S3-compatible path, with native and Ray execution on matching builds. Azure/GCS and intra-file Daft task splits were not added. Resource controls do not establish a total RSS bound or encoded execution through Daft operators.
 
 HTTP service acceptance uses IPv4 loopback. IPv6 literal hosts are outside the accepted matrix: preserving authority brackets during URL parsing alone does not remove the shared globber's interpretation of those brackets. The literal-authority unit test verifies request spelling, not successful IPv6 service execution.
 
+S3 HEAD authentication failures can arrive without an SDK error code and be classified as `MiscTransient` by Daft's existing backend. This phase retains that diagnostic/retry classification. Credential acceptance tests require successful reads with valid configuration before and after a wrong-secret rejection, with secrets absent from the error; they do not require authentication wording that the backend does not guarantee.
+
 Release-build comparisons against the same Daft engine reading Parquet, resource measurements, and a declared supported-fork matrix remain Phase 4. No improvement over Parquet, DataFusion, or Velox has been measured here.
 
-Material AI assistance was used for implementation, tests, review, and documentation. This report distinguishes executed checks from pending external acceptance.
+Material AI assistance was used for implementation, tests, review, and documentation. Local checks ran through the agent tools; real service acceptance ran in the user's terminal and was verified from its saved log.

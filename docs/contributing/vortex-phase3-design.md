@@ -6,7 +6,7 @@
 
 **Review base:** `poc/vortex-phase2`. Keep this work separate from earlier phases and upstream. Open the fork review PR after implementation and acceptance work; distinguish unavailable external checks from passing checks.
 
-**Status:** implemented with local acceptance complete; real service acceptance is pending. The [validation record](vortex-phase3-results.md) reports actual commands, results, and limits.
+**Status:** complete for the declared scope, including local checks and all 14 real HTTP/MinIO/Ray service tests. The [validation record](vortex-phase3-results.md) reports actual commands, results, and limits.
 
 ## Problem and intended behavior
 
@@ -125,7 +125,7 @@ Keep local adapter/scheduler tests socket-independent where possible, using real
 
 ## Environment and execution plan
 
-Initial inspection finds Ray, boto3, moto, PyArrow, and Vortex installed. The Docker CLI exists, but its daemon socket is absent. Binding a loopback TCP port from this agent session returns `EPERM`. Thus this session cannot currently launch a local HTTP server, MinIO, or Ray cluster. Continue implementation and socket-independent checks, prepare exact service commands and logs, and report real service checks as pending until they execute successfully in an environment that permits them.
+Initial inspection found Ray, boto3, moto, PyArrow, and Vortex installed. The agent session cannot bind loopback TCP ports or access Docker's socket. Implementation and socket-independent checks ran here; the user built the disposable MinIO image and completed all 14 real service checks in their terminal. The saved service log was inspected before PR creation; see the validation record.
 
 1. Record this plan, then implement adapter, public/config/worker plumbing, and shared result flow in coordinated ownership areas.
 2. Type-check and run focused Rust suites offline, serializing Cargo work to avoid cache/lock contention.

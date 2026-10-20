@@ -2,7 +2,7 @@
 
 **Status:** Phases 0, 1, and 2 are complete for the experimental local-reader scope. Phase 2 adds selective scans behind the same default-off `vortex` feature; see its [design](vortex-phase2-design.md) and [validation record](vortex-phase2-results.md). The [Phase 1 validation record](vortex-phase1-results.md) includes the dependency cost accepted for this fork.
 
-Phase 3 is in acceptance on its own branch; see the [I/O, resource-control, and worker plan](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Remote and worker acceptance remains separate from implemented local behavior.
+Phase 3 is complete for its declared I/O, resource-control, and worker scope, including real HTTP/MinIO/Ray acceptance; see the [plan](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Release-build performance evaluation remains Phase 4.
 
 **Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, implementation branch `poc/vortex-phase3`.
 

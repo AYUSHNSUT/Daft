@@ -23,6 +23,10 @@ execution. Its service tests require an enabled Phase 3 extension and permission
 to bind loopback ports. Their runner rejects skipped tests rather than treating
 missing services as successful acceptance.
 
+The [validation record](../../docs/contributing/vortex-phase3-results.md) reports
+14 passing service tests with zero skips, including actual Ray execution over
+local files, HTTP, and S3-compatible storage.
+
 With Docker running, build the disposable MinIO service from pinned source and
 run the HTTP/S3/Ray acceptance suite:
 
