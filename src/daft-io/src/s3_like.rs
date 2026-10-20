@@ -750,6 +750,21 @@ async fn build_client(config: &S3Config) -> super::Result<S3LikeSource> {
 }
 const REGION_HEADER: &str = "x-amz-bucket-region";
 
+fn validate_s3_range_response(
+    requested: &GetRange,
+    response: &s3::operation::get_object::GetObjectOutput,
+) -> super::Result<()> {
+    let length = response
+        .content_length()
+        .map(|length| {
+            usize::try_from(length).map_err(|_| super::Error::InvalidArgument {
+                msg: "Invalid S3 range response Content-Length".into(),
+            })
+        })
+        .transpose()?;
+    crate::range::validate_content_range(requested, response.content_range(), length)
+}
+
 impl S3LikeSource {
     pub async fn get_client(config: &S3Config) -> super::Result<Arc<Self>> {
         Ok(build_client(config).await?.into())
@@ -819,6 +834,9 @@ impl S3LikeSource {
 
             match response {
                 Ok(v) => {
+                    if let Some(range) = &range {
+                        validate_s3_range_response(range, &v)?;
+                    }
                     let body = v.body;
                     struct FuturesStreamCompatByteStream {
                         byte_stream: ByteStream,
@@ -1827,6 +1845,35 @@ mod tests {
         Result, S3LikeSource, integrations::test_full_get, object_io::ObjectSource,
         s3_like::normalize_endpoint_url,
     };
+
+    #[test]
+    fn range_response_validates_s3_sdk_content_range_before_reading_body() {
+        use aws_sdk_s3::operation::get_object::GetObjectOutput;
+        let requested = crate::GetRange::Bounded(5..10);
+        let valid = GetObjectOutput::builder()
+            .content_range("bytes 5-9/20")
+            .content_length(5)
+            .build();
+        super::validate_s3_range_response(&requested, &valid).unwrap();
+        for (content_range, length) in [
+            (None, 5),
+            (Some("bytes 0-4/20"), 5),
+            (Some("bytes 5-8/20"), 4),
+            (Some("bytes 5-10/20"), 6),
+            (Some("bytes 5-9/20"), -1),
+            (Some("bytes 5-9/20"), 6),
+            (Some("bytes 5-9/9"), 5),
+        ] {
+            let output = GetObjectOutput::builder()
+                .set_content_range(content_range.map(String::from))
+                .content_length(length)
+                .build();
+            assert!(
+                super::validate_s3_range_response(&requested, &output).is_err(),
+                "accepted {content_range:?}, {length}"
+            );
+        }
+    }
 
     #[test]
     fn test_normalize_endpoint_url_defaults_https_scheme() {

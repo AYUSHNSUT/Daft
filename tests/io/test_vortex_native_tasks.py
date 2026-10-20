@@ -16,7 +16,6 @@ import pytest
 
 import daft
 from daft import daft as _native
-from daft.io import _vortex
 from daft.io.pushdowns import Pushdowns
 from daft.io.source import DataSource, DataSourceTask
 from daft.pickle import cloudpickle
@@ -98,12 +97,6 @@ def test_vortex_task_rejects_unsupported_aggregation_pushdown(native_file: tuple
     path, schema = native_file
     with pytest.raises(NotImplementedError, match="aggregation"):
         DataSourceTask.vortex(path, schema, pushdowns=Pushdowns(aggregation=daft.col("id").count()))
-
-
-def test_vortex_task_rejects_ray_before_factory(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_vortex, "get_or_infer_runner_type", lambda: "ray")
-    with pytest.raises(ValueError, match="Ray is not supported"):
-        DataSourceTask.vortex("unused.vortex", Schema.from_pydict({"id": daft.DataType.int64()}))
 
 
 def test_vortex_config_pickle(native_file: tuple[str, Schema]) -> None:

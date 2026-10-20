@@ -1,6 +1,6 @@
 # Vortex integration: test and benchmark plan
 
-**Status:** acceptance plan for the [fork design](vortex-integration-design.md). The [Phase 0 experiment](../../examples/vortex_eval/README.md) and experimental Phase 1 native local reader exist. Consult the [Phase 1 validation record](vortex-phase1-results.md) for executed checks and remaining limits; optimization, remote-storage, and performance commands remain future work.
+**Status:** acceptance plan for the [fork design](vortex-integration-design.md). Phases 0 through 2 are complete for the local selective reader. Phase 3 implementation and acceptance are tracked in its [design](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md); release-performance evaluation remains Phase 4.
 
 ## Test strategy
 
@@ -51,7 +51,7 @@ Implemented files: `tests/io/test_vortex.py`, `tests/io/test_vortex_native_tasks
 | L7 | Task carrying a predicate directly | Reader honors it even without an outer Daft filter operator |
 | L8 | Zero-column and constant-only projection, `count_rows()`, `count(column)` | Preserve cardinality; distinguish total rows from non-null values |
 | L9 | Filter then limit across batches/files | Limit counts matching rows; global query output obeys Daft semantics |
-| L10 | Native scan descriptor and Python source/config serialization round-trip | Rust `ScanTask` serde retains the full validation schema; restored Python sources create fresh native tasks. Generic `PyDataSourceTask` Python pickling and Ray transport remain Phase 3 work |
+| L10 | Native scan descriptor and Python source/config serialization round-trip | Rust `ScanTask` serde retains the full validation schema; restored Python sources create fresh native tasks. Phase 3 tests actual local-plan transport for Ray; generic `PyDataSourceTask` Python pickling is not needed by that route |
 | L11 | Absent optional dependency or disabled native feature | Ordinary import/test collection succeeds; reader call gives a clear enablement error |
 | L12 | Errors and schema diagnostics | Useful path and cause; no credentials in messages |
 | L13 | Filter-before-limit and limit-before-filter | Match each query's own reference result; the two operator orders are not equivalent |
@@ -94,7 +94,7 @@ Keep `supports_count_pushdown()` false. Before ever enabling it, separately test
 
 ## I/O, workers, and splitting: Phase 3
 
-Proposed locations: reader I/O adapter Rust tests; `tests/integration/io/vortex/`; Ray cases in the focused Vortex tests.
+Locations: reader I/O adapter Rust tests, `tests/io/test_vortex_phase3.py`, `tests/execution/test_native_result_lifecycle.py`, and `tests/integration/io/vortex/`. See the [Phase 3 validation record](vortex-phase3-results.md) for checks actually executed.
 
 | ID | Case | Required result |
 | --- | --- | --- |
@@ -107,8 +107,10 @@ Proposed locations: reader I/O adapter Rust tests; `tests/integration/io/vortex/
 | I7 | Optional intra-file row ranges | Half-open ranges cover every row exactly once, including uneven/empty final splits |
 | I8 | Split row counts and estimates | Use split cardinality, not repeated whole-file counts; unknown estimates remain unknown |
 | I9 | File replacement or metadata-cache reuse | No stale footer served for different file content; cache identity/invalidation is tested |
+| I10 | Concurrent request and requested-byte limits | Per-open-reader permits cover active asynchronous collection; oversize requests fail and errors/cancellation release permits |
+| I11 | Full result queue, close, pending next, and shared inputs | Delivery remains bounded; close wakes blocked work; unrelated consumers survive; abandoned IDs cannot receive late messages |
 
-Use existing MinIO fixtures for S3 integration and an instrumented local HTTP server for byte-range behavior. These require a test environment that permits localhost sockets. Successful MinIO tests establish only the claimed S3-compatible path; Azure/GCS need separate tests before being advertised. Optional Ray tests run only once distributed support is claimed.
+Use disposable MinIO fixtures for S3 integration and an instrumented local HTTP server for byte-range behavior. These require a test environment that permits localhost sockets. Successful MinIO tests establish only the claimed S3-compatible path; Azure/GCS need separate tests before being advertised. Ray checks are required before claiming distributed support. The service runner rejects skipped prerequisites. Intra-file splitting remains unimplemented; I7/I8 apply only if it is added.
 
 **Gate:** supported I/O schemes honor configuration, errors, cancellation, and metrics; workers and any implemented splits preserve exactly-once coverage.
 
@@ -158,7 +160,7 @@ There is no guaranteed improvement target. A useful result may be that Vortex he
 
 ## Execution and CI plan
 
-The native crate, Phase 2 pushdown tests, and `vortex` feature now exist. The [Phase 1 implementation record](vortex-phase1-results.md) lists its completed checks; the [Phase 2 design](vortex-phase2-design.md) gives the selective-scan validation commands. Phase 3 service tests and Phase 4 benchmarks still require those paths to be implemented.
+The native crate, selective-scan tests, and default-off `vortex` feature exist. Historical local acceptance is recorded in [Phase 1](vortex-phase1-results.md) and [Phase 2](vortex-phase2-results.md). Phase 3 adds I/O/resource/worker tests and a strict service runner; consult its [validation record](vortex-phase3-results.md) before treating those capabilities as accepted. Phase 4 benchmarks remain to be implemented.
 
 Run from the repository root after the normal development setup (`make .venv`) has completed and the required dependencies are available.
 
@@ -179,9 +181,10 @@ cargo check --no-default-features --features vortex -p daft-local-execution
 DAFT_RUNNER=native .venv/bin/pytest -n 0 \
   tests/io/test_native_tasks.py tests/io/test_datasource_join.py
 
-# Phase 3: implement these tests and start local services first.
-DAFT_RUNNER=native .venv/bin/pytest -n 0 -o addopts='' \
-  -m integration tests/integration/io/vortex/
+# Phase 3: use an enabled build, Docker, and loopback permission.
+docker build -t daft-vortex-minio:phase3 - < examples/vortex_eval/minio.Dockerfile
+.venv/bin/python examples/vortex_eval/run_phase3_services.py \
+  --docker-image daft-vortex-minio:phase3
 
 # Phase 4: implement the benchmark suite and make a release build first.
 env -u CONDA_PREFIX PYO3_PYTHON=.venv/bin/python .venv/bin/maturin develop --release --uv --features python,vortex

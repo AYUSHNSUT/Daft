@@ -25,7 +25,14 @@ class BackgroundEventLoop:
         return obj
 
     def run(self, future: Coroutine[Any, Any, Any]) -> Any:
-        return asyncio.run_coroutine_threadsafe(future, self.loop).result()
+        submitted = asyncio.run_coroutine_threadsafe(future, self.loop)
+        try:
+            return submitted.result()
+        except BaseException:
+            # An interrupted synchronous caller no longer owns this operation.
+            # Cancel its coroutine so async-generator finally blocks can run.
+            submitted.cancel()
+            raise
 
 
 LOOP: BackgroundEventLoop | None = None

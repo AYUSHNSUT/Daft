@@ -111,7 +111,7 @@ impl ScanTaskSource {
                     let (scan_task, delete_map, input_id, is_last) = pending_tasks.pop_front().unwrap();
                     let sender = match &flattener_state {
                         Some((agg_tx, _)) => {
-                            let (stream_tx, stream_rx) = create_channel::<MicroPartition>(1);
+                            let (stream_tx, stream_rx) = create_channel::<OrderedScanMessage>(1);
                             let _ = agg_tx.send(FlattenerMessage { input_id, inner_rx: stream_rx, is_last });
                             ScanTaskOutputSender::OrderPreserving(stream_tx)
                         }
@@ -137,10 +137,10 @@ impl ScanTaskSource {
                                 match &flattener_state {
                                     Some((agg_tx, _)) => {
                                         let (stream_tx, stream_rx) =
-                                            create_channel::<MicroPartition>(1);
-                                        let _ = stream_tx.send(empty).await;
-                                        drop(stream_tx);
+                                            create_channel::<OrderedScanMessage>(1);
                                         let _ = agg_tx.send(FlattenerMessage { input_id, inner_rx: stream_rx, is_last: true });
+                                        let _ = stream_tx.send(OrderedScanMessage::Partition(empty)).await;
+                                        let _ = stream_tx.send(OrderedScanMessage::Finished).await;
                                     }
                                     None => {
                                         if output_sender.send(PipelineMessage::Morsel {
@@ -438,14 +438,22 @@ async fn get_delete_map(
 
 struct FlattenerMessage {
     input_id: InputId,
-    inner_rx: Receiver<MicroPartition>,
+    inner_rx: Receiver<OrderedScanMessage>,
     is_last: bool,
+}
+
+enum OrderedScanMessage {
+    Partition(MicroPartition),
+    // Channel closure can also mean a failed scan. Only this marker confirms
+    // successful completion and permits a per-input Flush.
+    Finished,
 }
 
 /// Drains a "receiver of (input_id, stream)" in order, forwarding each stream's
 /// micropartitions as Morsels. Sends Flush(input_id) only when the last receiver
-/// for that input_id has been drained (i.e. when we see a different input_id or
-/// the channel closes). Used when `maintain_order` is true.
+/// for that input_id reports successful completion. A failed earlier stream
+/// stops forwarding before any later stream can report success for that input.
+/// Used when `maintain_order` is true.
 async fn run_order_preserving_flattener(
     mut agg_rx: UnboundedReceiver<FlattenerMessage>,
     output_sender: Sender<PipelineMessage>,
@@ -456,7 +464,12 @@ async fn run_order_preserving_flattener(
         is_last,
     }) = agg_rx.recv().await
     {
-        while let Some(mp) = inner_rx.recv().await {
+        loop {
+            let mp = match inner_rx.recv().await {
+                Some(OrderedScanMessage::Partition(mp)) => mp,
+                Some(OrderedScanMessage::Finished) => break,
+                None => return,
+            };
             if output_sender
                 .send(PipelineMessage::Morsel {
                     input_id,
@@ -474,11 +487,11 @@ async fn run_order_preserving_flattener(
     }
 }
 
-/// Sender type for scan task output: either direct PipelineMessage (unordered) or
-/// MicroPartition-only for the order-preserving flattener to wrap.
+/// Sender type for scan task output: direct PipelineMessage (unordered), or
+/// partition and completion messages for the order-preserving flattener.
 enum ScanTaskOutputSender {
     Pipeline(Sender<PipelineMessage>),
-    OrderPreserving(Sender<MicroPartition>),
+    OrderPreserving(Sender<OrderedScanMessage>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -519,7 +532,10 @@ async fn forward_scan_task_stream(
                 }
             }
             ScanTaskOutputSender::OrderPreserving(s) => {
-                if s.send(partition).await.is_err() {
+                if s.send(OrderedScanMessage::Partition(partition))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -539,9 +555,13 @@ async fn forward_scan_task_stream(
                     .await;
             }
             ScanTaskOutputSender::OrderPreserving(s) => {
-                let _ = s.send(empty).await;
+                let _ = s.send(OrderedScanMessage::Partition(empty)).await;
             }
         }
+    }
+
+    if let ScanTaskOutputSender::OrderPreserving(sender) = sender {
+        let _ = sender.send(OrderedScanMessage::Finished).await;
     }
 
     Ok(input_id)
@@ -641,4 +661,87 @@ async fn stream_scan_task(
         );
         Ok(mp)
     }))
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use futures::poll;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn ordered_scan_requires_success_marker_before_flush() {
+        let (agg_tx, agg_rx) = create_unbounded_channel();
+        let (stream_tx, stream_rx) = create_channel(1);
+        let (output_tx, mut output_rx) = create_channel(1);
+        agg_tx
+            .send(FlattenerMessage {
+                input_id: 7,
+                inner_rx: stream_rx,
+                is_last: true,
+            })
+            .unwrap();
+        let mut flattener = Box::pin(run_order_preserving_flattener(agg_rx, output_tx));
+        stream_tx
+            .send(OrderedScanMessage::Partition(MicroPartition::empty(None)))
+            .await
+            .unwrap();
+        assert!(poll!(&mut flattener).is_pending());
+        assert!(matches!(
+            output_rx.recv().await,
+            Some(PipelineMessage::Morsel { input_id: 7, .. })
+        ));
+        assert!(poll!(Box::pin(output_rx.recv())).is_pending());
+        stream_tx.send(OrderedScanMessage::Finished).await.unwrap();
+        drop(agg_tx);
+        flattener.await;
+        assert!(matches!(
+            output_rx.recv().await,
+            Some(PipelineMessage::Flush(7))
+        ));
+        assert!(output_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_ordered_scan_cannot_flush_even_with_successful_later_file() {
+        for failed_is_last in [false, true] {
+            let (agg_tx, agg_rx) = create_unbounded_channel();
+            let (failed_tx, failed_rx) = create_channel(1);
+            let (output_tx, mut output_rx) = create_channel(2);
+            agg_tx
+                .send(FlattenerMessage {
+                    input_id: 7,
+                    inner_rx: failed_rx,
+                    is_last: failed_is_last,
+                })
+                .unwrap();
+            // Data may already have been emitted when a later read fails.
+            failed_tx
+                .send(OrderedScanMessage::Partition(MicroPartition::empty(None)))
+                .await
+                .unwrap();
+            drop(failed_tx);
+            if !failed_is_last {
+                let (successful_tx, successful_rx) = create_channel(1);
+                successful_tx
+                    .send(OrderedScanMessage::Finished)
+                    .await
+                    .unwrap();
+                agg_tx
+                    .send(FlattenerMessage {
+                        input_id: 7,
+                        inner_rx: successful_rx,
+                        is_last: true,
+                    })
+                    .unwrap();
+            }
+            drop(agg_tx);
+            run_order_preserving_flattener(agg_rx, output_tx).await;
+            assert!(matches!(
+                output_rx.recv().await,
+                Some(PipelineMessage::Morsel { input_id: 7, .. })
+            ));
+            assert!(output_rx.recv().await.is_none(), "a failed scan is not EOF");
+        }
+    }
 }

@@ -3,9 +3,10 @@
 The Phase 0 tools check fixture correctness, an optional Python reader, and
 native Vortex-to-Daft batch compatibility. Their historical results are in the
 [Phase 0 report](../../docs/contributing/vortex-phase0-results.md).
-This branch also implements the experimental native connector with Phase 2
-selective scans; see the [Phase 1 setup](../../docs/contributing/vortex-phase1-results.md)
-and [Phase 2 validation and limits](../../docs/contributing/vortex-phase2-results.md).
+This branch also implements the experimental native connector with selective
+scans and Daft I/O integration; see the [Phase 1 setup](../../docs/contributing/vortex-phase1-results.md),
+[Phase 2 validation and limits](../../docs/contributing/vortex-phase2-results.md),
+and [Phase 3 acceptance record](../../docs/contributing/vortex-phase3-results.md).
 The [Phase 2 design](../../docs/contributing/vortex-phase2-design.md) explains
 independent physical projection and filter-pushdown switches.
 
@@ -13,6 +14,50 @@ Run the commands below from the repository root, using a working source-built
 Daft environment. See the [development guide](../../docs/contributing/development.md)
 for `make .venv` and `make build`. These are small correctness checks, not
 performance benchmarks; meaningful performance runs require an optimized build.
+
+## Phase 3 service acceptance
+
+The [Phase 3 plan](../../docs/contributing/vortex-phase3-design.md) covers Daft I/O,
+per-reader request budgets, local result backpressure/cancellation, and worker
+execution. Its service tests require an enabled Phase 3 extension and permission
+to bind loopback ports. Their runner rejects skipped tests rather than treating
+missing services as successful acceptance.
+
+The [validation record](../../docs/contributing/vortex-phase3-results.md) reports
+14 passing service tests with zero skips, including actual Ray execution over
+local files, HTTP, and S3-compatible storage.
+
+With Docker running, build the disposable MinIO service from pinned source and
+run the HTTP/S3/Ray acceptance suite:
+
+```bash
+docker build -t daft-vortex-minio:phase3 - < examples/vortex_eval/minio.Dockerfile
+
+set -o pipefail
+mkdir -p examples/vortex_eval/artifacts/phase3
+.venv/bin/python examples/vortex_eval/run_phase3_services.py \
+  --docker-image daft-vortex-minio:phase3 \
+  2>&1 | tee examples/vortex_eval/artifacts/phase3/service-acceptance.log
+```
+
+The empty Docker build context sends no repository files to the image builder.
+The helper creates its own container and unique test buckets, starts the HTTP
+fixture, and cleans those resources after testing. MinIO's upstream release
+documents a [source build](https://github.com/minio/minio/releases/tag/RELEASE.2025-10-15T17-29-55Z);
+this avoids assuming an old public container tag remains available. The Docker
+build and service execution must be verified in an environment with a running
+daemon and loopback permission.
+
+An existing local MinIO service can instead be supplied through
+`VORTEX_MINIO_ENDPOINT`, `VORTEX_MINIO_ACCESS_KEY`, and `VORTEX_MINIO_SECRET_KEY`;
+run the helper without `--docker-image`. Use disposable development storage.
+Ray, boto3, pytest, and the fixture writer must be installed in the same Python
+environment. To run just the worker/local-file gate:
+
+```bash
+DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/pytest -n 0 -m integration -q \
+  tests/integration/io/vortex/test_remote.py -k ray_local
+```
 
 ## Install the optional tools
 

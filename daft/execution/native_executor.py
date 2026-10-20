@@ -35,7 +35,15 @@ class NativeExecutor:
         inputs: Mapping[int, Input | list[PyMicroPartition]],
         ctx: DaftContext,
         context: dict[str, str] | None,
+        *,
+        results_buffer_size: int | None = None,
     ) -> Generator[LocalMaterializedResult, None, tuple[str, PyExecutionStats]]:
+        if results_buffer_size is not None and (
+            isinstance(results_buffer_size, bool)
+            or not isinstance(results_buffer_size, int)
+            or results_buffer_size <= 0
+        ):
+            raise ValueError("results_buffer_size must be a positive integer or None")
         stats: PyExecutionStats | None = None
 
         async def stream_results() -> AsyncGenerator[PyMicroPartition | FlightPartitions | None, None]:
@@ -46,13 +54,22 @@ class NativeExecutor:
                 dict(inputs),
                 context,
                 ctx.daft_execution_config.maintain_order,
+                results_buffer_size=results_buffer_size,
             )
             nonlocal stats
+            completed = False
             try:
                 async for batch in result_handle:
+                    if batch is None:
+                        completed = True
+                        break
                     yield batch
             finally:
-                stats = await result_handle.try_finish()
+                if completed:
+                    stats = await result_handle.try_finish()
+                else:
+                    await result_handle.aclose()
+            yield None
 
         event_loop = get_or_init_event_loop()
         async_exec = stream_results()

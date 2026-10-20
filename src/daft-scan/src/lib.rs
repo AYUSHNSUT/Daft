@@ -851,6 +851,46 @@ impl ScanTask {
         self.sources.first().and_then(|s| s.partition_spec.as_ref())
     }
 
+    fn source_for_display<'a>(&self, source: &'a ScanSource) -> Cow<'a, ScanSource> {
+        if matches!(
+            self.source_config.as_ref(),
+            SourceConfig::File(FileFormatConfig::Vortex(_))
+        ) {
+            let mut display = source.clone();
+            if let ScanSourceKind::File { path, .. } = &mut display.kind {
+                if path
+                    .get(..5)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+                {
+                    // Preserve literal file-URI spelling, including percent
+                    // characters. Only diagnostics discard URI-only secrets.
+                    let end = path.find(['?', '#']).unwrap_or(path.len());
+                    path.truncate(end);
+                    if path
+                        .get(..7)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
+                    {
+                        let authority_end = path[7..].find('/').map_or(path.len(), |end| 7 + end);
+                        if let Some(at) = path[7..authority_end].rfind('@') {
+                            path.replace_range(7..=7 + at, "");
+                        }
+                    }
+                } else if !std::path::Path::new(path.as_str()).is_absolute()
+                    && let Ok(mut url) = url::Url::parse(path)
+                {
+                    let _ = url.set_username("");
+                    let _ = url.set_password(None);
+                    url.set_query(None);
+                    url.set_fragment(None);
+                    *path = url.to_string();
+                }
+            }
+            Cow::Owned(display)
+        } else {
+            Cow::Borrowed(source)
+        }
+    }
+
     #[must_use]
     pub fn multiline_display(&self) -> Vec<String> {
         let mut res = vec![];
@@ -859,7 +899,7 @@ impl ScanTask {
             "Sources = [ {} ]",
             self.sources
                 .iter()
-                .map(|s| s.multiline_display().join(", "))
+                .map(|s| self.source_for_display(s).multiline_display().join(", "))
                 .join("; ")
         ));
         res.push(format!("Schema = {}", self.schema.short_string()));
@@ -899,16 +939,19 @@ impl DisplayAs for ScanTask {
     fn display_as(&self, level: common_display::DisplayLevel) -> String {
         // take first 3 and last 3 if more than 6 sources
         let mut condensed_sources = if self.sources.len() <= 6 {
-            self.sources.iter().map(|s| s.display_as(level)).join(", ")
+            self.sources
+                .iter()
+                .map(|s| self.source_for_display(s).display_as(level))
+                .join(", ")
         } else {
             let len = self.sources.len();
             self.sources
                 .iter()
                 .enumerate()
                 .filter_map(|(i, s)| match i {
-                    0..3 => Some(s.display_as(level)),
+                    0..3 => Some(self.source_for_display(s).display_as(level)),
                     3 => Some("...".to_string()),
-                    _ if i >= len - 3 => Some(s.display_as(level)),
+                    _ if i >= len - 3 => Some(self.source_for_display(s).display_as(level)),
                     _ => None,
                 })
                 .join(", ")
@@ -1001,12 +1044,16 @@ mod test {
         let defaults = VortexSourceConfig::default();
         assert!(defaults.enable_projection_pushdown);
         assert!(defaults.enable_filter_pushdown);
+        assert_eq!(defaults.max_concurrent_requests, 8);
+        assert_eq!(defaults.max_in_flight_bytes, 64 * 1024 * 1024);
         for enable_projection_pushdown in [false, true] {
             for enable_filter_pushdown in [false, true] {
                 let config = VortexSourceConfig {
                     batch_size: 7,
                     enable_projection_pushdown,
                     enable_filter_pushdown,
+                    max_concurrent_requests: 3,
+                    max_in_flight_bytes: 1_048_576,
                 };
                 let encoded =
                     bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
@@ -1016,6 +1063,71 @@ mod test {
                 assert_eq!(decoded, config);
             }
         }
+    }
+
+    #[test]
+    fn vortex_task_display_redacts_secrets_without_changing_transport_uri() {
+        use common_py_serde::bincode;
+
+        for (raw, safe) in [
+            (
+                "https://sentinel-user:sentinel-password@transport.test/data.vortex?token=sentinel-query#sentinel-fragment",
+                "https://transport.test/data.vortex",
+            ),
+            (
+                "file:///tmp/data.vortex?token=sentinel-query#sentinel-fragment",
+                "file:///tmp/data.vortex",
+            ),
+            (
+                "FILE:///tmp/a%20b.vortex?token=sentinel-query#sentinel-fragment",
+                "FILE:///tmp/a%20b.vortex",
+            ),
+            (
+                "file://sentinel-user:sentinel-password@host/tmp/data.vortex?token=sentinel-query#sentinel-fragment",
+                "file://host/tmp/data.vortex",
+            ),
+        ] {
+            let mut task = make_scan_task(1);
+            task.source_config = Arc::new(SourceConfig::File(FileFormatConfig::Vortex(
+                VortexSourceConfig::default(),
+            )));
+            let ScanSourceKind::File { path, .. } = &mut task.sources[0].kind else {
+                panic!("expected file source");
+            };
+            *path = raw.to_string();
+            for display in [
+                task.multiline_display().join("\n"),
+                task.display_as(DisplayLevel::Compact),
+                task.display_as(DisplayLevel::Default),
+            ] {
+                assert!(display.contains(safe), "{display}");
+                for secret in [
+                    "sentinel-user",
+                    "sentinel-password",
+                    "sentinel-query",
+                    "sentinel-fragment",
+                ] {
+                    assert!(!display.contains(secret), "{display}");
+                }
+            }
+            assert_eq!(task.sources[0].get_path(), raw);
+            let encoded = bincode::serde::encode_to_vec(&task, bincode::config::legacy()).unwrap();
+            let (decoded, consumed): (ScanTask, _) =
+                bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded.sources[0].get_path(), raw);
+        }
+
+        let raw_local = "/tmp/plain?literal#filename.vortex";
+        let mut task = make_scan_task(1);
+        task.source_config = Arc::new(SourceConfig::File(FileFormatConfig::Vortex(
+            VortexSourceConfig::default(),
+        )));
+        let ScanSourceKind::File { path, .. } = &mut task.sources[0].kind else {
+            panic!("expected file source");
+        };
+        *path = raw_local.to_string();
+        assert!(task.multiline_display().join("\n").contains(raw_local));
     }
 
     #[test]
@@ -1039,7 +1151,7 @@ mod test {
                 statistics: None,
                 partition_spec: None,
                 kind: ScanSourceKind::File {
-                    path: "fixture.vortex".to_string(),
+                    path: "s3://transport-fixture/data.vortex".to_string(),
                     chunk_spec: None,
                     iceberg_delete_files: None,
                     parquet_metadata: None,
@@ -1050,10 +1162,22 @@ mod test {
                     batch_size: 17,
                     enable_projection_pushdown: false,
                     enable_filter_pushdown: true,
+                    max_concurrent_requests: 2,
+                    max_in_flight_bytes: 4_194_304,
                 },
             ))),
             schema,
-            Arc::new(StorageConfig::default()),
+            Arc::new(StorageConfig::new_internal(
+                true,
+                Some(common_io_config::IOConfig {
+                    s3: common_io_config::S3Config {
+                        endpoint_url: Some("http://127.0.0.1:9000".to_string()),
+                        region_name: Some("us-east-1".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+            )),
             Pushdowns {
                 columns: Some(Arc::new(vec!["id".to_string()])),
                 limit: Some(5),
@@ -1108,8 +1232,12 @@ mod test {
                 batch_size: 17,
                 enable_projection_pushdown: false,
                 enable_filter_pushdown: true,
+                max_concurrent_requests: 2,
+                max_in_flight_bytes: 4_194_304,
             }))
         ));
+        assert_eq!(decoded.storage_config, task.storage_config);
+        assert_eq!(decoded.sources, task.sources);
         assert_eq!(decoded.num_rows(), None);
         assert_eq!(decoded.approx_num_rows(None), None);
         assert_eq!(decoded.estimate_in_memory_size_bytes(None), None);

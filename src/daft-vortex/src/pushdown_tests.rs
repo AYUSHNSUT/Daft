@@ -194,6 +194,7 @@ impl ColumnFile {
                 batch_size: CHUNK_ROWS,
                 enable_projection_pushdown,
                 enable_filter_pushdown,
+                ..Default::default()
             },
             VortexConvertOptions {
                 schema,

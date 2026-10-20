@@ -9,6 +9,7 @@ use arrow_schema::{DataType as ArrowDataType, Schema as ArrowSchema, SchemaRef a
 use common_error::{DaftError, DaftResult};
 use daft_core::prelude::{Field, Schema, SchemaRef};
 use daft_dsl::expr::bound_expr::BoundExpr;
+use daft_io::{IOClient, IOStatsRef};
 use daft_recordbatch::RecordBatch;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use vortex::{
@@ -21,7 +22,11 @@ use vortex::{
     session::VortexSession,
 };
 
-use crate::{VortexConvertOptions, VortexReadOptions, plan::plan_scan};
+use crate::{
+    VortexConvertOptions, VortexReadOptions,
+    io::{DaftReadAt, display_uri, validate_options},
+    plan::plan_scan,
+};
 
 // Daft Field has no nullability member, and its equality ignores metadata. Keep
 // this marker on the inferred scan schema and explicitly compare it for every
@@ -29,6 +34,7 @@ use crate::{VortexConvertOptions, VortexReadOptions, plan::plan_scan};
 pub(crate) const NULLABILITY_METADATA_KEY: &str = "daft.vortex.nullable";
 
 fn read_error(uri: &str, operation: &str, error: impl std::fmt::Display) -> DaftError {
+    let uri = display_uri(uri);
     DaftError::ComputeError(format!("Vortex {operation} for {uri:?}: {error}"))
 }
 
@@ -47,7 +53,8 @@ fn local_path(uri: &str) -> DaftResult<PathBuf> {
     {
         if uri.contains('?') || uri.contains('#') {
             return Err(DaftError::ValueError(format!(
-                "Vortex file URL must not contain a query or fragment: {uri:?}"
+                "Vortex file URL must not contain a query or fragment: {:?}",
+                display_uri(uri)
             )));
         }
         // Follow Daft local I/O's literal file-URI convention. Url::to_file_path
@@ -56,7 +63,8 @@ fn local_path(uri: &str) -> DaftResult<PathBuf> {
         let path = if let Some(authority_and_path) = after_scheme.strip_prefix("//") {
             if !authority_and_path.starts_with('/') && !authority_and_path.is_empty() {
                 return Err(DaftError::ValueError(format!(
-                    "Vortex file:// URLs must not contain a host, got {uri:?}"
+                    "Vortex file:// URLs must not contain a host, got {:?}",
+                    display_uri(uri)
                 )));
             }
             authority_and_path
@@ -73,22 +81,55 @@ fn local_path(uri: &str) -> DaftResult<PathBuf> {
     }
     if url::Url::parse(uri).is_ok() {
         return Err(DaftError::NotImplemented(format!(
-            "Vortex supports only local paths and file:// URLs, got {uri:?}"
+            "Vortex supports only local paths, file://, http(s):// and s3:// URLs, got {:?}",
+            display_uri(uri)
         )));
     }
     Ok(PathBuf::from(uri))
 }
 
-async fn open_file(uri: &str) -> DaftResult<(VortexSession, VortexFile)> {
-    let path = local_path(uri)?;
+fn input_uri(uri: &str) -> DaftResult<String> {
+    if !Path::new(uri).is_absolute() {
+        match url::Url::parse(uri) {
+            Ok(parsed) if matches!(parsed.scheme(), "http" | "https" | "s3") => {
+                if parsed.host_str().is_none() {
+                    return Err(DaftError::ValueError(format!(
+                        "Vortex remote URL requires a host: {:?}",
+                        display_uri(uri)
+                    )));
+                }
+                return Ok(uri.to_string());
+            }
+            Err(_) if uri.contains("://") => {
+                return Err(DaftError::ValueError(format!(
+                    "Invalid Vortex URL: {:?}",
+                    display_uri(uri)
+                )));
+            }
+            _ => {}
+        }
+    }
+    local_path(uri).map(|path| path.to_string_lossy().into_owned())
+}
+
+async fn open_file(
+    uri: &str,
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    options: &VortexReadOptions,
+) -> DaftResult<(VortexSession, VortexFile)> {
+    validate_options(options)?;
+    let uri = input_uri(uri)?;
     tokio::runtime::Handle::try_current()
-        .map_err(|error| read_error(uri, "requires an active Tokio runtime", error))?;
+        .map_err(|error| read_error(&uri, "requires an active Tokio runtime", error))?;
     let session = VortexSession::default().with_tokio();
+    let reader = Arc::new(DaftReadAt::new(uri.clone(), io_client, io_stats, options).await?);
     let file = session
         .open_options()
-        .open_path(path)
+        .with_initial_read_size(options.max_in_flight_bytes.min(65535))
+        .open(reader)
         .await
-        .map_err(|error| read_error(uri, "open", error))?;
+        .map_err(|error| read_error(&uri, "open", error))?;
     Ok((session, file))
 }
 
@@ -99,6 +140,8 @@ pub(crate) fn schemas(
     session: &VortexSession,
     dtype: &DType,
 ) -> DaftResult<(ArrowSchemaRef, SchemaRef)> {
+    let safe_uri = display_uri(uri);
+    let uri = safe_uri.as_str();
     if !matches!(dtype, DType::Struct(_, Nullability::NonNullable)) {
         return Err(DaftError::TypeError(format!(
             "Vortex {uri:?} requires a non-nullable top-level struct, got {dtype}"
@@ -178,6 +221,8 @@ pub(crate) fn schemas(
 }
 
 pub(crate) fn validate_schema(uri: &str, expected: &Schema, actual: &Schema) -> DaftResult<()> {
+    let safe_uri = display_uri(uri);
+    let uri = safe_uri.as_str();
     if expected.len() != actual.len() {
         return Err(DaftError::SchemaMismatch(format!(
             "Vortex {uri:?} has {} columns; expected {} in the full first-file schema",
@@ -219,10 +264,15 @@ fn to_daft(batch: &ArrowRecordBatch) -> DaftResult<RecordBatch> {
 }
 
 /// Infer the complete schema, retaining source nullability for strict validation
-/// across files. Only local paths and file URLs are accepted.
-pub async fn read_vortex_schema(uri: &str) -> DaftResult<SchemaRef> {
-    let (session, file) = open_file(uri).await?;
-    Ok(schemas(uri, &session, file.dtype())?.1)
+/// across files. The same configured client and budgets govern footer reads.
+pub async fn read_vortex_schema(
+    uri: &str,
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+) -> DaftResult<SchemaRef> {
+    let (session, file) = open_file(uri, io_client, io_stats, &read_options).await?;
+    Ok(schemas(&display_uri(uri), &session, file.dtype())?.1)
 }
 
 struct ScanState {
@@ -235,20 +285,29 @@ struct ScanState {
     uri: String,
 }
 
-/// Stream one local file. Validate the complete schema first, then apply the
+/// Stream one file. Validate the complete schema first, then apply the
 /// complete residual filter, final projection, and exact post-filter limit.
 pub async fn stream_vortex(
     uri: &str,
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
     read_options: VortexReadOptions,
     convert_options: VortexConvertOptions,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     if read_options.batch_size == 0 {
         return Err(DaftError::ValueError(format!(
-            "Vortex batch_size must be positive for {uri:?}"
+            "Vortex batch_size must be positive for {:?}",
+            display_uri(uri)
         )));
     }
-    let (session, file) = open_file(uri).await?;
-    stream_opened_vortex(uri, session, file, read_options, convert_options)
+    let (session, file) = open_file(uri, io_client, io_stats, &read_options).await?;
+    stream_opened_vortex(
+        &display_uri(uri),
+        session,
+        file,
+        read_options,
+        convert_options,
+    )
 }
 
 // The returned stream owns the opened file and session until EOF, an error,

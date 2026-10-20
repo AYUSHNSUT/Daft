@@ -1,4 +1,4 @@
-//! Native local-file Vortex scans.
+//! Native Vortex scans through Daft's configured positional I/O.
 //!
 //! The reader supports flat primitive columns, exports Vortex arrays
 //! through Arrow, and applies complete Daft predicates before projection and
@@ -9,6 +9,7 @@
 use daft_core::prelude::SchemaRef;
 use daft_dsl::ExprRef;
 
+mod io;
 mod plan;
 mod read;
 
@@ -27,6 +28,13 @@ pub struct VortexReadOptions {
     pub enable_projection_pushdown: bool,
     /// Evaluate safe conjuncts in Vortex, then reevaluate the complete Daft filter.
     pub enable_filter_pushdown: bool,
+    /// Maximum active async positional requests per opened file. Cancellation
+    /// releases permits even if a dispatched blocking filesystem read finishes later.
+    pub max_concurrent_requests: usize,
+    /// Maximum requested bytes in flight per opened file. A larger individual
+    /// read fails; returned buffers, caches, decoded output and blocking reads
+    /// finishing after cancellation are not charged.
+    pub max_in_flight_bytes: usize,
 }
 
 impl Default for VortexReadOptions {
@@ -35,6 +43,8 @@ impl Default for VortexReadOptions {
             batch_size: 128 * 1024,
             enable_projection_pushdown: true,
             enable_filter_pushdown: true,
+            max_concurrent_requests: 8,
+            max_in_flight_bytes: 64 * 1024 * 1024,
         }
     }
 }

@@ -260,16 +260,15 @@ class DataSourceTask(ABC):
         stats: RecordBatch | None = None,
         storage_config: StorageConfig | None = None,
     ) -> DataSourceTask:
-        """Create an experimental native Vortex task for a local file.
+        """Create an experimental native Vortex task for a supported file URL.
 
-        Requires a ``python,vortex`` build and the native runner. Pass the full
+        Requires a ``python,vortex`` build on every executing worker. Pass the full
         schema inferred by ``daft.daft.read_vortex_schema``, preserving its
         reserved nullability metadata. Predicates are residual Daft filters;
         columns needed by them are retained alongside projected output.
         """
-        from daft.io._vortex import _require_native_runner, _require_vortex
+        from daft.io._vortex import _require_vortex
 
-        _require_native_runner()
         _require_vortex()
         inner = PyDataSourceTask.vortex(
             path=path,

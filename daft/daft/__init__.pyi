@@ -356,6 +356,8 @@ class VortexSourceConfig:
     batch_size: int
     enable_projection_pushdown: bool
     enable_filter_pushdown: bool
+    max_concurrent_requests: int
+    max_in_flight_bytes: int
 
     def __init__(
         self,
@@ -363,6 +365,8 @@ class VortexSourceConfig:
         *,
         enable_projection_pushdown: bool = True,
         enable_filter_pushdown: bool = True,
+        max_concurrent_requests: int = 8,
+        max_in_flight_bytes: int = 67108864,
     ) -> None: ...
 
 class DatabaseSourceConfig:
@@ -1352,8 +1356,14 @@ class PyDataSourceTask:
         storage_config: StorageConfig | None = None,
     ) -> PyDataSourceTask: ...
 
-def read_vortex_schema(path: str) -> PySchema:
-    """Infer a supported local Vortex schema; available with the vortex feature."""
+def read_vortex_schema(
+    uri: str,
+    io_config: IOConfig | None = None,
+    *,
+    max_concurrent_requests: int = 8,
+    max_in_flight_bytes: int = 67108864,
+) -> PySchema:
+    """Infer a Vortex schema through Daft I/O; available with the vortex feature."""
 
 def _vortex_scan_diagnostics(
     schema: PySchema,
@@ -2634,6 +2644,7 @@ class PyResultReceiver:
     def __aiter__(self) -> PyResultReceiver: ...
     async def __anext__(self) -> PyMicroPartition | FlightPartitions | None: ...
     async def try_finish(self) -> PyExecutionStats: ...
+    async def aclose(self) -> None: ...
 
 class LocalPhysicalPlan:
     @staticmethod
@@ -2657,6 +2668,8 @@ class NativeExecutor:
         inputs: dict[int, Input | list[PyMicroPartition]],
         context: dict[str, str] | None = None,
         maintain_order: bool = True,
+        *,
+        results_buffer_size: int | None = None,
     ) -> PyResultReceiver: ...
     def active_plan_count(self) -> int: ...
     def cancel_plan(self, fingerprint: int) -> None: ...

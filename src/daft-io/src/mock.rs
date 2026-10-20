@@ -42,6 +42,7 @@ mod tests {
         ls_pages: Mutex<VecDeque<LSResult>>,
         // The continuation token supplied to each ls() request.
         ls_requests: Arc<Mutex<Vec<Option<String>>>>,
+        connection_pool: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     impl MockSource {
@@ -55,6 +56,7 @@ mod tests {
                 requests: Arc::new(Mutex::new(Vec::new())),
                 ls_pages: Mutex::new(VecDeque::new()),
                 ls_requests: Arc::new(Mutex::new(Vec::new())),
+                connection_pool: None,
             }
         }
 
@@ -70,6 +72,11 @@ mod tests {
 
         fn with_fail_get(self, count: usize) -> Self {
             *self.fail_get_remaining.lock().unwrap() = count;
+            self
+        }
+
+        fn with_connection_pool(mut self, pool: Arc<tokio::sync::Semaphore>) -> Self {
+            self.connection_pool = Some(pool);
             self
         }
 
@@ -131,7 +138,7 @@ mod tests {
             &self,
             uri: &str,
             range: Option<GetRange>,
-            _io_stats: Option<IOStatsRef>,
+            io_stats: Option<IOStatsRef>,
         ) -> Result<GetResult> {
             {
                 let mut remaining = self.fail_get_remaining.lock().unwrap();
@@ -143,9 +150,23 @@ mod tests {
                     });
                 }
             }
+            let permit = if let Some(pool) = &self.connection_pool {
+                Some(pool.clone().acquire_owned().await.unwrap())
+            } else {
+                None
+            };
             self.requests.lock().unwrap().push(range.clone());
+            if let Some(stats) = &io_stats {
+                stats.mark_get_requests(1);
+            }
+            let length = self.slice_for_range(range.clone()).len();
             let s = self.read_data(range, uri);
-            Ok(GetResult::Stream(s, Some(self.content.len()), None, None))
+            Ok(GetResult::Stream(
+                crate::stream_utils::io_stats_on_bytestream(s, io_stats),
+                Some(length),
+                permit,
+                None,
+            ))
         }
 
         async fn put(&self, _uri: &str, _data: Bytes, _io_stats: Option<IOStatsRef>) -> Result<()> {
@@ -311,6 +332,75 @@ mod tests {
                 Some(GetRange::Bounded(245760..data_len))
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_resumable_counts_retry_bytes_once_and_releases_single_connection() {
+        let data = b"12345678".to_vec();
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let src =
+            Arc::new(MockSource::new(data.clone(), 4, Some(1)).with_connection_pool(pool.clone()));
+        let stats = crate::IOStatsContext::new("retry count regression");
+        let range = Some(GetRange::Bounded(0..8));
+        let initial = src
+            .get("mock://path", range.clone(), Some(stats.clone()))
+            .await
+            .unwrap();
+        assert_eq!(pool.available_permits(), 0);
+        let wrapped = initial.with_retry(StreamingRetryParams::new(
+            src.clone(),
+            "mock://path".into(),
+            range,
+            Some(stats.clone()),
+        ));
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), wrapped.bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output.as_ref(), data.as_slice());
+        assert_eq!(stats.load_get_requests(), 2);
+        assert_eq!(stats.load_bytes_read(), 8);
+        assert_eq!(pool.available_permits(), 1);
+        assert_eq!(
+            *src.requests.lock().unwrap(),
+            vec![Some(GetRange::Bounded(0..8)), Some(GetRange::Bounded(4..8))]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resumable_retains_replacement_connection_until_consumer_drop() {
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let src = Arc::new(
+            MockSource::new(b"123456789abc".to_vec(), 4, Some(1))
+                .with_connection_pool(pool.clone()),
+        );
+        let stats = crate::IOStatsContext::new("retry cancel regression");
+        let range = Some(GetRange::Bounded(0..12));
+        let initial = src
+            .get("mock://path", range.clone(), Some(stats.clone()))
+            .await
+            .unwrap();
+        let wrapped = initial.with_retry(StreamingRetryParams::new(
+            src,
+            "mock://path".into(),
+            range,
+            Some(stats.clone()),
+        ));
+        let GetResult::Stream(mut stream, _, _, _) = wrapped else {
+            panic!("expected stream")
+        };
+        assert_eq!(stream.next().await.unwrap().unwrap().as_ref(), b"1234");
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.as_ref(), b"5678");
+        assert_eq!(pool.available_permits(), 0);
+        drop(stream);
+        assert_eq!(pool.available_permits(), 1);
+        assert_eq!(stats.load_get_requests(), 2);
+        assert_eq!(stats.load_bytes_read(), 8);
     }
 
     #[tokio::test]

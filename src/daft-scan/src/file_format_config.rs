@@ -543,6 +543,8 @@ pub struct VortexSourceConfig {
     pub batch_size: usize,
     pub enable_projection_pushdown: bool,
     pub enable_filter_pushdown: bool,
+    pub max_concurrent_requests: usize,
+    pub max_in_flight_bytes: usize,
 }
 
 impl Default for VortexSourceConfig {
@@ -551,6 +553,8 @@ impl Default for VortexSourceConfig {
             batch_size: 131_072,
             enable_projection_pushdown: true,
             enable_filter_pushdown: true,
+            max_concurrent_requests: 8,
+            max_in_flight_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -565,6 +569,14 @@ impl VortexSourceConfig {
                 self.enable_projection_pushdown
             ),
             format!("Enable filter pushdown = {}", self.enable_filter_pushdown),
+            format!(
+                "Maximum concurrent requests = {}",
+                self.max_concurrent_requests
+            ),
+            format!(
+                "Maximum in-flight request bytes = {}",
+                self.max_in_flight_bytes
+            ),
         ]
     }
 }
@@ -577,22 +589,61 @@ fn strict_vortex_bool(value: &pyo3::Bound<'_, PyAny>) -> PyResult<bool> {
 }
 
 #[cfg(feature = "python")]
+fn strict_vortex_budget(value: &pyo3::Bound<'_, PyAny>) -> PyResult<usize> {
+    use pyo3::types::{PyBool, PyInt};
+
+    if value.is_instance_of::<PyBool>() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "Vortex request budgets must be positive integers, not bool",
+        ));
+    }
+    let budget = value.cast::<PyInt>()?.extract::<usize>()?;
+    if budget == 0 {
+        return Err(PyValueError::new_err(
+            "Vortex request budgets must be positive integers",
+        ));
+    }
+    Ok(budget)
+}
+
+#[cfg(feature = "python")]
 #[pymethods]
 impl VortexSourceConfig {
     #[new]
-    #[pyo3(signature = (batch_size=131_072, *, enable_projection_pushdown=true, enable_filter_pushdown=true))]
+    #[pyo3(signature = (
+        batch_size=131_072,
+        *,
+        enable_projection_pushdown=true,
+        enable_filter_pushdown=true,
+        max_concurrent_requests=8,
+        max_in_flight_bytes=67_108_864,
+    ))]
     fn new(
         batch_size: usize,
         #[pyo3(from_py_with = strict_vortex_bool)] enable_projection_pushdown: bool,
         #[pyo3(from_py_with = strict_vortex_bool)] enable_filter_pushdown: bool,
+        #[pyo3(from_py_with = strict_vortex_budget)] max_concurrent_requests: usize,
+        #[pyo3(from_py_with = strict_vortex_budget)] max_in_flight_bytes: usize,
     ) -> PyResult<Self> {
         if batch_size == 0 {
             return Err(PyValueError::new_err("Vortex batch_size must be positive"));
+        }
+        if max_concurrent_requests > usize::MAX >> 3 {
+            return Err(PyValueError::new_err(
+                "Vortex max_concurrent_requests exceeds the semaphore capacity",
+            ));
+        }
+        if max_in_flight_bytes > (u32::MAX as usize).min(usize::MAX >> 3) {
+            return Err(PyValueError::new_err(
+                "Vortex max_in_flight_bytes exceeds the supported request budget",
+            ));
         }
         Ok(Self {
             batch_size,
             enable_projection_pushdown,
             enable_filter_pushdown,
+            max_concurrent_requests,
+            max_in_flight_bytes,
         })
     }
 }

@@ -87,7 +87,7 @@ pub(crate) async fn read_scan_task(
             }
             #[cfg(feature = "vortex")]
             FileFormatConfig::Vortex(cfg) => {
-                read_vortex(scan_task, cfg, url, file_column_names).await
+                read_vortex(scan_task, cfg, url, file_column_names, io_client, io_stats).await
             }
             #[cfg(not(feature = "vortex"))]
             FileFormatConfig::Vortex(_) => Err(common_error::DaftError::NotImplemented(
@@ -361,6 +361,8 @@ async fn read_vortex(
     cfg: &VortexSourceConfig,
     url: &str,
     file_column_names: Option<Vec<String>>,
+    io_client: Arc<daft_io::IOClient>,
+    io_stats: IOStatsRef,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     if scan_task.pushdowns.aggregation.is_some() {
         return Err(common_error::DaftError::NotImplemented(
@@ -371,6 +373,8 @@ async fn read_vortex(
         batch_size: cfg.batch_size,
         enable_projection_pushdown: cfg.enable_projection_pushdown,
         enable_filter_pushdown: cfg.enable_filter_pushdown,
+        max_concurrent_requests: cfg.max_concurrent_requests,
+        max_in_flight_bytes: cfg.max_in_flight_bytes,
     };
     let convert_options = daft_vortex::VortexConvertOptions {
         schema: scan_task.schema.clone(),
@@ -378,7 +382,7 @@ async fn read_vortex(
         include_columns: file_column_names,
         limit: scan_task.pushdowns.limit,
     };
-    daft_vortex::stream_vortex(url, read_options, convert_options).await
+    daft_vortex::stream_vortex(url, io_client, io_stats, read_options, convert_options).await
 }
 
 async fn read_text(

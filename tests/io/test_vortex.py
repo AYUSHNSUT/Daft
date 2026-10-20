@@ -57,7 +57,7 @@ def test_read_vortex_empty_input_rejected_before_io(path) -> None:
         daft.read_vortex(path)
 
 
-@pytest.mark.parametrize("path", ["s3://bucket/file.vortex", "https://host/file.vortex", "gs://bucket/*.vortex"])
+@pytest.mark.parametrize("path", ["gs://bucket/*.vortex", "az://bucket/file.vortex", "ftp://host/file.vortex"])
 def test_read_vortex_remote_input_rejected_before_io(path: str) -> None:
     with pytest.raises(ValueError, match="only local"):
         daft.read_vortex(path)
@@ -75,15 +75,10 @@ def test_read_vortex_empty_file_uri_rejected_before_io(path: str) -> None:
         daft.read_vortex(path)
 
 
-def test_read_vortex_explicit_io_config_rejected() -> None:
-    with pytest.raises(NotImplementedError, match="io_config.*Phase 3"):
-        daft.read_vortex("unused.vortex", io_config=daft.io.IOConfig())
-
-
-def test_read_vortex_ray_rejected_without_starting_runner(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(_vortex, "get_or_infer_runner_type", lambda: "ray")
-    with pytest.raises(ValueError, match="Ray is not supported"):
-        daft.read_vortex("unused.vortex")
+def test_read_vortex_explicit_io_config(vortex_path: str) -> None:
+    assert daft.read_vortex(vortex_path, io_config=daft.io.IOConfig()).select("id").to_pydict() == {
+        "id": list(range(9))
+    }
 
 
 def test_vortex_path_resolution_uses_native_globs_and_deduplicates(tmp_path: Path) -> None:
