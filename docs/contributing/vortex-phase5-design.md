@@ -30,6 +30,13 @@ and report, with no samples pooled from the failed attempt. It does not cache
 file metadata or change retry settings. Preserve trial stderr/timestamps and
 service diagnostics before cleanup; do not add pacing or retry failed trials.
 
+Compatibility validation also found that strict shared HTTP range checks blocked
+MCAP's existing whole-file fallback. Distinguish an ignored range (HTTP 200)
+from a malformed partial response. MCAP may explicitly fetch and verify a full
+buffer after its initial range probe, preserving indexed ordering, filters and
+limits. Vortex continues to require validated partial responses. Malformed 206
+responses and unrelated I/O errors must fail without a whole-file fallback.
+
 ## Data flow and resource bounds
 
 The constructor continues to infer the full first-file schema. On each `get_tasks` invocation, the source partitions its resolved, deduplicated paths into bounded windows. A native batch runs independent footer reads concurrently with ordered results. Each returned count is associated with its original path and passed into the existing native scan-task metadata.
@@ -50,6 +57,7 @@ Public source serialization includes the concurrency setting. Native tasks retai
 | Correctness | Existing joins still build the small dimension and probe fact rows; filters, limits, full schema/nullability checks, lifecycle and credential redaction remain correct |
 | Builds | Rebuilt native extension, focused Rust tests in debug and release profiles, applicable Clippy/format/dependency checks, and feature-off import/query/enablement behavior |
 | Services | Real HTTP/MinIO/Ray tests with zero service skips; controlled remote comparison uses the existing local MinIO image |
+| HTTP compatibility | Vortex rejects ignored or misaligned ranges; small/large MCAP reads preserve ordering, filters and limits on servers without ranges; reject malformed partial responses and full-file size mismatches |
 | Performance | At least 20 measured repetitions for the short targeted comparison plus warmups; preserve every sample, CPU/RSS, provenance, and regressions |
 
 A failed metadata read must not create tasks with invented zero rows. Repeated planning must still observe replaced files. No background build/test load should overlap measured queries. Compare same-build concurrency settings before attributing changes to this implementation; keep Phase 4 measurements as a separately identified historical baseline.

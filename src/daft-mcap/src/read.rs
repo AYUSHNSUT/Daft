@@ -20,7 +20,8 @@ use tokio::io::AsyncRead;
 use tokio_util::io::StreamReader;
 
 use crate::{
-    BufferedRange, MAX_RECORD_LENGTH, McapReadOptions, fetch_exact_range, fetch_range,
+    BufferedRange, MAX_RECORD_LENGTH, McapReadOptions, fetch_exact_range, fetch_full_file,
+    fetch_leading_bytes,
     indexed::{IndexedAction, IndexedReader},
     mcap_error, parse_summary_from_bytes, read_summary,
 };
@@ -227,19 +228,18 @@ impl McapReader {
             // Small remote files: one request buys the whole file; the summary
             // and any chunk reads are then served from the buffer.
             let mut buffer = if is_remote && file_size <= SMALL_REMOTE_FILE_THRESHOLD {
-                Some(fetch_exact_range(&uri, 0, file_size, &io_client, &io_stats).await?)
+                Some(fetch_full_file(&uri, file_size, &io_client, &io_stats).await?)
             } else {
                 None
             };
             let magic = match &buffer {
                 Some(bytes) => bytes.slice(0..mcap::MAGIC.len()),
                 None => {
-                    let bytes =
-                        fetch_range(&uri, 0, mcap::MAGIC.len(), &io_client, &io_stats).await?;
+                    let bytes = fetch_leading_bytes(&uri, file_size, &io_client, &io_stats).await?;
                     if is_remote && bytes.len() == file_size {
                         // HTTP may ignore Range, even when it advertises support.
-                        // Reuse the full response for the summary and chunk reads
-                        // so indexed files retain their log-time ordering.
+                        // The initial probe then explicitly retries a full GET.
+                        // Reuse its buffer so indexed files keep log-time ordering.
                         let magic = bytes.slice(..mcap::MAGIC.len());
                         buffer = Some(bytes);
                         magic

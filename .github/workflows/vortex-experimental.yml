@@ -14,6 +14,7 @@ on:
     - daft/**
     - src/**
     - tests/io/test_vortex*.py
+    - tests/io/mcap/**
     - tests/integration/io/vortex/**
     - tests/execution/test_native_result_lifecycle.py
     - tests/io/test_native_tasks.py
@@ -43,6 +44,7 @@ on:
     - daft/**
     - src/**
     - tests/io/test_vortex*.py
+    - tests/io/mcap/**
     - tests/integration/io/vortex/**
     - tests/execution/test_native_result_lifecycle.py
     - tests/io/test_native_tasks.py
@@ -138,6 +140,7 @@ jobs:
           maturin==1.13.3 pytest==9.0.3 pytest-xdist==3.8.0 \
           numpy==2.2.6 pandas==2.2.3 requests==2.32.5 \
           azure-storage-blob==12.27.1 boto3==1.36.2 \
+          mcap==1.3.1 mcap-ros2-support==0.5.7 lz4==4.4.4 zstandard==0.24.0 \
           -r examples/vortex_eval/requirements.txt
         mkdir -p examples/vortex_eval/artifacts/phase4-ci
     - name: Build optimized extension
@@ -231,6 +234,14 @@ jobs:
           tests/dataframe/test_show.py::test_native_runner_close_does_not_log_missing_event_loop \
           tests/dataframe/test_show.py::test_show_limit_does_not_log_active_nodes_warning \
           2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/regressions.log
+    - name: Check MCAP compatibility with HTTP range validation
+      run: |
+        set -euo pipefail
+        .venv/bin/python -m pytest -n 0 -q -rs \
+          --junitxml=examples/vortex_eval/artifacts/phase4-ci/mcap.xml \
+          tests/io/mcap/test_mcap.py \
+          -k 'not test_mcap_read_huggingface and not test_mcap_read_s3' \
+          2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/mcap.log
     - name: Smoke-test benchmark correctness without timing thresholds
       if: matrix.mode == 'enabled'
       run: |
