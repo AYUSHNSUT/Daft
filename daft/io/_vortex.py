@@ -28,12 +28,21 @@ _FEATURE_ERROR = (
 )
 _MAX_REQUESTS = sys.maxsize >> 2
 _MAX_IN_FLIGHT_BYTES = min(2**32 - 1, _MAX_REQUESTS)
+_MAX_METADATA_CONCURRENCY = 64
+
+
+def _validate_metadata_concurrency(value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= _MAX_METADATA_CONCURRENCY:
+        raise ValueError(
+            f"metadata_concurrency must be an integer from 1 through {_MAX_METADATA_CONCURRENCY}, received {value!r}"
+        )
 
 
 def _require_vortex() -> None:
     if (
         not hasattr(_native, "read_vortex_schema")
         or not hasattr(_native, "read_vortex_metadata")
+        or not hasattr(_native, "read_vortex_metadata_bulk")
         or not hasattr(_native.PyDataSourceTask, "vortex")
     ):
         raise ImportError(_FEATURE_ERROR)
@@ -189,6 +198,7 @@ def read_vortex(
     enable_filter_pushdown: bool = True,
     max_concurrent_requests: int = 8,
     max_in_flight_bytes: int = 64 * 1024 * 1024,
+    metadata_concurrency: int = 8,
 ) -> DataFrame:
     """Read Vortex files with the experimental native reader.
 
@@ -220,6 +230,10 @@ def read_vortex(
             reader. Default 67108864. A single larger request fails explicitly.
             This bounds requests rather than decoded data, caches, or query
             memory. Multiple file tasks each have their own request budget.
+        metadata_concurrency: Maximum concurrently opened files for planning
+            footer metadata, from 1 through 64. Default 8. Each open has its
+            own request/byte budget; this is independent of scan-task execution
+            concurrency and does not establish a query-wide memory bound.
 
     Note:
         Requires a build with Rust features ``python,vortex``. The Python
@@ -251,6 +265,7 @@ def read_vortex(
     """
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         raise ValueError(f"batch_size must be a positive integer, received {batch_size!r}")
+    _validate_metadata_concurrency(metadata_concurrency)
     for name, value in (
         ("max_concurrent_requests", max_concurrent_requests),
         ("max_in_flight_bytes", max_in_flight_bytes),
@@ -277,6 +292,7 @@ def read_vortex(
         enable_filter_pushdown=enable_filter_pushdown,
         max_concurrent_requests=max_concurrent_requests,
         max_in_flight_bytes=max_in_flight_bytes,
+        metadata_concurrency=metadata_concurrency,
     ).read()
 
 
@@ -291,7 +307,9 @@ class VortexSource(DataSource):
         enable_filter_pushdown: bool = True,
         max_concurrent_requests: int = 8,
         max_in_flight_bytes: int = 64 * 1024 * 1024,
+        metadata_concurrency: int = 8,
     ) -> None:
+        _validate_metadata_concurrency(metadata_concurrency)
         self._paths = _resolve_vortex_paths(paths, io_config)
         self._batch_size = batch_size
         self._io_config = io_config
@@ -299,6 +317,7 @@ class VortexSource(DataSource):
         self._enable_filter_pushdown = enable_filter_pushdown
         self._max_concurrent_requests = max_concurrent_requests
         self._max_in_flight_bytes = max_in_flight_bytes
+        self._metadata_concurrency = metadata_concurrency
         # Preserve native metadata: it carries original field nullability for
         # strict matching, which Daft's logical types alone cannot represent.
         self._scan_schema = Schema._from_pyschema(
@@ -330,29 +349,33 @@ class VortexSource(DataSource):
     async def get_tasks(self, pushdowns: Pushdowns) -> AsyncIterator[DataSourceTask]:
         from daft.daft import VortexSourceConfig
 
-        for path in self._paths:
-            # Refresh footer counts for each materialization; reused/pickled
-            # sources must not retain stale cardinality estimates. These counts
-            # inform planning, while execution still validates and scans files.
-            _, num_rows = _native.read_vortex_metadata(
-                path,
+        for start in range(0, len(self._paths), self._metadata_concurrency):
+            paths = self._paths[start : start + self._metadata_concurrency]
+            # Read fresh footers in bounded ordered windows. Sources can be
+            # reused or pickled; no counts or open handles survive planning.
+            metadata, _metrics = _native.read_vortex_metadata_bulk(
+                paths,
                 io_config=self._io_config,
+                max_concurrent_files=self._metadata_concurrency,
                 max_concurrent_requests=self._max_concurrent_requests,
                 max_in_flight_bytes=self._max_in_flight_bytes,
             )
-            # Full schema validation precedes physical optimization. The native
-            # reader retains every residual dependency before final projection.
-            yield DataSourceTask.vortex(
-                path=path,
-                schema=self._scan_schema,
-                num_rows=num_rows,
-                vortex_config=VortexSourceConfig(
-                    batch_size=self._batch_size,
-                    enable_projection_pushdown=self._enable_projection_pushdown,
-                    enable_filter_pushdown=self._enable_filter_pushdown,
-                    max_concurrent_requests=self._max_concurrent_requests,
-                    max_in_flight_bytes=self._max_in_flight_bytes,
-                ),
-                pushdowns=pushdowns,
-                storage_config=StorageConfig(multithreaded_io=True, io_config=self._io_config),
-            )
+            row_counts = [num_rows for _, num_rows in metadata]
+            del metadata
+            for path, num_rows in zip(paths, row_counts, strict=True):
+                # Execution validates the full schema before optimization and
+                # retains residual dependencies before final projection.
+                yield DataSourceTask.vortex(
+                    path=path,
+                    schema=self._scan_schema,
+                    num_rows=num_rows,
+                    vortex_config=VortexSourceConfig(
+                        batch_size=self._batch_size,
+                        enable_projection_pushdown=self._enable_projection_pushdown,
+                        enable_filter_pushdown=self._enable_filter_pushdown,
+                        max_concurrent_requests=self._max_concurrent_requests,
+                        max_in_flight_bytes=self._max_in_flight_bytes,
+                    ),
+                    pushdowns=pushdowns,
+                    storage_config=StorageConfig(multithreaded_io=True, io_config=self._io_config),
+                )

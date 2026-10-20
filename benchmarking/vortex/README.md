@@ -170,3 +170,60 @@ Alternatively, set `VORTEX_MINIO_ENDPOINT`, `VORTEX_MINIO_ACCESS_KEY`, and
 unique bucket. Endpoint URLs must not contain credentials, queries, or fragments.
 This experiment measures local S3-compatible transport and does not represent
 public-cloud latency or throughput. It does not measure Ray scaling.
+
+## Metadata planning comparison
+
+The [Phase 5 results](../../docs/contributing/vortex-phase5-results.md) record
+the completed local and MinIO comparisons, build identities and remaining regressions.
+
+Phase 5 adds a separate harness for `read_vortex(metadata_concurrency=...)`.
+It compares Vortex concurrency 1 and 8 in the same release build, alongside
+contemporaneous Parquet query trials. Metadata-only trials report fresh bulk
+footer calls separately from complete query timings. They expose the helper's
+configured file cap, elapsed time and available Daft I/O counters; they exclude
+discovery/execution and do not measure physical network requests or disk I/O.
+
+After the enabled release build and provenance setup above, reuse existing
+fixtures:
+
+```bash
+.venv/bin/python -m benchmarking.vortex.metadata_eval \
+  --manifest examples/vortex_eval/artifacts/phase4/fixtures-1g/manifest.json \
+  --output examples/vortex_eval/artifacts/phase5/local-report \
+  --concurrency 1 8 --cases scan_narrow range_0.01 eq_0.01 join scan_full \
+  --rounds 20 --warmups 1
+
+.venv/bin/python -m examples.vortex_eval.run_phase5_services \
+  --manifest examples/vortex_eval/artifacts/phase4/remote-fixtures/manifest.json \
+  --output examples/vortex_eval/artifacts/phase5/remote-report \
+  --docker-image draft-vortex-minio:phase3 \
+  --cases scan_narrow range_0.01 eq_0.01 join scan_full \
+  --rounds 20 --warmups 1
+```
+
+The image name is the existing local developer tag; substitute the exact tag of
+your own MinIO build. The helper owns only its temporary bucket/container and
+uses the same configured credentials for both readers. Provisioning/upload and
+cleanup are outside the query timer.
+
+The default query subset is narrow projection, 1% range and 1% equality. `--cases`
+also accepts `join` and `scan_full`; `--modes metadata` isolates footer calls.
+`--orders`/`--layouts` select datasets for the direct harness, and the service
+helper uses `--order`/`--layout`. Normal comparisons require 20 measured rounds
+and one warmup. `--allow-dev --rounds 1 --warmups 0` is correctness smoke only.
+
+All trials use fresh processes and seeded interleaving, retain correct output
+digests and failures, and record build/binary/source/fixture identity. Reports
+show Parquet/Vortex query ratios and Vortex concurrency-1/concurrency-8 ratios
+separately. OS caches remain retained. A concurrency setting is not a global
+memory or CPU bound; each active file retains its own request/byte budgets.
+
+Each trial also saves UTC subprocess start/completion times, its process exit
+code, and full redacted worker stderr. These diagnostics are separate from the
+worker's query or metadata timer. The MinIO helper saves
+`service-diagnostics.json` before cleanup, including service health and, for a
+container it owns, selected container state, Docker versions and bounded logs.
+It takes snapshots before and after the evaluation without polling during
+trials. A failed trial still fails the comparison; diagnostics add no retries or
+pauses between trials. Use a new output directory for each attempt so failed
+runs remain available.

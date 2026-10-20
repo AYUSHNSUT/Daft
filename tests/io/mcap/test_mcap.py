@@ -33,6 +33,7 @@ def _make_counting_range_handler(contents: bytes):
     class CountingRangeHandler(BaseHTTPRequestHandler):
         bytes_served = 0
         get_requests = 0
+        range_requests = 0
 
         def log_message(self, format, *args):
             pass
@@ -45,6 +46,8 @@ def _make_counting_range_handler(contents: bytes):
 
         def do_GET(self):
             header = self.headers.get("Range")
+            if header is not None:
+                type(self).range_requests += 1
             if header is None:
                 start, end, status = 0, len(contents) - 1, 200
             else:
@@ -337,6 +340,7 @@ def test_mcap_small_remote_filter_uses_one_body_request(tmp_path):
 
     assert result == {"sequence": [0, 1, 2]}
     assert CountingRangeHandler.get_requests == 1
+    assert CountingRangeHandler.range_requests == 0
     assert CountingRangeHandler.bytes_served == len(contents)
 
 
@@ -536,31 +540,136 @@ def test_timestamp_pushdown_preserves_residual_semantics(tmp_path):
     assert pushed == {"sequence": [2, 3, 4]}
 
 
-def test_http_without_byte_range_support():
-    contents = mcap_bytes(reversed(range(1000)), payload=b"x" * 100)
-    assert len(contents) > 64 * 1024
+@pytest.mark.parametrize("rows", [10, 1000], ids=["small", "large"])
+@pytest.mark.parametrize("advertise_ranges", [False, True], ids=["no-advertisement", "ignores-advertised-ranges"])
+def test_http_without_byte_range_support(rows, advertise_ranges):
+    contents = mcap_bytes(reversed(range(rows)), payload=b"x" * 100)
+    assert (len(contents) <= 64 * 1024) == (rows == 10)
 
     class FullResponseHandler(BaseHTTPRequestHandler):
+        get_ranges = []
+
         def log_message(self, *args):
             pass
 
         def do_HEAD(self):
             self.send_response(200)
             self.send_header("Content-Length", str(len(contents)))
+            if advertise_ranges:
+                self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
 
         def do_GET(self):
+            type(self).get_ranges.append(self.headers.get("Range"))
             self.do_HEAD()
-            self.wfile.write(contents)
+            try:
+                self.wfile.write(contents)
+            except (BrokenPipeError, ConnectionResetError):
+                # Strict range validation can drop an ignored-range response
+                # before MCAP retries with an ordinary full-file GET.
+                pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), FullResponseHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         url = f"http://127.0.0.1:{server.server_port}/test.mcap"
-        assert daft.read_mcap(url).count_rows() == 1000
+        assert daft.read_mcap(url).count_rows() == rows
         assert daft.read_mcap(url).limit(3).select("log_time").to_pydict() == {"log_time": [0, 1, 2]}
+        assert daft.read_mcap(url, topics=["/a"], start_time=5, end_time=8).select("log_time").to_pydict() == {
+            "log_time": [5, 6, 7]
+        }
     finally:
         server.shutdown()
         server.server_close()
         thread.join()
+
+    assert FullResponseHandler.get_ranges.count(None) == 3
+    assert len(FullResponseHandler.get_ranges) == (3 if rows == 10 else 6)
+
+
+@pytest.mark.parametrize("rows", [10, 1000], ids=["small", "large"])
+def test_http_full_file_buffer_checks_head_length(rows):
+    contents = mcap_bytes(reversed(range(rows)), payload=b"x" * 100)
+
+    class ChangedLengthHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(contents) + 1))
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(contents)))
+            self.end_headers()
+            try:
+                self.wfile.write(contents)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ChangedLengthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/test.mcap"
+        with pytest.raises(Exception, match="unexpected full-file length"):
+            daft.read_mcap(url).collect()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("malformed", ["missing-content-range", "wrong-offset", "wrong-length"])
+def test_http_malformed_partial_response_does_not_fall_back(malformed):
+    contents = mcap_bytes(reversed(range(1000)), payload=b"x" * 100)
+    assert len(contents) > 64 * 1024
+
+    class MalformedRangeHandler(BaseHTTPRequestHandler):
+        get_ranges = []
+
+        def log_message(self, *args):
+            pass
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(contents)))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+
+        def do_GET(self):
+            requested = self.headers.get("Range")
+            type(self).get_ranges.append(requested)
+            if requested is None:
+                self.do_HEAD()
+                body = contents
+            else:
+                assert requested == "bytes=0-7"
+                start = 1 if malformed == "wrong-offset" else 0
+                body = contents[start : start + (9 if malformed == "wrong-length" else 8)]
+                self.send_response(206)
+                self.send_header("Content-Length", str(len(body)))
+                if malformed != "missing-content-range":
+                    self.send_header("Content-Range", f"bytes {start}-{start + 7}/{len(contents)}")
+                self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MalformedRangeHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/test.mcap"
+        with pytest.raises(Exception, match="Invalid byte-range response"):
+            daft.read_mcap(url).collect()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert MalformedRangeHandler.get_ranges == ["bytes=0-7"]

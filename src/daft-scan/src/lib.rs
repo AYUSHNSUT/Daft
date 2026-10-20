@@ -1060,7 +1060,10 @@ mod test {
                 let (decoded, consumed): (VortexSourceConfig, _) =
                     bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
                 assert_eq!(consumed, encoded.len());
-                assert_eq!(decoded, config);
+                assert!(
+                    decoded == config,
+                    "Vortex config changed during bincode round-trip"
+                );
             }
         }
     }

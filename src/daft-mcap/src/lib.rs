@@ -76,8 +76,11 @@ pub(crate) async fn fetch_range(
         )
         .await?;
 
-    // Right now, local files reads are not recorded by the IOClient
-    // Record on the caller size instead
+    collect_get_result(result, io_stats).await
+}
+
+async fn collect_get_result(result: GetResult, io_stats: &IOStatsRef) -> DaftResult<Bytes> {
+    // Local file reads are not recorded by the IOClient; count them here.
     let local = matches!(&result, GetResult::File(_));
     let bytes = result.bytes().await?;
     if local {
@@ -85,6 +88,65 @@ pub(crate) async fn fetch_range(
     }
 
     Ok(bytes)
+}
+
+pub(crate) async fn fetch_full_file(
+    uri: &str,
+    file_size: usize,
+    io_client: &Arc<IOClient>,
+    io_stats: &IOStatsRef,
+) -> DaftResult<Bytes> {
+    let result = io_client
+        .single_url_get(uri.to_string(), None, Some(io_stats.clone()))
+        .await?;
+    let bytes = collect_get_result(result, io_stats).await?;
+    if bytes.len() != file_size {
+        return Err(mcap_error(format!(
+            "unexpected full-file length: expected {file_size} bytes, received {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn is_range_not_supported(error: &daft_io::Error) -> bool {
+    match error {
+        daft_io::Error::RangeNotSupported => true,
+        daft_io::Error::CachedError { source } => is_range_not_supported(source),
+        _ => false,
+    }
+}
+
+/// Probe leading magic through the strict range reader. Only an HTTP 200
+/// capability failure permits a separate full GET; malformed partial responses
+/// and other I/O failures still propagate. A full buffer retains indexed ordering.
+pub(crate) async fn fetch_leading_bytes(
+    uri: &str,
+    file_size: usize,
+    io_client: &Arc<IOClient>,
+    io_stats: &IOStatsRef,
+) -> DaftResult<Bytes> {
+    // Inspect the typed I/O error before converting it to DaftError.
+    let result = io_client
+        .single_url_get(
+            uri.to_string(),
+            Some(GetRange::Bounded(0..mcap::MAGIC.len())),
+            Some(io_stats.clone()),
+        )
+        .await;
+    match result {
+        Ok(result) => {
+            let bytes = collect_get_result(result, io_stats).await?;
+            if bytes.len() != mcap::MAGIC.len() {
+                return Err(mcap_error("unexpected length reading leading magic"));
+            }
+            Ok(bytes)
+        }
+        Err(error) if is_range_not_supported(&error) => {
+            fetch_full_file(uri, file_size, io_client, io_stats).await
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Require the range contract when callers rely on the requested interval.
@@ -367,8 +429,27 @@ mod tests {
     use daft_dsl::{lit, resolved_col};
     use tempfile::NamedTempFile;
 
-    use super::{BufferedRange, McapConvertOptions, McapReadOptions};
+    use super::{BufferedRange, McapConvertOptions, McapReadOptions, is_range_not_supported};
     use crate::test_utils::{collect_stream, write_corrupt_chunk_mcap, write_mcap};
+
+    #[test]
+    fn full_file_fallback_requires_typed_range_capability_error() {
+        use daft_io::Error;
+
+        assert!(is_range_not_supported(&Error::RangeNotSupported));
+        assert!(is_range_not_supported(&Error::CachedError {
+            source: std::sync::Arc::new(Error::RangeNotSupported),
+        }));
+        for message in [
+            "HTTP server ignored the byte-range request (returned 200 OK)",
+            "Invalid byte-range response: missing or malformed Content-Range",
+        ] {
+            assert!(!is_range_not_supported(&Error::InvalidArgument {
+                msg: message.to_string(),
+            }));
+        }
+    }
+
     #[test]
     fn buffered_range_slices_within_bounds() {
         let buffer = BufferedRange {

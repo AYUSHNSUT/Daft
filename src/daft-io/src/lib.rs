@@ -71,6 +71,11 @@ pub enum Error {
     #[snafu(display("Invalid Argument: {:?}", msg))]
     InvalidArgument { msg: String },
 
+    /// A ranged HTTP GET received 200 OK instead of a partial response.
+    /// Callers that support whole-file buffering may explicitly retry without Range.
+    #[snafu(display("HTTP server ignored the byte-range request (returned 200 OK)"))]
+    RangeNotSupported,
+
     #[snafu(display("Unable to expand home dir"))]
     HomeDirError { path: String },
 

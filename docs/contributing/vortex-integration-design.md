@@ -4,13 +4,15 @@
 
 Phase 3 is complete for its declared I/O, resource-control, and worker scope, including real HTTP/MinIO/Ray acceptance; see the [plan](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Phase 4's benchmark harness, connector documentation, personal-fork CI workflow, and Vortex footer row estimates are implemented. Release evaluation and local/user-terminal acceptance are complete for the [Phase 4 scope](vortex-phase4-design.md); the [results record](vortex-phase4-results.md) includes remaining regressions and measurement limits. GitHub/Linux workflow execution is separately unverified.
 
-**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, current implementation branch `poc/vortex-phase4`, review base `poc/vortex-phase3`.
+Phase 5's [bounded metadata plan](vortex-phase5-design.md) is implemented and has completed local/user-terminal validation, including shared S3 connection reuse and MCAP HTTP compatibility. Its [results](vortex-phase5-results.md) separate same-build concurrency comparisons, the original local measurement build and final remote acceptance. Remaining Parquet regressions and unverified final GitHub/Linux execution are explicit.
+
+**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, current implementation branch `poc/vortex-phase5`, review base `poc/vortex-phase4`.
 
 **Design baseline:** `d3cd974150ba93dbbe8efef8370b129538fcee4b`; reviewed October 20, 2026.
 
 **Companion:** [test and benchmark plan](vortex-integration-test-plan.md).
 
-**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), [Phase 2 selective-scan results](vortex-phase2-results.md), [Phase 3 I/O and scheduling validation](vortex-phase3-results.md), [Phase 4 release results](vortex-phase4-results.md), [release benchmark instructions](../../benchmarking/vortex/README.md), and the [experimental connector guide](../connectors/vortex.md).
+**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), [Phase 2 selective-scan results](vortex-phase2-results.md), [Phase 3 I/O and scheduling validation](vortex-phase3-results.md), [Phase 4 release results](vortex-phase4-results.md), [Phase 5 metadata results](vortex-phase5-results.md), [release benchmark instructions](../../benchmarking/vortex/README.md), and the [experimental connector guide](../connectors/vortex.md).
 
 ## Summary
 
@@ -41,7 +43,7 @@ result = df.where(col("value") >= 20).select("id").limit(100)
 result.show()
 ```
 
-The API accepts `path`, optional `io_config`, and `batch_size=131072`. Keyword-only options are `enable_projection_pushdown=True`, `enable_filter_pushdown=True`, `max_concurrent_requests=8`, and `max_in_flight_bytes=67108864`. Phase 3 carries explicit configuration into Daft I/O and serializes the per-reader budgets. See its validation record for remote and worker acceptance. The switches independently disable physical Vortex optimizations for differential testing; Daft still applies the complete filter and final projection.
+The API accepts `path`, optional `io_config`, and `batch_size=131072`. Keyword-only options are `enable_projection_pushdown=True`, `enable_filter_pushdown=True`, `max_concurrent_requests=8`, `max_in_flight_bytes=67108864`, and `metadata_concurrency=8`. Phase 3 carries explicit configuration into Daft I/O and serializes the per-reader budgets. Phase 5 bounds fresh planning-footer windows with `metadata_concurrency`, a strict integer from 1 through 64; each active file retains its own request/byte budget. Counts refresh on every materialization rather than being cached across opens. The switches independently disable physical Vortex optimizations for differential testing; Daft still applies the complete filter and final projection.
 
 | Capability | First native milestone | Later phases |
 | --- | --- | --- |
@@ -142,6 +144,7 @@ Each phase is a separately reviewable change on the fork. Advancing requires its
 | **2. Selective scans** | Push requested physical columns and a small, tested predicate subset into Vortex; expose useful scan diagnostics. | Differential tests agree with pushdowns disabled and the in-memory oracle; instrumentation proves less reading or decoding where expected. |
 | **3. I/O and scheduling parity** | Adapt Daft positional I/O, credentials/configuration, tracing, and per-input metrics; add tested remote schemes and Ray execution. Consider intra-file row ranges as a separate substep. | Local services prove range/error/configuration behavior; task serialization and cancellation pass; splits cover rows exactly once if implemented. |
 | **4. Evaluation and supported fork feature** | Release-build benchmarks, regressions report, installation/API/connector documentation, and a declared support matrix. | Reproducible results with correct outputs and resource measurements; supported behavior has CI coverage; limitations remain visible. |
+| **5. Bounded metadata planning** | Ordered bulk footer reads, fresh bounded source windows, metadata-only diagnostics and same-build concurrency comparisons; shared transport compatibility repairs. | Local/user-terminal correctness and service acceptance; complete repeated comparisons with separate build provenance and remaining regressions. |
 
 ### Phase 0: make the first experiment small
 

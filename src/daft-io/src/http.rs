@@ -330,6 +330,9 @@ fn validate_range_response(
     let invalid = |reason: &str| super::Error::InvalidArgument {
         msg: format!("Invalid HTTP range response: {reason}"),
     };
+    if status == reqwest::StatusCode::OK {
+        return Err(super::Error::RangeNotSupported);
+    }
     if status != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(invalid("server did not return 206 Partial Content"));
     }
@@ -585,7 +588,14 @@ mod tests {
         let requested = GetRange::Bounded(5..10);
         let valid = range_headers("bytes 5-9/20", Some("5"));
         validate_range_response(&requested, StatusCode::PARTIAL_CONTENT, &valid).unwrap();
-        assert!(validate_range_response(&requested, StatusCode::OK, &valid).is_err());
+        assert!(matches!(
+            validate_range_response(&requested, StatusCode::OK, &valid),
+            Err(crate::Error::RangeNotSupported)
+        ));
+        assert!(matches!(
+            validate_range_response(&requested, StatusCode::CREATED, &valid),
+            Err(crate::Error::InvalidArgument { .. })
+        ));
         for range in ["bytes 5-9/*", "Bytes 5-9/*", "BYTES 5-9/20"] {
             validate_range_response(
                 &requested,
@@ -612,7 +622,7 @@ mod tests {
                     StatusCode::PARTIAL_CONTENT,
                     &range_headers(range, Some(length))
                 )
-                .is_err(),
+                .is_err_and(|error| matches!(error, crate::Error::InvalidArgument { .. })),
                 "accepted {range}"
             );
         }

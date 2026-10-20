@@ -3,7 +3,7 @@ name: Vortex experimental
 # This is a personal-fork acceptance workflow, not an upstream feature gate.
 on:
   push:
-    branches: [poc/vortex-phase4]
+    branches: [poc/vortex-phase4, poc/vortex-phase5]
     paths:
     - .github/workflows/vortex-experimental.yml
     - Cargo.toml
@@ -14,6 +14,7 @@ on:
     - daft/**
     - src/**
     - tests/io/test_vortex*.py
+    - tests/io/mcap/**
     - tests/integration/io/vortex/**
     - tests/execution/test_native_result_lifecycle.py
     - tests/io/test_native_tasks.py
@@ -32,7 +33,7 @@ on:
     - docs/install.md
     - docs/SUMMARY.md
   pull_request:
-    branches: [poc/vortex-phase3]
+    branches: [poc/vortex-phase3, poc/vortex-phase4]
     paths:
     - .github/workflows/vortex-experimental.yml
     - Cargo.toml
@@ -43,6 +44,7 @@ on:
     - daft/**
     - src/**
     - tests/io/test_vortex*.py
+    - tests/io/mcap/**
     - tests/integration/io/vortex/**
     - tests/execution/test_native_result_lifecycle.py
     - tests/io/test_native_tasks.py
@@ -71,7 +73,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
@@ -88,9 +90,11 @@ jobs:
     if: >-
       github.repository == 'AYUSHNSUT/Daft' &&
       ((github.event_name == 'pull_request' &&
-        github.head_ref == 'poc/vortex-phase4' &&
+        ((github.head_ref == 'poc/vortex-phase4' && github.base_ref == 'poc/vortex-phase3') ||
+         (github.head_ref == 'poc/vortex-phase5' && github.base_ref == 'poc/vortex-phase4')) &&
         github.event.pull_request.head.repo.full_name == 'AYUSHNSUT/Daft') ||
-       (github.event_name != 'pull_request' && github.ref == 'refs/heads/poc/vortex-phase4'))
+       (github.event_name != 'pull_request' &&
+        (github.ref == 'refs/heads/poc/vortex-phase4' || github.ref == 'refs/heads/poc/vortex-phase5')))
     name: Vortex ${{ matrix.mode }}
     runs-on: ubuntu-24.04
     timeout-minutes: 150
@@ -136,6 +140,7 @@ jobs:
           maturin==1.13.3 pytest==9.0.3 pytest-xdist==3.8.0 \
           numpy==2.2.6 pandas==2.2.3 requests==2.32.5 \
           azure-storage-blob==12.27.1 boto3==1.36.2 \
+          mcap==1.3.1 mcap-ros2-support==0.5.7 lz4==4.4.4 zstandard==0.24.0 \
           -r examples/vortex_eval/requirements.txt
         mkdir -p examples/vortex_eval/artifacts/phase4-ci
     - name: Build optimized extension
@@ -159,6 +164,7 @@ jobs:
 
         enabled = os.environ["VORTEX_EXPECT_ENABLED"] == "enabled"
         assert hasattr(native, "read_vortex_schema") == enabled
+        assert hasattr(native, "read_vortex_metadata_bulk") == enabled
         assert callable(daft.read_vortex)
         assert daft.get_build_type() == "release"
         assert daft.from_pydict({"id": [1, 2]}).select("id").to_pydict() == {"id": [1, 2]}
@@ -198,6 +204,12 @@ jobs:
         set -euo pipefail
         cargo test --release --locked --no-default-features -p daft-vortex -p daft-scan --lib \
           2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/native-vortex.log
+    - name: Check S3 connection reuse, proxy, and timeout behavior
+      if: matrix.mode == 'enabled'
+      run: |
+        set -euo pipefail
+        cargo test --release --locked --no-default-features -p daft-io --lib test_s3_http_client_ \
+          2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/s3-pooling.log
     - name: Check benchmark harness and remote-helper ownership
       if: matrix.mode == 'enabled'
       run: |
@@ -205,6 +217,7 @@ jobs:
         .venv/bin/python -m pytest -n 0 -q -rs \
           --junitxml=examples/vortex_eval/artifacts/phase4-ci/harness.xml \
           benchmarking/vortex/test_*.py examples/vortex_eval/test_phase4_services.py \
+          examples/vortex_eval/test_phase5_services.py \
           2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/harness.log
     - name: Check existing native, Parquet, count, and iterator behavior
       run: |
@@ -221,6 +234,14 @@ jobs:
           tests/dataframe/test_show.py::test_native_runner_close_does_not_log_missing_event_loop \
           tests/dataframe/test_show.py::test_show_limit_does_not_log_active_nodes_warning \
           2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/regressions.log
+    - name: Check MCAP compatibility with HTTP range validation
+      run: |
+        set -euo pipefail
+        .venv/bin/python -m pytest -n 0 -q -rs \
+          --junitxml=examples/vortex_eval/artifacts/phase4-ci/mcap.xml \
+          tests/io/mcap/test_mcap.py \
+          -k 'not test_mcap_read_huggingface and not test_mcap_read_s3' \
+          2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/mcap.log
     - name: Smoke-test benchmark correctness without timing thresholds
       if: matrix.mode == 'enabled'
       run: |
@@ -236,6 +257,11 @@ jobs:
           --orders sorted shuffled --layouts single multi \
           --rounds 1 --warmups 0 --allow-dev 2>&1 | \
           tee examples/vortex_eval/artifacts/phase4-ci/benchmark-smoke.log
+        .venv/bin/python -m benchmarking.vortex.metadata_eval \
+          --manifest examples/vortex_eval/artifacts/phase4-ci/data/manifest.json \
+          --output examples/vortex_eval/artifacts/phase4-ci/metadata-report \
+          --orders sorted --layouts multi --rounds 1 --warmups 0 --allow-dev 2>&1 | \
+          tee examples/vortex_eval/artifacts/phase4-ci/metadata-smoke.log
     - name: Install real service prerequisites
       if: matrix.mode == 'enabled' && (github.event_name != 'workflow_dispatch' || inputs.services)
       run: uv pip install --python .venv/bin/python 'ray[data,client]==2.59.0'
@@ -263,4 +289,5 @@ jobs:
           examples/vortex_eval/artifacts/phase4-ci/*.log
           examples/vortex_eval/artifacts/phase4-ci/*.xml
           examples/vortex_eval/artifacts/phase4-ci/report/
+          examples/vortex_eval/artifacts/phase4-ci/metadata-report/
           examples/vortex_eval/artifacts/phase4-ci/data/manifest.json

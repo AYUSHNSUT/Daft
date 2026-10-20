@@ -282,6 +282,108 @@ async fn footer_metadata_preserves_schema_and_exact_row_counts() -> DaftResult<(
 }
 
 #[tokio::test]
+async fn bulk_footer_metadata_preserves_order_duplicates_and_refreshes_counts() -> DaftResult<()> {
+    let mut files = Vec::new();
+    for rows in [3, 0, 10] {
+        files.push(write_batch(primitive_batch(true).slice(0, rows)).await);
+    }
+    let uris = [2, 0, 1, 2]
+        .map(|index| files[index].path().to_string_lossy().into_owned())
+        .to_vec();
+    let client = Arc::new(daft_io::IOClient::new(Default::default())?);
+    for max_concurrent_files in [1, 2, 64] {
+        let stats = daft_io::IOStatsContext::new("Vortex bulk metadata order test");
+        let metadata = crate::read_vortex_metadata_bulk(
+            &uris,
+            client.clone(),
+            stats.clone(),
+            VortexReadOptions::default(),
+            max_concurrent_files,
+        )
+        .await?;
+        assert_eq!(
+            metadata.iter().map(|(_, rows)| *rows).collect::<Vec<_>>(),
+            [10, 3, 0, 10]
+        );
+        assert!(stats.load_get_requests() >= uris.len());
+        assert!(stats.load_bytes_read() > 0);
+        assert_eq!(stats.load_list_requests(), 0);
+        for (schema, _) in metadata {
+            assert_eq!(schema.len(), primitive_batch(true).num_columns());
+            assert_eq!(
+                schema
+                    .get_field("id")?
+                    .metadata
+                    .get(NULLABILITY_METADATA_KEY)
+                    .map(String::as_str),
+                Some("false")
+            );
+        }
+    }
+
+    let replacement = write_batch(primitive_batch(true).slice(0, 7)).await;
+    std::fs::copy(replacement.path(), files[0].path())?;
+    let refreshed = crate::read_vortex_metadata_bulk(
+        &uris,
+        client,
+        daft_io::IOStatsContext::new("Vortex bulk metadata refresh test"),
+        VortexReadOptions::default(),
+        2,
+    )
+    .await?;
+    assert_eq!(
+        refreshed.iter().map(|(_, rows)| *rows).collect::<Vec<_>>(),
+        [10, 7, 0, 10]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_footer_metadata_accepts_empty_inputs_without_io() -> DaftResult<()> {
+    let client = Arc::new(daft_io::IOClient::new(Default::default())?);
+    for max_concurrent_files in [1, 8, 64] {
+        let stats = daft_io::IOStatsContext::new("Vortex empty bulk metadata test");
+        let metadata = crate::read_vortex_metadata_bulk(
+            &[],
+            client.clone(),
+            stats.clone(),
+            VortexReadOptions::default(),
+            max_concurrent_files,
+        )
+        .await?;
+        assert!(metadata.is_empty());
+        assert_eq!(stats.load_head_requests(), 0);
+        assert_eq!(stats.load_get_requests(), 0);
+        assert_eq!(stats.load_list_requests(), 0);
+        assert_eq!(stats.load_bytes_read(), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_footer_metadata_rejects_invalid_concurrency_before_io() -> DaftResult<()> {
+    let client = Arc::new(daft_io::IOClient::new(Default::default())?);
+    let missing = vec!["missing.vortex".to_string()];
+    for max_concurrent_files in [0, 65, usize::MAX] {
+        let stats = daft_io::IOStatsContext::new("Vortex invalid bulk metadata test");
+        let error = crate::read_vortex_metadata_bulk(
+            &missing,
+            client.clone(),
+            stats.clone(),
+            VortexReadOptions::default(),
+            max_concurrent_files,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("max_concurrent_files"));
+        assert_eq!(stats.load_head_requests(), 0);
+        assert_eq!(stats.load_get_requests(), 0);
+        assert_eq!(stats.load_bytes_read(), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn primitive_values_nulls_and_retained_batches_roundtrip() -> DaftResult<()> {
     let expected = primitive_batch(true);
     let file = write_batch(expected.clone()).await;

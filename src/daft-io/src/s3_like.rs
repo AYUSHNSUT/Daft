@@ -472,6 +472,30 @@ async fn provide_credentials_with_retry(
     Ok(creds)
 }
 
+fn s3_http_client(
+    proxy_config: aws_smithy_http_client::proxy::ProxyConfig,
+) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    use aws_smithy_http_client::{
+        Builder, Connector,
+        tls::{Provider, rustls_provider::CryptoMode},
+    };
+
+    // The SDK calls http_connector for every request. Its client builder caches
+    // connectors by timeout settings, so requests can reuse their connection pool.
+    // This public, doc-hidden factory is needed to retain environment proxy support
+    // with the locked Smithy version; build_https does not configure a proxy.
+    Builder::new().build_with_connector_fn(move |settings, components| {
+        let mut builder = Connector::builder()
+            .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
+            .proxy_config(proxy_config.clone());
+        builder.set_connector_settings(settings.cloned());
+        if let Some(components) = components {
+            builder.set_sleep_impl(components.sleep_impl());
+        }
+        builder.build()
+    })
+}
+
 /// Normalize an S3-compatible endpoint URL: default the scheme to `https` when
 /// absent (a bare host otherwise fails URI parsing and the AWS SDK rejects it),
 /// and ensure a trailing slash for correct path construction.
@@ -589,28 +613,6 @@ async fn build_s3_conf(config: &S3Config) -> super::Result<s3::Config> {
     let http_client = {
         use aws_smithy_runtime_api::client::http::SharedHttpClient;
 
-        fn default_client() -> SharedHttpClient {
-            use aws_smithy_http_client::{
-                Connector,
-                proxy::ProxyConfig,
-                tls::{Provider, rustls_provider::CryptoMode},
-            };
-            use aws_smithy_runtime_api::client::http::{
-                HttpConnectorSettings, SharedHttpConnector, http_client_fn,
-            };
-
-            let proxy_config = ProxyConfig::from_env();
-
-            http_client_fn(move |settings: &HttpConnectorSettings, _components| {
-                let connector = Connector::builder()
-                    .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
-                    .proxy_config(proxy_config.clone())
-                    .connector_settings(settings.clone())
-                    .build();
-                SharedHttpConnector::new(connector)
-            })
-        }
-
         fn no_verify_hostname_client() -> SharedHttpClient {
             unimplemented!(
                 "Setting `S3Config.check_hostname_ssl` is no longer supported. See this GitHub Issue for more info: https://github.com/Eventual-Inc/Daft/issues/4530"
@@ -624,7 +626,7 @@ async fn build_s3_conf(config: &S3Config) -> super::Result<s3::Config> {
         }
 
         match (config.verify_ssl, config.check_hostname_ssl) {
-            (true, true) => default_client(),
+            (true, true) => s3_http_client(aws_smithy_http_client::proxy::ProxyConfig::from_env()),
             (true, false) => no_verify_hostname_client(),
             (false, _) => no_verify_client(),
         }
@@ -1838,13 +1840,286 @@ impl S3MultipartWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
+    use aws_config::{BehaviorVersion, timeout::TimeoutConfig};
+    use aws_sdk_s3::{
+        Client,
+        config::{AsyncSleep, Credentials, Region, Sleep, retry::RetryConfig},
+    };
+    use aws_smithy_http_client::proxy::ProxyConfig;
+    use aws_smithy_runtime_api::client::http::SharedHttpClient;
     use common_io_config::S3Config;
 
     use crate::{
         Result, S3LikeSource, integrations::test_full_get, object_io::ObjectSource,
         s3_like::normalize_endpoint_url,
     };
+
+    fn pooling_test_client(
+        endpoint: &str,
+        http_client: SharedHttpClient,
+        connect_timeout: Duration,
+        read_timeout: Duration,
+    ) -> Client {
+        Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version(BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(Credentials::new(
+                    "local-test-key",
+                    "local-test-secret",
+                    None,
+                    None,
+                    "pooling-test",
+                ))
+                .endpoint_url(endpoint)
+                .force_path_style(true)
+                .retry_config(RetryConfig::standard().with_max_attempts(1))
+                .timeout_config(
+                    TimeoutConfig::builder()
+                        .connect_timeout(connect_timeout)
+                        .read_timeout(read_timeout)
+                        .build(),
+                )
+                .http_client(http_client)
+                .build(),
+        )
+    }
+
+    /// Serve HEAD requests without closing their sockets, and count accepted TCP
+    /// connections. Multiple pools can retain an idle connection simultaneously.
+    fn spawn_s3_head_server(
+        expected_requests: usize,
+    ) -> (String, std::thread::JoinHandle<(usize, Vec<String>)>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let completed = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let mut handlers = Vec::new();
+            while completed.load(Ordering::SeqCst) < expected_requests && Instant::now() < deadline
+            {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        socket
+                            .set_read_timeout(Some(Duration::from_millis(50)))
+                            .unwrap();
+                        let completed = completed.clone();
+                        let requests = requests.clone();
+                        handlers.push(std::thread::spawn(move || {
+                            let mut header = Vec::new();
+                            while completed.load(Ordering::SeqCst) < expected_requests
+                                && Instant::now() < deadline
+                            {
+                                let mut byte = [0];
+                                match socket.read(&mut byte) {
+                                    Ok(0) => break,
+                                    Ok(_) => {
+                                        header.push(byte[0]);
+                                        assert!(header.len() <= 16 * 1024);
+                                        if header.ends_with(b"\r\n\r\n") {
+                                            requests
+                                                .lock()
+                                                .unwrap()
+                                                .push(String::from_utf8(std::mem::take(&mut header)).unwrap());
+                                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n").unwrap();
+                                            completed.fetch_add(1, Ordering::SeqCst);
+                                        }
+                                    }
+                                    Err(error)
+                                        if matches!(
+                                            error.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::TimedOut
+                                        ) => {}
+                                    Err(error) => panic!("reading test request: {error}"),
+                                }
+                            }
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accepting test connection: {error}"),
+                }
+            }
+            let connections = handlers.len();
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+            assert_eq!(completed.load(Ordering::SeqCst), expected_requests);
+            let requests = Arc::try_unwrap(requests).unwrap().into_inner().unwrap();
+            (connections, requests)
+        });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn test_s3_http_client_reuses_tcp_connection() {
+        let (endpoint, server) = spawn_s3_head_server(3);
+        let client = pooling_test_client(
+            &endpoint,
+            super::s3_http_client(ProxyConfig::disabled()),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        for key in ["first", "second", "third"] {
+            client
+                .head_object()
+                .bucket("pooled")
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+        }
+        let (connections, requests) = server.join().unwrap();
+        assert_eq!(
+            connections, 1,
+            "sequential requests must reuse their TCP connection"
+        );
+        assert_eq!(requests.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_s3_http_client_keeps_distinct_timeout_pools() {
+        let (endpoint, server) = spawn_s3_head_server(6);
+        let http_client = super::s3_http_client(ProxyConfig::disabled());
+        let clients: Vec<_> = [(1, 1), (2, 1), (1, 2)]
+            .into_iter()
+            .map(|(connect, read)| {
+                pooling_test_client(
+                    &endpoint,
+                    http_client.clone(),
+                    Duration::from_secs(connect),
+                    Duration::from_secs(read),
+                )
+            })
+            .collect();
+        for _ in 0..2 {
+            for client in &clients {
+                client
+                    .head_object()
+                    .bucket("pooled")
+                    .key("key")
+                    .send()
+                    .await
+                    .unwrap();
+            }
+        }
+        let (connections, _) = server.join().unwrap();
+        assert_eq!(
+            connections, 3,
+            "each connect/read timeout pair must retain its own pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_s3_http_client_preserves_proxy_and_connection_reuse() {
+        let (proxy, server) = spawn_s3_head_server(2);
+        let client = pooling_test_client(
+            "http://s3-proxy-target.invalid",
+            super::s3_http_client(ProxyConfig::http(proxy).unwrap()),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        for _ in 0..2 {
+            client
+                .head_object()
+                .bucket("pooled")
+                .key("key")
+                .send()
+                .await
+                .unwrap();
+        }
+        let (connections, requests) = server.join().unwrap();
+        assert_eq!(connections, 1);
+        for request in requests {
+            let uri = request.split_whitespace().nth(1).unwrap();
+            assert_eq!(
+                uri.split('?').next().unwrap(),
+                "http://s3-proxy-target.invalid/pooled/key"
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingSleep(Arc<AtomicUsize>);
+
+    impl AsyncSleep for RecordingSleep {
+        fn sleep(&self, duration: Duration) -> Sleep {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Sleep::new(tokio::time::sleep(duration))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_http_client_read_timeout_uses_runtime_sleep() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let (release, finished) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("accepting stalled test connection: {error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            assert!(socket.read(&mut [0; 4096]).unwrap() > 0);
+            finished.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = pooling_test_client(
+            &endpoint,
+            super::s3_http_client(ProxyConfig::disabled()),
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+        );
+        let config = client
+            .config()
+            .to_builder()
+            .sleep_impl(RecordingSleep(calls.clone()))
+            .build();
+        let result = Client::from_conf(config)
+            .head_object()
+            .bucket("pooled")
+            .key("key")
+            .send()
+            .await;
+        release.send(()).unwrap();
+        server.join().unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            matches!(&error, aws_sdk_s3::error::SdkError::TimeoutError(_))
+                || matches!(&error, aws_sdk_s3::error::SdkError::DispatchFailure(failure) if failure.is_timeout()),
+            "expected a read timeout, got {error:?}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "connector must use the runtime's AsyncSleep"
+        );
+    }
 
     #[test]
     fn range_response_validates_s3_sdk_content_range_before_reading_body() {

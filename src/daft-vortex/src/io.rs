@@ -84,9 +84,9 @@ fn io_error(uri: &str, error: &daft_io::Error) -> VortexError {
         Error::UnableToLoadCredentials { .. } | Error::UnableToCreateClient { .. } => {
             "unable to load credentials or initialize I/O client"
         }
-        Error::InvalidRangeRequest { .. } | Error::InvalidArgument { .. } => {
-            "invalid byte-range request or response"
-        }
+        Error::InvalidRangeRequest { .. }
+        | Error::InvalidArgument { .. }
+        | Error::RangeNotSupported => "invalid byte-range request or response",
         Error::NotAFile { .. } => "path is not a file",
         Error::UnableToDetermineSize { .. } => "unable to determine object size",
         Error::CachedError { source } => return io_error(uri, source),
