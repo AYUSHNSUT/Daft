@@ -13,7 +13,9 @@ mod io;
 mod plan;
 mod read;
 
-pub use read::{read_vortex_metadata, read_vortex_schema, stream_vortex};
+pub use read::{
+    read_vortex_metadata, read_vortex_metadata_bulk, read_vortex_schema, stream_vortex,
+};
 
 #[cfg(feature = "python")]
 mod python;

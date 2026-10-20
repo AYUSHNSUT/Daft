@@ -2,6 +2,10 @@
 
 **Status:** acceptance plan for the [fork design](vortex-integration-design.md). Phases 0 through 3 are complete for their declared scopes; Phase 3's I/O and worker acceptance is recorded in its [design](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Phase 4's harness, connector documentation, personal-fork workflow, and footer row estimates are implemented. The [Phase 4 results](vortex-phase4-results.md) record completed release evaluation and local/user-terminal acceptance under its [plan](vortex-phase4-design.md); GitHub/Linux workflow execution remains separately unverified.
 
+The [Phase 5 plan](vortex-phase5-design.md) adds ordered bulk metadata reads,
+fresh bounded planning windows, HTTP concurrency/failure tests, and a separate
+same-build metadata comparison. Its implementation and acceptance are in progress.
+
 ## Test strategy
 
 Use the same fixtures and query cases for the optional Python reference, native Vortex with optimizations disabled, native Vortex with optimizations enabled, and existing native Parquet. The primary correctness oracle is a canonical in-memory Daft table with independently specified expected values. A shared conversion bug must not make two readers incorrectly agree.

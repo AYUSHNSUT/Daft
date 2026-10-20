@@ -46,6 +46,12 @@ def test_vortex_request_budget_upper_bounds_validate_before_io(name: str) -> Non
         daft.read_vortex("unused.vortex", **{name: 2**128})
 
 
+@pytest.mark.parametrize("value", [0, -1, 65, True, False, 1.5, "8", None, np.int64(8)])
+def test_vortex_metadata_concurrency_validates_before_io(value) -> None:
+    with pytest.raises(ValueError, match="metadata_concurrency"):
+        daft.read_vortex("unused.vortex", metadata_concurrency=value)
+
+
 @pytest.mark.parametrize("name", ["max_concurrent_requests", "max_in_flight_bytes"])
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "8", None, np.int64(8)])
 def test_vortex_native_config_budget_validation_without_reader_feature(name: str, value) -> None:
@@ -184,7 +190,7 @@ def test_vortex_missing_http_diagnostics_redact_credentials(
         "https://sentinel-user:sentinel-password@host:invalid/data?token=sentinel-query",
     ],
 )
-@pytest.mark.parametrize("operation", ["task", "schema", "metadata"])
+@pytest.mark.parametrize("operation", ["task", "schema", "metadata", "bulk_metadata"])
 def test_vortex_native_task_path_errors_redact_credentials(path: str, operation: str) -> None:
     if not hasattr(_native, "read_vortex_schema"):
         pytest.skip("requires a Daft build with Rust features python,vortex")
@@ -194,8 +200,10 @@ def test_vortex_native_task_path_errors_redact_credentials(path: str, operation:
             DataSourceTask.vortex(path, schema)
         elif operation == "schema":
             _native.read_vortex_schema(path)
-        else:
+        elif operation == "metadata":
             _native.read_vortex_metadata(path)
+        else:
+            _native.read_vortex_metadata_bulk([path], max_concurrent_files=1)
     assert "Vortex" in str(failure.value)
     for secret in ["sentinel-user", "sentinel-password", "sentinel-query"]:
         assert secret not in str(failure.value)
@@ -276,10 +284,10 @@ def test_vortex_io_config_and_budgets_reach_discovery_schema_and_tasks(monkeypat
         observed["schema_options"] = kwargs
         return scan_schema._schema
 
-    def metadata(path, **kwargs):
-        observed["metadata_path"] = path
+    def metadata(paths, **kwargs):
+        observed["metadata_paths"] = paths
         observed["metadata_options"] = kwargs
-        return scan_schema._schema, 17
+        return [(scan_schema._schema, 17)], {}
 
     def task(**kwargs):
         observed["task"] = kwargs
@@ -287,10 +295,12 @@ def test_vortex_io_config_and_budgets_reach_discovery_schema_and_tasks(monkeypat
 
     monkeypatch.setattr(_vortex, "glob_path_with_stats", glob)
     monkeypatch.setattr(_native, "read_vortex_schema", infer, raising=False)
-    monkeypatch.setattr(_native, "read_vortex_metadata", metadata, raising=False)
+    monkeypatch.setattr(_native, "read_vortex_metadata_bulk", metadata, raising=False)
     monkeypatch.setattr(_native, "VortexSourceConfig", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(DataSourceTask, "vortex", staticmethod(task))
-    source = _vortex.VortexSource([path], io_config, 3, max_concurrent_requests=2, max_in_flight_bytes=4096)
+    source = _vortex.VortexSource(
+        [path], io_config, 3, metadata_concurrency=3, max_concurrent_requests=2, max_in_flight_bytes=4096
+    )
 
     async def tasks():
         return [task async for task in source.get_tasks(Pushdowns(columns=["id"]))]
@@ -303,8 +313,8 @@ def test_vortex_io_config_and_budgets_reach_discovery_schema_and_tasks(monkeypat
         "max_concurrent_requests": 2,
         "max_in_flight_bytes": 4096,
     }
-    assert observed["metadata_path"] == path
-    assert observed["metadata_options"] == observed["schema_options"]
+    assert observed["metadata_paths"] == [path]
+    assert observed["metadata_options"] == {**observed["schema_options"], "max_concurrent_files": 3}
     task = observed["task"]
     assert task["path"] == path
     assert task["schema"] is source._scan_schema

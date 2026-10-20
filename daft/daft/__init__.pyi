@@ -1374,6 +1374,16 @@ def read_vortex_metadata(
 ) -> tuple[PySchema, int]:
     """Read Vortex schema and unfiltered footer rows through configured Daft I/O."""
 
+def read_vortex_metadata_bulk(
+    uris: list[str],
+    io_config: IOConfig | None = None,
+    *,
+    max_concurrent_files: int = 8,
+    max_concurrent_requests: int = 8,
+    max_in_flight_bytes: int = 67108864,
+) -> tuple[list[tuple[PySchema, int]], dict[str, int | float]]:
+    """Read ordered fresh footers with bounded concurrency and metadata-only I/O diagnostics."""
+
 def _vortex_scan_diagnostics(
     schema: PySchema,
     columns: list[str] | None = None,

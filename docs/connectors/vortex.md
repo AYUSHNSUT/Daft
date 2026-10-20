@@ -14,7 +14,7 @@ query over Vortex-encoded arrays.
 ## Install from the fork
 
 Use Python 3.11 and the Rust toolchain pinned in `rust-toolchain.toml`
-(`nightly-2026-05-27`). From a checkout of the fork's `poc/vortex-phase4` branch:
+(`nightly-2026-05-27`). From a checkout of the fork's `poc/vortex-phase5` branch:
 
 ```bash
 uv venv --python 3.11 .venv
@@ -143,6 +143,7 @@ df = daft.read_vortex(
     batch_size=131072,
     max_concurrent_requests=8,
     max_in_flight_bytes=64 * 1024 * 1024,
+    metadata_concurrency=8,
 )
 ```
 
@@ -157,6 +158,13 @@ bytes; they do not bound decoded arrays, Vortex caches, consumer-retained batche
 all tasks, physical device I/O, or total process memory. An already dispatched
 blocking filesystem operation may finish after cancellation.
 
+Planning reads fresh footer counts in ordered windows of at most
+`metadata_concurrency` files. This setting accepts integers from 1 through 64
+and defaults to 8; use 1 for a serial comparison. Each concurrently opened file
+has its own request/byte budget, so the aggregate can multiply by this setting.
+It is independent of execution scan-task concurrency. Reused and pickled sources
+refresh counts on every materialization; execution reopens and validates files.
+
 Each file creates one Daft task. A large single file is not split into independent
 Daft scan tasks. Native result delivery honors `results_buffer_size`, but that
 capacity counts partitions rather than bytes, and upstream/operator buffers are
@@ -169,6 +177,13 @@ native scan diagnostics used in the tests; requested flags in explain output are
 not proof of pruning. Execute `df.collect()` before reading `df.metrics` for
 execution byte statistics. Request counters are not currently exposed as public
 query metrics, and a streamed `to_arrow()` call does not retain those metrics.
+
+The low-level `daft.daft.read_vortex_metadata_bulk` helper returns ordered
+schema/count pairs and metadata-only elapsed time plus Daft I/O counters. These
+diagnostics exclude discovery and query execution. Counters are logical I/O
+operations and returned bytes, not physical network traffic or device reads.
+The [Phase 5 design](../contributing/vortex-phase5-design.md) describes the bounded
+metadata comparison and its freshness requirements.
 
 ## Compatibility matrix
 

@@ -32,6 +32,7 @@ use crate::{
 // this marker on the inferred scan schema and explicitly compare it for every
 // input file. It is not attached to the Arrow export or output record batches.
 pub(crate) const NULLABILITY_METADATA_KEY: &str = "daft.vortex.nullable";
+pub(crate) const MAX_CONCURRENT_METADATA_FILES: usize = 64;
 
 fn read_error(uri: &str, operation: &str, error: impl std::fmt::Display) -> DaftError {
     let uri = display_uri(uri);
@@ -291,6 +292,37 @@ pub async fn read_vortex_metadata(
         schemas(&display_uri(uri), &session, file.dtype())?.1,
         file.row_count(),
     ))
+}
+
+/// Refresh metadata for several files, preserving their input order.
+///
+/// At most `max_concurrent_files` files are opened concurrently. Each open keeps
+/// its own request and byte budgets from `read_options`; these budgets are not
+/// shared across files. Dropping the future drops pending opens, with no spawned
+/// tasks or metadata cache retained by this helper.
+pub async fn read_vortex_metadata_bulk(
+    uris: &[String],
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+    max_concurrent_files: usize,
+) -> DaftResult<Vec<(SchemaRef, u64)>> {
+    validate_options(&read_options)?;
+    if !(1..=MAX_CONCURRENT_METADATA_FILES).contains(&max_concurrent_files) {
+        return Err(DaftError::ValueError(format!(
+            "Vortex max_concurrent_files must be between 1 and {MAX_CONCURRENT_METADATA_FILES}"
+        )));
+    }
+    futures::stream::iter(uris.iter().cloned())
+        .map(|uri| {
+            let io_client = io_client.clone();
+            let io_stats = io_stats.clone();
+            let read_options = read_options.clone();
+            async move { read_vortex_metadata(&uri, io_client, io_stats, read_options).await }
+        })
+        .buffered(max_concurrent_files)
+        .try_collect()
+        .await
 }
 
 struct ScanState {
