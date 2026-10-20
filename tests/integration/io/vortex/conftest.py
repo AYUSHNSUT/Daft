@@ -34,9 +34,14 @@ def vortex_service_file(tmp_path):
 
 
 @pytest.fixture
-def vortex_http(vortex_service_file):
+def vortex_http_token():
+    return "vortex-local-test-token"
+
+
+@pytest.fixture
+def vortex_http(vortex_service_file, vortex_http_token):
     path, table = vortex_service_file
-    token = "vortex-local-test-token"
+    token = vortex_http_token
     payloads = {
         "/data.vortex": path.read_bytes(),
         "/truncate.vortex": path.read_bytes(),

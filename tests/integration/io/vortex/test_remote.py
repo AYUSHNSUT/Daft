@@ -120,10 +120,24 @@ def test_vortex_minio_exact_directory_glob_and_pickle(vortex_minio) -> None:
 
 
 def test_vortex_minio_credentials_are_required(vortex_minio) -> None:
-    base, config, _ = vortex_minio
-    wrong = daft.io.IOConfig(s3=config.s3.replace(access_key="wrong-local-test-secret", num_tries=1))
-    with pytest.raises(Exception, match="(?i)(403|forbidden|signature|access.denied|credential)"):
-        daft.read_vortex(base + "/prefix/explicit.bin", io_config=wrong).collect()
+    base, config, table = vortex_minio
+    path = base + "/prefix/explicit.bin"
+    expected = {"id": table["id"].to_pylist()}
+    assert daft.read_vortex(path, io_config=config).select("id").to_pydict() == expected
+
+    wrong_secret = "wrong-local-test-secret"
+    wrong = daft.io.IOConfig(s3=config.s3.replace(access_key=wrong_secret, num_tries=1))
+    # Existing S3 HEAD errors can omit the SDK's authentication code. Prove
+    # rejection and credential isolation against this same readable object.
+    with pytest.raises(OSError, match="Vortex discovery") as failure:
+        daft.read_vortex(path, io_config=wrong).collect()
+    message = str(failure.value)
+    assert path in message
+    assert wrong_secret not in message
+    valid_secret = config.s3.access_key
+    assert valid_secret is not None
+    assert valid_secret not in message
+    assert daft.read_vortex(path, io_config=config).select("id").to_pydict() == expected
 
 
 _RAY_QUERY = r"""
@@ -189,9 +203,9 @@ def test_vortex_ray_local_matches_native(vortex_service_file) -> None:
     _ray_query(path, table)
 
 
-def test_vortex_ray_http_reopens_with_explicit_io_config(vortex_http) -> None:
-    url, config, _, table = vortex_http
-    _ray_query(url, table, "http", {"bearer_token": config.http.bearer_token, "num_tries": 1})
+def test_vortex_ray_http_reopens_with_explicit_io_config(vortex_http, vortex_http_token) -> None:
+    url, _, _, table = vortex_http
+    _ray_query(url, table, "http", {"bearer_token": vortex_http_token, "num_tries": 1})
 
 
 def test_vortex_ray_minio_reopens_with_explicit_io_config(vortex_minio) -> None:
