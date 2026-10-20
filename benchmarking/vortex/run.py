@@ -462,6 +462,8 @@ def run(
         "trials": [],
     }
     trial_env = {**os.environ, "DAFT_RUNNER": "native", "DAFT_PROGRESS_BAR": "0", "DAFT_ANALYTICS_ENABLED": "0"}
+    (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    round_size = len(cases) * len(datasets) * len(configs)
     for index, entry in enumerate(schedule(cases, datasets, configs, warmups, rounds, seed)):
         spec = {
             **entry,
@@ -501,7 +503,10 @@ def run(
             trial = {**entry, "status": "failed", "error": redacted(str(error))}
         report["trials"].append(trial)
         result_path.write_text(json.dumps(trial, indent=2, sort_keys=True) + "\n")
-        (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        # Per-trial files are durable immediately. Checkpoint the growing full
+        # report once per round to avoid quadratic diagnostic writes on large runs.
+        if (index + 1) % round_size == 0:
+            (output / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         print(f"[{index + 1}] {entry['dataset']} {entry['case']} {entry['config']}: {trial['status']}", flush=True)
     report["summary"] = summarize(report["trials"])
     report["status"] = "passed" if all(t["status"] == "passed" for t in report["trials"]) else "failed"
