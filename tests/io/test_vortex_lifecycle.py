@@ -161,9 +161,9 @@ def test_vortex_later_query_error_keeps_earlier_output_valid(vortex_input, tmp_p
 
     corrupt = tmp_path / "corrupt-after-earlier-output.vortex"
     corrupt.write_bytes(b"not a Vortex file")
-    # Planning uses the valid first file; execution discovers the bad footer in
-    # the second. We make no assumption about whether this failing query emits
-    # any output before the error: parallel file execution may report it early.
+    # Task materialization reads footer statistics, so the second file may fail
+    # during planning. Earlier query output must stay valid regardless of when
+    # this independent query reports the error.
     failed = daft.read_vortex([path, corrupt], batch_size=7).iter_partitions()
     try:
         with pytest.raises(Exception, match="corrupt-after-earlier-output.vortex"):

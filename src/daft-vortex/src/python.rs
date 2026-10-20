@@ -36,6 +36,24 @@ fn read_vortex_schema(
     #[pyo3(from_py_with = strict_vortex_budget)] max_concurrent_requests: usize,
     #[pyo3(from_py_with = strict_vortex_budget)] max_in_flight_bytes: usize,
 ) -> PyResult<PySchema> {
+    read_vortex_metadata(
+        py,
+        uri,
+        io_config,
+        max_concurrent_requests,
+        max_in_flight_bytes,
+    )
+    .map(|(schema, _)| schema)
+}
+
+#[pyfunction(signature = (uri, io_config=None, *, max_concurrent_requests=8, max_in_flight_bytes=67108864))]
+fn read_vortex_metadata(
+    py: Python<'_>,
+    uri: &str,
+    io_config: Option<IOConfig>,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_concurrent_requests: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_in_flight_bytes: usize,
+) -> PyResult<(PySchema, u64)> {
     let uri = uri.to_string();
     py.detach(move || {
         let options = VortexReadOptions {
@@ -45,12 +63,12 @@ fn read_vortex_schema(
         };
         crate::io::validate_options(&options)?;
         let client = daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())?;
-        let stats = daft_io::IOStatsContext::new("Vortex schema inference");
+        let stats = daft_io::IOStatsContext::new("Vortex metadata inference");
         let runtime = common_runtime::get_io_runtime(true);
-        let schema = runtime.block_within_async_context(async move {
-            crate::read_vortex_schema(&uri, client, stats, options).await
+        let (schema, num_rows) = runtime.block_within_async_context(async move {
+            crate::read_vortex_metadata(&uri, client, stats, options).await
         })??;
-        Ok(schema.into())
+        Ok((schema.into(), num_rows))
     })
 }
 
@@ -137,6 +155,7 @@ fn source_nullability(field: &Field) -> PyResult<bool> {
 
 pub fn register_python(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(read_vortex_schema, parent)?)?;
+    parent.add_function(wrap_pyfunction!(read_vortex_metadata, parent)?)?;
     parent.add_function(wrap_pyfunction!(_vortex_scan_diagnostics, parent)?)?;
     Ok(())
 }

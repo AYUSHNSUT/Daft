@@ -61,12 +61,28 @@ Local and S3 directories are searched recursively for `*.vortex`. Explicit files
 may have any extension; overlapping inputs are deduplicated. The reader accepts a
 string, `pathlib.Path`, or list of those values. Discovery and first-file schema
 inference occur when the DataFrame is created; data reads occur during execution.
-Inputs must stay unchanged between those steps.
+Do not mutate inputs while a scan is being planned or executed.
 
 Local `file://` URLs cannot have a host, query, or fragment. Their percent signs
 are literal, following Daft's local discovery convention. Pass a plain path or
 `Path` for names containing spaces or percent characters; an encoded
 `Path.as_uri()` can name a different file.
+
+### Planning row counts
+
+When scan tasks are materialized, the reader refreshes the footer of every matched
+file through Daft I/O and attaches its exact input row count to the native task.
+These counts inform planning, including join build-side estimates. They are
+refreshed for each materialization rather than cached permanently in reused or
+serialized sources. File discovery and the first-file schema remain fixed; this
+does not provide snapshot isolation.
+
+Footer refresh adds metadata I/O before data execution, using the same `IOConfig`
+and request budgets as other Vortex reads. This cost is included in end-to-end
+planning time, but not in execution-source byte counters. Counts describe file
+inputs before filtering: Daft's ordinary filter/limit estimation rules still
+apply. Column statistics and aggregation pushdown remain unsupported, and this
+does not enable metadata-only count pushdown.
 
 ### Remote configuration
 

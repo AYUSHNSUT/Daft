@@ -266,6 +266,10 @@ class DataSourceTask(ABC):
         schema inferred by ``daft.daft.read_vortex_schema``, preserving its
         reserved nullability metadata. Predicates are residual Daft filters;
         columns needed by them are retained alongside projected output.
+
+        ``num_rows`` may contain the unfiltered footer row count for planning.
+        Filter/limit estimates use the standard scan-task rules; this does not
+        enable aggregation pushdowns or replace strict file validation.
         """
         from daft.io._vortex import _require_vortex
 

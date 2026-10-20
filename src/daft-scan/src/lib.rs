@@ -664,8 +664,8 @@ impl ScanTask {
                             }
                             FileFormatConfig::Avro(_) => 1.5,
                             FileFormatConfig::Mcap(_) => 1.0,
-                            // Vortex compression ratios are not a row-count estimate.
-                            // Leave planning statistics unknown until metadata support exists.
+                            // Without footer metadata, Vortex compression ratios do
+                            // not provide a row-count estimate.
                             FileFormatConfig::Vortex(_) => return None,
                         },
                         #[cfg(feature = "python")]
@@ -1249,6 +1249,137 @@ mod test {
         )));
         assert!(
             other_format
+                .materialized_schema()
+                .get_field("id")
+                .unwrap()
+                .metadata
+                .contains_key("daft.vortex.nullable")
+        );
+    }
+
+    fn vortex_task_with_row_counts(row_counts: &[usize], pushdowns: Pushdowns) -> ScanTask {
+        ScanTask::new(
+            row_counts
+                .iter()
+                .enumerate()
+                .map(|(index, &length)| ScanSource {
+                    size_bytes: Some(1024),
+                    metadata: Some(TableMetadata {
+                        length,
+                        column_sizes: None,
+                    }),
+                    statistics: None,
+                    partition_spec: None,
+                    kind: ScanSourceKind::File {
+                        path: format!("test{index}.vortex"),
+                        chunk_spec: None,
+                        iceberg_delete_files: None,
+                        parquet_metadata: None,
+                    },
+                })
+                .collect(),
+            Arc::new(SourceConfig::File(FileFormatConfig::Vortex(
+                VortexSourceConfig::default(),
+            ))),
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64).with_metadata(BTreeMap::from([(
+                    "daft.vortex.nullable".to_string(),
+                    "false".to_string(),
+                )])),
+                Field::new("value", DataType::Int64).with_metadata(BTreeMap::from([(
+                    "daft.vortex.nullable".to_string(),
+                    "true".to_string(),
+                )])),
+            ])),
+            Arc::new(StorageConfig::default()),
+            pushdowns,
+            None,
+        )
+    }
+
+    #[test]
+    fn vortex_metadata_counts_respect_projection_limits_and_filters() {
+        use daft_dsl::{lit, resolved_col};
+
+        let full = vortex_task_with_row_counts(&[100, 0, 50], Pushdowns::default());
+        assert_eq!(full.num_rows(), Some(150));
+        assert_eq!(full.approx_num_rows(None), Some(150.0));
+        assert_eq!(full.upper_bound_rows(), Some(150));
+        let full_size = full.estimate_in_memory_size_bytes(None).unwrap();
+        assert!(full_size > 0);
+
+        let projected = Pushdowns::default().with_columns(Some(Arc::new(vec!["id".to_string()])));
+        let narrow = vortex_task_with_row_counts(&[100, 0, 50], projected.clone());
+        assert_eq!(narrow.num_rows(), Some(150));
+        let narrow_size = narrow.estimate_in_memory_size_bytes(None).unwrap();
+        assert!(narrow_size > 0 && narrow_size < full_size);
+
+        for limit in [0, 7, 200] {
+            let limited =
+                vortex_task_with_row_counts(&[100, 0, 50], projected.with_limit(Some(limit)));
+            let expected_rows = limit.min(150);
+            assert_eq!(limited.num_rows(), Some(expected_rows));
+            assert_eq!(limited.approx_num_rows(None), Some(expected_rows as f64));
+            assert_eq!(limited.upper_bound_rows(), Some(expected_rows));
+            let limited_size = limited.estimate_in_memory_size_bytes(None).unwrap();
+            match limit {
+                0 => assert_eq!(limited_size, 0),
+                7 => assert!(limited_size > 0 && limited_size < narrow_size),
+                _ => assert_eq!(limited_size, narrow_size),
+            }
+        }
+
+        let filtered = vortex_task_with_row_counts(
+            &[100, 0, 50],
+            projected.with_filters(Some(resolved_col("value").gt(lit(50_i64)))),
+        );
+        assert_eq!(filtered.num_rows(), None);
+        assert_eq!(filtered.upper_bound_rows(), Some(150));
+        let estimated_rows = filtered.approx_num_rows(None).unwrap();
+        assert!(estimated_rows > 0.0 && estimated_rows < 150.0);
+        let filtered_size = filtered.estimate_in_memory_size_bytes(None).unwrap();
+        assert!(filtered_size > 0 && filtered_size < narrow_size);
+
+        let empty = vortex_task_with_row_counts(&[0], Pushdowns::default());
+        assert_eq!(empty.num_rows(), Some(0));
+        assert_eq!(empty.approx_num_rows(None), Some(0.0));
+        assert_eq!(empty.estimate_in_memory_size_bytes(None), Some(0));
+    }
+
+    #[test]
+    fn vortex_metadata_counts_roundtrip_with_native_scan_tasks() {
+        use common_py_serde::bincode;
+
+        let task = vortex_task_with_row_counts(
+            &[100, 0, 50],
+            Pushdowns::default()
+                .with_columns(Some(Arc::new(vec!["id".to_string()])))
+                .with_limit(Some(7)),
+        );
+        let encoded = bincode::serde::encode_to_vec(&task, bincode::config::legacy()).unwrap();
+        let (decoded, consumed): (ScanTask, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.sources, task.sources);
+        assert_eq!(decoded.metadata.as_ref().unwrap().length, 150);
+        assert!(decoded.statistics.is_none());
+        assert_eq!(decoded.num_rows(), Some(7));
+        assert_eq!(decoded.approx_num_rows(None), Some(7.0));
+        assert_eq!(
+            decoded.estimate_in_memory_size_bytes(None),
+            task.estimate_in_memory_size_bytes(None)
+        );
+        assert_eq!(
+            decoded
+                .schema
+                .get_field("value")
+                .unwrap()
+                .metadata
+                .get("daft.vortex.nullable"),
+            Some(&"true".to_string())
+        );
+        assert!(
+            !decoded
                 .materialized_schema()
                 .get_field("id")
                 .unwrap()

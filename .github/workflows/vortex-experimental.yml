@@ -179,6 +179,7 @@ jobs:
           tests/io/test_vortex_native_tasks.py \
           tests/io/test_vortex_lifecycle.py \
           tests/io/test_vortex_pushdowns.py \
+          tests/io/test_vortex_statistics.py \
           tests/io/test_vortex_phase3.py 2>&1 | \
           tee examples/vortex_eval/artifacts/phase4-ci/correctness.log
     - name: Require enabled coverage without feature or writer skips
@@ -195,7 +196,7 @@ jobs:
       if: matrix.mode == 'enabled'
       run: |
         set -euo pipefail
-        cargo test --release --locked --no-default-features -p daft-vortex --lib \
+        cargo test --release --locked --no-default-features -p daft-vortex -p daft-scan --lib \
           2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/native-vortex.log
     - name: Check benchmark harness and remote-helper ownership
       if: matrix.mode == 'enabled'

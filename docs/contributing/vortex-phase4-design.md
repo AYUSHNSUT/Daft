@@ -12,6 +12,12 @@ The phase adds a reproducible evaluation harness, a results report, installation
 
 The existing TPC-H queries contain date predicates that this reader cannot load directly. Initial end-to-end workloads therefore use supported primitive scan, aggregate, and join shapes. Any adapted TPC-H workload must document its schema and query changes and be labelled adapted; no standard TPC-H result is claimed.
 
+## Benchmark-driven scope adjustment: planning cardinality
+
+The initial local measurements exposed a join-planning gap: unknown Vortex source statistics became zero rows/bytes, so the existing planner chose the large fact input as the hash-build side. The user authorized a Phase 4 fix limited to Vortex footer metadata. Global statistics handling and join-selection rules remain unchanged. Rebuilt validation and replacement performance measurements are pending; no improvement from this fix is claimed yet.
+
+The native `read_vortex_metadata` helper returns the full schema and unsigned file row count through configured Daft I/O. `VortexSource.get_tasks` refreshes every file's footer for each materialization and passes the count through the existing native task metadata path, retaining the original full scan schema. This avoids permanently cached counts in reused/pickled sources and adds planning I/O before execution, using the same configuration and request budgets. It does not provide snapshot isolation. The task factory accepts nonnegative row counts while still rejecting column statistics and aggregation pushdowns. Exact counts describe input files; ordinary Daft filter/limit estimation rules apply, and `supports_count_pushdown` remains false.
+
 ## Delivery sequence
 
 1. Record this design, create `benchmarking/vortex/`, and implement deterministic batched fixture generation. Store equal logical rows in both formats, with a manifest containing writer settings, file boundaries, hashes, and independent expected results. Keep generated files outside version control.
@@ -34,12 +40,12 @@ The existing TPC-H queries contain date predicates that this reader cannot load 
 | Scale | Small correctness fixtures, then approximately 1 GiB logical data; larger runs explicitly identified |
 | Storage | Local baseline; selected HTTP/S3-compatible experiments reported independently |
 
-Parquet keeps its normal optimizations. Writer defaults and codec settings are recorded, not adjusted to force equal compressed sizes. Vortex schedules one task per file while Parquet can schedule row groups: use an explicitly controlled comparison for reader isolation and retain the normal-settings comparison so this limitation remains visible.
+Parquet keeps its normal optimizations. Writer defaults and codec settings are recorded, not adjusted to force equal compressed sizes. Vortex schedules one task per file. Record actual scan-task splitting and internal decoding parallelism from saved plans/effective settings; do not assume Parquet row-group scan tasks occurred. Retain both the default and restricted-concurrency comparisons.
 
 ## Measurement contract
 
 - Generate, encode, and check fixtures outside query timers. Record generation/write cost separately.
-- Create a fresh source and query for every sample. The primary timer starts before discovery/schema/planning and ends after full result consumption. Imports and process startup are excluded and identified separately.
+- Create a fresh source and query for every sample. The primary timer starts before discovery/schema/planning, including all per-file footer row-count refreshes, and ends after full result consumption. Imports and process startup are excluded and identified separately.
 - Use value reductions or drain native batches; neither metadata-only counts nor terminal/Python object rendering measure scan throughput.
 - Run one warmup and at least five measured trials per reported configuration, with a deterministic randomized/interleaved order. Preserve individual samples, median, spread, failures, and regressions.
 - Validate results against an independent oracle outside the timer. Compare integer results exactly and document any floating-point tolerance before measuring. Save optimized/physical plans outside the timing interval.
@@ -52,6 +58,15 @@ Parquet keeps its normal optimizations. Writer defaults and codec settings are r
 Small tests cover deterministic generation and manifests, independent result validation, query/configuration selection, sample ordering, release-build enforcement, failure reporting, aggregation, and CLI smoke execution. Deliberately mismatched results or changed fixture bytes must fail validation rather than produce a performance claim.
 
 Re-run the existing Vortex reader/task/lifecycle/pushdown suites and relevant ordinary Parquet/native-task/iterator/count regressions. Rebuild without the optional feature to verify normal imports/queries and actionable reader enablement errors, then restore the enabled release build. Run public API examples, documentation checks available locally, and applicable contribution hooks. Shared code unchanged in this phase inherits Phase 3's focused native and real service evidence; additional testing is reported with exact counts and scope.
+
+The planning-cardinality change additionally requires:
+
+- Native footer schema/count coverage for ordinary, empty, and zero-column files, without importing the optional Python writer during reads.
+- Public joins with the fact input on either side: verify the physical plan builds the small dimension, the probe-row metric records the full fact input, and output values remain correct. Small-build paths may omit the build-row counter. Repeat relevant projections and multiple-file layouts.
+- Input-count behavior under projections, filters, limits, empty files, and duplicate paths; filtered counts must not be treated as exact footer counts.
+- Footer refresh on repeated planning and pickled sources, preservation through native task serialization, and rejection of negative counts, column statistics, and aggregation pushdown. Confirm configured I/O/budgets reach metadata reads and repeat feature-on/off checks.
+
+After correctness checks, rerun the local/default, restricted, and selected remote comparisons with new source/binary identities. Preserve the initial join regression as diagnostic evidence, separate from replacement measurements. Passing tests or improved join performance must be reported only after those checks complete.
 
 The phase is complete when the supported local matrix has reproducible correct release-build results with resource measurements, the selected service checks have explicit outcomes, documented supported behavior has automated coverage, and the report exposes regressions and remaining limitations. There is no minimum speedup gate. Any unavailable environment-dependent acceptance remains pending and must be disclosed before opening the completed review PR.
 

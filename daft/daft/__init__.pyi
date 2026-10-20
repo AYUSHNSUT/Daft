@@ -1365,6 +1365,15 @@ def read_vortex_schema(
 ) -> PySchema:
     """Infer a Vortex schema through Daft I/O; available with the vortex feature."""
 
+def read_vortex_metadata(
+    uri: str,
+    io_config: IOConfig | None = None,
+    *,
+    max_concurrent_requests: int = 8,
+    max_in_flight_bytes: int = 67108864,
+) -> tuple[PySchema, int]:
+    """Read Vortex schema and unfiltered footer rows through configured Daft I/O."""
+
 def _vortex_scan_diagnostics(
     schema: PySchema,
     columns: list[str] | None = None,
