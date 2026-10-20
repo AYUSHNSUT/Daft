@@ -278,9 +278,14 @@ impl PyDataSourceTask {
                     "The experimental Vortex reader supports only local, HTTP(S), and S3 files",
                 ));
             }
-            if num_rows.is_some() || stats.is_some() {
+            if num_rows.is_some_and(|n| usize::try_from(n).is_err()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Vortex num_rows must be nonnegative and fit in the platform row-count range",
+                ));
+            }
+            if stats.is_some() {
                 return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                    "The experimental Vortex reader does not support row-count or column statistics metadata",
+                    "The experimental Vortex reader does not support column statistics metadata",
                 ));
             }
             if pushdowns
@@ -297,7 +302,7 @@ impl PyDataSourceTask {
                 schema,
                 FileFormatConfig::Vortex(vortex_config),
                 pushdowns,
-                None,
+                num_rows,
                 size_bytes,
                 None,
                 None,

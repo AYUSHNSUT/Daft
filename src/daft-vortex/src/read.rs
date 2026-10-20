@@ -271,8 +271,26 @@ pub async fn read_vortex_schema(
     io_stats: IOStatsRef,
     read_options: VortexReadOptions,
 ) -> DaftResult<SchemaRef> {
+    Ok(read_vortex_metadata(uri, io_client, io_stats, read_options)
+        .await?
+        .0)
+}
+
+/// Read schema and unfiltered row count from the footer without decoding rows.
+///
+/// Refresh this metadata when planning tasks rather than caching counts in a
+/// source that can be reused or transported to another worker.
+pub async fn read_vortex_metadata(
+    uri: &str,
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+) -> DaftResult<(SchemaRef, u64)> {
     let (session, file) = open_file(uri, io_client, io_stats, &read_options).await?;
-    Ok(schemas(&display_uri(uri), &session, file.dtype())?.1)
+    Ok((
+        schemas(&display_uri(uri), &session, file.dtype())?.1,
+        file.row_count(),
+    ))
 }
 
 struct ScanState {

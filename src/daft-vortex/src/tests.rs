@@ -240,6 +240,48 @@ async fn collect(
 }
 
 #[tokio::test]
+async fn footer_metadata_preserves_schema_and_exact_row_counts() -> DaftResult<()> {
+    let primitive = primitive_batch(true);
+    let zero_fields = ArrowRecordBatch::try_new_with_options(
+        Arc::new(ArrowSchema::empty()),
+        vec![],
+        &RecordBatchOptions::new().with_row_count(Some(5)),
+    )?;
+    for expected in [
+        primitive.slice(0, 0),
+        primitive.slice(0, 1),
+        primitive,
+        zero_fields,
+    ] {
+        let expected_rows = expected.num_rows() as u64;
+        let file = write_batch(expected.clone()).await;
+        let uri = file.path().to_str().unwrap();
+        let (schema, num_rows) = crate::read_vortex_metadata(
+            uri,
+            Arc::new(daft_io::IOClient::new(Default::default())?),
+            daft_io::IOStatsContext::new("Vortex footer metadata test"),
+            VortexReadOptions {
+                max_concurrent_requests: 1,
+                max_in_flight_bytes: 1024 * 1024,
+                ..Default::default()
+            },
+        )
+        .await?;
+        assert_eq!(num_rows, expected_rows);
+        assert_eq!(schema, read_vortex_schema(uri).await?);
+        assert_eq!(schema.len(), expected.num_columns());
+        for (field, expected_field) in schema.fields().iter().zip(expected.schema().fields()) {
+            let expected_nullable = expected_field.is_nullable().to_string();
+            assert_eq!(
+                field.metadata.get(NULLABILITY_METADATA_KEY),
+                Some(&expected_nullable)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn primitive_values_nulls_and_retained_batches_roundtrip() -> DaftResult<()> {
     let expected = primitive_batch(true);
     let file = write_batch(expected.clone()).await;

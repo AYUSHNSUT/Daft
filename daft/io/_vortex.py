@@ -31,7 +31,11 @@ _MAX_IN_FLIGHT_BYTES = min(2**32 - 1, _MAX_REQUESTS)
 
 
 def _require_vortex() -> None:
-    if not hasattr(_native, "read_vortex_schema") or not hasattr(_native.PyDataSourceTask, "vortex"):
+    if (
+        not hasattr(_native, "read_vortex_schema")
+        or not hasattr(_native, "read_vortex_metadata")
+        or not hasattr(_native.PyDataSourceTask, "vortex")
+    ):
         raise ImportError(_FEATURE_ERROR)
 
 
@@ -327,11 +331,21 @@ class VortexSource(DataSource):
         from daft.daft import VortexSourceConfig
 
         for path in self._paths:
+            # Refresh footer counts for each materialization; reused/pickled
+            # sources must not retain stale cardinality estimates. These counts
+            # inform planning, while execution still validates and scans files.
+            _, num_rows = _native.read_vortex_metadata(
+                path,
+                io_config=self._io_config,
+                max_concurrent_requests=self._max_concurrent_requests,
+                max_in_flight_bytes=self._max_in_flight_bytes,
+            )
             # Full schema validation precedes physical optimization. The native
             # reader retains every residual dependency before final projection.
             yield DataSourceTask.vortex(
                 path=path,
                 schema=self._scan_schema,
+                num_rows=num_rows,
                 vortex_config=VortexSourceConfig(
                     batch_size=self._batch_size,
                     enable_projection_pushdown=self._enable_projection_pushdown,

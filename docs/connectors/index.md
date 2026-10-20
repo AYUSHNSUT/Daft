@@ -339,6 +339,13 @@ See also [Text Files](text.md) and [Blob Files](blob.md) for detailed usage.
 
 See also [ORC Files](orc.md) for schema and file-reading behavior.
 
+### Vortex (experimental fork)
+
+[`read_vortex`][daft.io.read_vortex] reads supported Vortex files when this
+personal fork is built with the optional native feature. See
+[Vortex Files](vortex.md) for installation, optimization controls, and the narrow
+compatibility matrix. This is not an upstream release feature.
+
 ### WebDataset
 
 | Function                                       | Description                                                    |

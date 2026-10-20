@@ -1,6 +1,6 @@
 # Vortex integration: test and benchmark plan
 
-**Status:** acceptance plan for the [fork design](vortex-integration-design.md). Phases 0 through 2 are complete for the local selective reader. Phase 3 implementation and acceptance are tracked in its [design](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md); release-performance evaluation remains Phase 4.
+**Status:** acceptance plan for the [fork design](vortex-integration-design.md). Phases 0 through 3 are complete for their declared scopes; Phase 3's I/O and worker acceptance is recorded in its [design](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Phase 4's harness, connector documentation, personal-fork workflow, and footer row estimates are implemented. The [Phase 4 results](vortex-phase4-results.md) record completed release evaluation and local/user-terminal acceptance under its [plan](vortex-phase4-design.md); GitHub/Linux workflow execution remains separately unverified.
 
 ## Test strategy
 
@@ -116,17 +116,17 @@ Use disposable MinIO fixtures for S3 integration and an instrumented local HTTP 
 
 ## Benchmark protocol
 
-Benchmarks are Phase 4 evidence, with a small baseline captured in Phase 0. Proposed harness: `benchmarking/vortex/`. Use existing Parquet benchmark conventions and adapt the [TPC-H table factory](../../benchmarking/tpch/__main__.py) for end-to-end cases.
+Benchmarks are Phase 4 evidence, with a small baseline captured in Phase 0. The implemented [`benchmarking/vortex/` harness](../../benchmarking/vortex/README.md) provides deterministic batched fixture generation, independent result checks, fresh-process trials, and reports. The [Phase 4 design](vortex-phase4-design.md) defines the current evaluation scope. Its supported primitive query shapes do not implement canonical TPC-H; temporal/decimal-dependent queries require a separately declared extension.
 
 ### Comparisons
 
 | Configuration | Purpose |
 | --- | --- |
-| Native Daft + Parquet | Primary baseline |
-| Native Daft + Vortex, optimized scans disabled | Reader/format baseline |
-| Native Daft + Vortex, each optimization enabled | Isolate projection/filter/pruning gains |
-| Optional Python Vortex reference | Diagnose bridge overhead; label it separately |
-| Optional same-bridge Parquet reference | Separate Python bridge cost from storage-format effects |
+| `parquet`: native Daft + Parquet | Primary baseline, with normal Parquet optimizations |
+| `vortex_00`: both Vortex pushdowns disabled | Reader/format baseline |
+| `vortex_10`, `vortex_01`, `vortex_11` | Projection only, filtering only, and both enabled |
+| Optional Python Vortex reference, outside the Phase 4 harness | Diagnose bridge overhead; label it separately |
+| Optional same-bridge Parquet reference, outside the Phase 4 harness | Separate Python bridge cost from storage-format effects |
 
 Keep both primary formats in the same Daft revision/build. Do not interpret a different engine's Vortex result, or a Python bridge versus native Parquet result alone, as the format's intrinsic speedup.
 
@@ -135,12 +135,12 @@ Keep both primary formats in the same Daft revision/build. Do not interpret a di
 | Dimension | Initial cases |
 | --- | --- |
 | Data | Repetitive numeric, low/high-cardinality strings, mixed nullable columns |
-| Layout | One file and multiple files with matching row boundaries; record internal chunk/layout settings separately |
+| Layout | Sorted/shuffled logical rows, each in one file and multiple files with matching row boundaries; record internal chunk/layout settings separately |
 | Query | Forced value reduction/full consumption, narrow/wide projection, equality/range filters, group-by, one join |
 | Filter selectivity | 0%, 0.1%, 1%, 50%, 100% |
-| Scale | Small correctness data, then approximately 1-10 GB; larger-than-RAM runs separately |
-| Storage | Local first; supported remote storage after Phase 3 |
-| End-to-end | TPC-H Q1/Q6, then Q3; expand without dropping regressions or unsupported-query failures |
+| Scale | Small correctness data, then approximately 1 GiB logical data per dataset; larger runs only when resources justify them |
+| Storage | Local first; selected HTTP/S3-compatible runs through the accepted Phase 3 paths, reported separately |
+| End-to-end | Primitive value reductions, grouped aggregation, and a join to an identical 128-row in-memory dimension; adapted TPC-H remains separate work |
 
 Record format writer defaults and chosen compression/encodings rather than forcing equal compressed bytes. Keep equal logical data, CPU budget, runner, and result consumption. One task per Vortex file can underuse a single large file relative to Parquet row-group scheduling: match effective parallelism for format isolation and separately report each engine path's normal settings.
 
@@ -149,10 +149,12 @@ Record format writer defaults and chosen compression/encodings rather than forci
 1. Use a release build with identical settings. Keep data generation, encoding, and correctness checks outside the timed section; report conversion/write time separately.
 2. Build a fresh source/query for every repeat: reusing a collected Daft DataFrame can benchmark its cached result. The primary end-to-end timer starts before source creation and includes discovery, schema/footer reads, planning, execution, and full result consumption. Imports and fixture generation stay outside. An optional scan-only timer must use equivalent preplanning/cache policies for both formats. Never time only lazy query construction.
 3. Use a real value reduction or fully drain data. Metadata-only `count(*)` is not a scan-throughput measurement; Python object conversion/terminal printing should not dominate the primary comparison.
-4. Begin with one warmup and at least five measured trials, randomizing/interleaving formats. Report median and spread, per-query speedup/regression, failures, CPU time, peak RSS, file bytes, and observed read bytes/requests.
-5. Separate warm-cache and verified cold-cache runs. A fresh process is not proof of a cold OS cache. Record Vortex segment/footer cache policy and all thread/read-concurrency settings.
+4. Begin with one warmup and at least five measured trials, randomizing/interleaving formats. Report median and spread, per-query speedup/regression, failures, process CPU time, peak process RSS, file bytes, and available execution-source read counters. Request counts are unavailable in the current public source snapshot; do not report them as zero.
+5. Separate warm-cache and verified cold-cache runs. The implemented harness retains OS caches and reads fixtures during validation/warmups; a fresh process is not proof of a cold OS cache. Record Vortex segment/footer cache policy and all thread/read-concurrency settings. `--threads 1 --scan-tasks 1` constrains Daft compute and scan tasks, not every Vortex/Tokio worker.
 6. Save optimized/physical plans and correct output digests with results. Capture environment, CPU/RAM/storage, Daft revision, Vortex/PyArrow/Arrow versions, fixture manifest, and build flags.
 7. Profile separately from timing runs; report scan/decode/Arrow-conversion costs where instrumentation supports attribution. Do not fabricate zero I/O metrics when a reader bypasses Daft counters.
+
+Local Parquet uses direct positional reads that bypass `IOStatsRef`; its file-read byte metric is unavailable even when the raw operator counter is zero. Remote Parquet and Vortex expose returned execution-source bytes, excluding discovery/planning and physical-device or protocol overhead. Attribute file reads to `ScanTask` operator rows; the join's `InMemoryScan` counter describes its dimension table, not storage I/O. Preserve raw operator metrics for inspection and state any missing coverage explicitly.
 
 There is no guaranteed improvement target. A useful result may be that Vortex helps selective scans but loses on wide scans, or that Arrow conversion dominates. As a planning illustration, halving a scan that accounts for 40% of query time yields about 1.25x overall improvement if the remaining work is unchanged; that is not a forecast for this integration.
 
@@ -160,14 +162,17 @@ There is no guaranteed improvement target. A useful result may be that Vortex he
 
 ## Execution and CI plan
 
-The native crate, selective-scan tests, and default-off `vortex` feature exist. Historical local acceptance is recorded in [Phase 1](vortex-phase1-results.md) and [Phase 2](vortex-phase2-results.md). Phase 3 adds I/O/resource/worker tests and a strict service runner; consult its [validation record](vortex-phase3-results.md) before treating those capabilities as accepted. Phase 4 benchmarks remain to be implemented.
+The native crate, selective-scan tests, and default-off `vortex` feature exist. Historical acceptance is recorded in [Phase 1](vortex-phase1-results.md), [Phase 2](vortex-phase2-results.md), and [Phase 3](vortex-phase3-results.md). Phase 4 adds the benchmark harness, [connector guide](../connectors/vortex.md), footer-count regression coverage, and [experimental workflow](../../.github/workflows/vortex-experimental.yml); its [validation record](vortex-phase4-results.md) reports release results and completed local/user-terminal checks separately from unverified GitHub execution.
+
+The workflow is restricted to `AYUSHNSUT/Daft` and the declared phase branches. It defines enabled/disabled builds, focused correctness and existing regressions, native reader tests, harness/helper tests, and a small CLI correctness smoke run without timing thresholds. The enabled service gate requires real HTTP, authenticated MinIO, and Ray checks with zero skips when selected; manual dispatch can explicitly omit those service checks. Large performance measurements remain separate manual runs. Record actual CI outcomes separately from the existence of these checks.
 
 Run from the repository root after the normal development setup (`make .venv`) has completed and the required dependencies are available.
 
 ```bash
 # Rebuild after Rust edits, enabling the experimental feature.
 make check-toolchain
-env -u CONDA_PREFIX PYO3_PYTHON=.venv/bin/python .venv/bin/maturin develop --uv --features python,vortex
+env -u CONDA_PREFIX CI=1 DAFT_DASHBOARD_SKIP_BUILD=1 \
+  PYO3_PYTHON=.venv/bin/python .venv/bin/maturin develop --uv --features python,vortex
 
 # Focused native-runner tests using the built extension.
 DAFT_RUNNER=native .venv/bin/pytest -n 0 \
@@ -186,18 +191,34 @@ docker build -t daft-vortex-minio:phase3 - < examples/vortex_eval/minio.Dockerfi
 .venv/bin/python examples/vortex_eval/run_phase3_services.py \
   --docker-image daft-vortex-minio:phase3
 
-# Phase 4: implement the benchmark suite and make a release build first.
-env -u CONDA_PREFIX PYO3_PYTHON=.venv/bin/python .venv/bin/maturin develop --release --uv --features python,vortex
-DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/pytest -n 0 \
-  -o addopts='' -m benchmark benchmarking/vortex/ \
-  --benchmark-json=/tmp/daft-vortex-benchmarks.json
+# Phase 4: verify the harness and service-helper ownership before timing.
+DAFT_RUNNER=native DAFT_ANALYTICS_ENABLED=0 .venv/bin/pytest -n 0 -rs \
+  benchmarking/vortex/test_*.py examples/vortex_eval/test_phase4_services.py
+
+# Build all benchmark configurations with the same enabled release extension.
+env -u CONDA_PREFIX CI=1 RUST_DAFT_PKG_BUILD_TYPE=release CARGO_BUILD_JOBS=2 \
+  PYO3_PYTHON=.venv/bin/python DAFT_DASHBOARD_SKIP_BUILD=1 \
+  .venv/bin/maturin develop --release --skip-install --offline --locked \
+  --features python,vortex
+
+# Record the exact successful build command; the label alone is not proof of optimization.
+export DAFT_VORTEX_BENCH_BUILD_COMMAND='env -u CONDA_PREFIX CI=1 RUST_DAFT_PKG_BUILD_TYPE=release CARGO_BUILD_JOBS=2 PYO3_PYTHON=.venv/bin/python DAFT_DASHBOARD_SKIP_BUILD=1 .venv/bin/maturin develop --release --skip-install --offline --locked --features python,vortex'
+
+.venv/bin/python -m benchmarking.vortex generate \
+  --output examples/vortex_eval/artifacts/phase4/fixtures-1g \
+  --logical-gib 1 --files 8 --batch-rows 65536
+
+.venv/bin/python -m benchmarking.vortex run \
+  --manifest examples/vortex_eval/artifacts/phase4/fixtures-1g/manifest.json \
+  --output examples/vortex_eval/artifacts/phase4/local-report \
+  --rounds 5 --warmups 1
 ```
 
-These build commands mirror the existing `make build` / `make build-release` recipes while explicitly adding the experimental feature. This checkout's Makefile does not forward a custom feature argument; use the explicit Maturin invocation. In an already configured environment, `--skip-install` can replace `--uv` to reuse installed Python dependencies; see the [tested offline command](vortex-phase1-results.md#using-the-reader).
+These build commands explicitly add the experimental feature because this checkout's Makefile does not forward a custom feature argument. `CI=1` selects the existing headless dashboard build route; `DAFT_DASHBOARD_SKIP_BUILD=1` skips optional frontend assets. The release command assumes installed Python dependencies and cached Cargo dependencies for `--skip-install --offline`. The [harness README](../../benchmarking/vortex/README.md) also documents small correctness smoke runs, remote provisioning, and build provenance. Output directories must be absent or empty. Finish builds, tests, and fixture generation before timing; do not run them concurrently with measurements.
 
 Run default builds without Vortex and all-feature checks as well as the targeted configuration. Follow repository pre-commit stages, dependency validation, Clippy, and unused-dependency checks. When the native integration is ready, run the broader Rust/Python CI matrix; run Ray and Python API doctests for capabilities actually claimed.
 
-Repository defaults exclude `integration`, `benchmark`, and `hypothesis` tests. `make test` rebuilds and excludes `tests/integration`; it also defaults to parallel workers. The direct serial pytest commands above are intentional for custom-feature builds, external integration, and benchmarks. Ordinary tests may instead use the normal `DAFT_RUNNER=native make test EXTRA_ARGS="..."` workflow after feature forwarding is wired correctly.
+Repository defaults exclude `integration`, `benchmark`, and `hypothesis` tests. `make test` rebuilds and excludes `tests/integration`; it also defaults to parallel workers. The direct serial pytest commands above are intentional for custom-feature correctness tests. Phase 4 measurements use the `python -m benchmarking.vortex` CLI, not pytest-benchmark. Ordinary tests may instead use the normal `DAFT_RUNNER=native make test EXTRA_ARGS="..."` workflow after feature forwarding is wired correctly.
 
 Record baseline failures separately. The Phase 0 branch now includes the independent Rust doctest fix as cherry-pick `e36391a74`; it does not establish that the full workspace suite passed. Record network/localhost/system-query restrictions as execution limitations rather than passing tests. Do not disable failing checks, silently skip required suites, or claim the full suite passed from a partial run.
 

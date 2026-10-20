@@ -1,0 +1,266 @@
+name: Vortex experimental
+
+# This is a personal-fork acceptance workflow, not an upstream feature gate.
+on:
+  push:
+    branches: [poc/vortex-phase4]
+    paths:
+    - .github/workflows/vortex-experimental.yml
+    - Cargo.toml
+    - Cargo.lock
+    - rust-toolchain.toml
+    - pyproject.toml
+    - uv.lock
+    - daft/**
+    - src/**
+    - tests/io/test_vortex*.py
+    - tests/integration/io/vortex/**
+    - tests/execution/test_native_result_lifecycle.py
+    - tests/io/test_native_tasks.py
+    - tests/io/test_datasource_join.py
+    - tests/io/test_parquet.py
+    - tests/dataframe/test_count.py
+    - tests/dataframe/test_iter.py
+    - tests/dataframe/test_into_batches.py
+    - tests/dataframe/test_into_partitions.py
+    - tests/dataframe/test_show.py
+    - examples/vortex_eval/**
+    - benchmarking/vortex/**
+    - docs/connectors/vortex.md
+    - docs/connectors/index.md
+    - docs/api/io.md
+    - docs/install.md
+    - docs/SUMMARY.md
+  pull_request:
+    branches: [poc/vortex-phase3]
+    paths:
+    - .github/workflows/vortex-experimental.yml
+    - Cargo.toml
+    - Cargo.lock
+    - rust-toolchain.toml
+    - pyproject.toml
+    - uv.lock
+    - daft/**
+    - src/**
+    - tests/io/test_vortex*.py
+    - tests/integration/io/vortex/**
+    - tests/execution/test_native_result_lifecycle.py
+    - tests/io/test_native_tasks.py
+    - tests/io/test_datasource_join.py
+    - tests/io/test_parquet.py
+    - tests/dataframe/test_count.py
+    - tests/dataframe/test_iter.py
+    - tests/dataframe/test_into_batches.py
+    - tests/dataframe/test_into_partitions.py
+    - tests/dataframe/test_show.py
+    - examples/vortex_eval/**
+    - benchmarking/vortex/**
+    - docs/connectors/vortex.md
+    - docs/connectors/index.md
+    - docs/api/io.md
+    - docs/install.md
+    - docs/SUMMARY.md
+  workflow_dispatch:
+    inputs:
+      services:
+        description: Run real HTTP, source-built MinIO, and Ray acceptance
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  DAFT_ANALYTICS_ENABLED: "0"
+  DAFT_PROGRESS_BAR: "0"
+  DAFT_RUNNER: native
+  DAFT_DASHBOARD_SKIP_BUILD: "1"
+  RUST_DAFT_PKG_BUILD_TYPE: release
+  RUST_BACKTRACE: "1"
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  correctness:
+    if: >-
+      github.repository == 'AYUSHNSUT/Daft' &&
+      ((github.event_name == 'pull_request' &&
+        github.head_ref == 'poc/vortex-phase4' &&
+        github.event.pull_request.head.repo.full_name == 'AYUSHNSUT/Daft') ||
+       (github.event_name != 'pull_request' && github.ref == 'refs/heads/poc/vortex-phase4'))
+    name: Vortex ${{ matrix.mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - mode: enabled
+          features: python,vortex
+        - mode: disabled
+          features: python
+    steps:
+    - uses: actions/checkout@v7
+    - name: Free build space
+      uses: jlumbroso/free-disk-space@v1.3.1
+      with:
+        tool-cache: false
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: false
+        docker-images: true
+        swap-storage: true
+    - uses: moonrepo/setup-rust@v1
+      with:
+        cache: false
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: vortex-experimental-${{ matrix.mode }}
+        cache-all-crates: "true"
+        cache-workspace-crates: "true"
+    - uses: astral-sh/setup-uv@v7
+      with:
+        version: "0.12.0"
+        python-version: "3.11"
+        enable-cache: true
+    - name: Install focused test prerequisites
+      run: |
+        set -euo pipefail
+        uv venv .venv
+        echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+        uv pip install --python .venv/bin/python \
+          maturin==1.13.3 pytest==9.0.3 pytest-xdist==3.8.0 \
+          numpy==2.2.6 pandas==2.2.3 requests==2.32.5 \
+          azure-storage-blob==12.27.1 boto3==1.36.2 \
+          -r examples/vortex_eval/requirements.txt
+        mkdir -p examples/vortex_eval/artifacts/phase4-ci
+    - name: Build optimized extension
+      env:
+        VORTEX_CARGO_FEATURES: ${{ matrix.features }}
+      run: |
+        set -euo pipefail
+        echo "DAFT_VORTEX_BENCH_BUILD_COMMAND=CI=true RUST_DAFT_PKG_BUILD_TYPE=release CARGO_BUILD_JOBS=2 DAFT_DASHBOARD_SKIP_BUILD=1 env -u CONDA_PREFIX PYO3_PYTHON=$GITHUB_WORKSPACE/.venv/bin/python .venv/bin/maturin develop --release --uv --locked --features $VORTEX_CARGO_FEATURES" >> "$GITHUB_ENV"
+        env -u CONDA_PREFIX PYO3_PYTHON="$GITHUB_WORKSPACE/.venv/bin/python" \
+          .venv/bin/maturin develop --release --uv --locked \
+          --features "$VORTEX_CARGO_FEATURES" 2>&1 | \
+          tee examples/vortex_eval/artifacts/phase4-ci/build.log
+    - name: Check feature separation and ordinary Daft execution
+      env:
+        VORTEX_EXPECT_ENABLED: ${{ matrix.mode }}
+      run: |
+        .venv/bin/python - <<'PY'
+        import os
+        import daft
+        from daft import daft as native
+
+        enabled = os.environ["VORTEX_EXPECT_ENABLED"] == "enabled"
+        assert hasattr(native, "read_vortex_schema") == enabled
+        assert callable(daft.read_vortex)
+        assert daft.get_build_type() == "release"
+        assert daft.from_pydict({"id": [1, 2]}).select("id").to_pydict() == {"id": [1, 2]}
+        if not enabled:
+            try:
+                daft.read_vortex("nonexistent.vortex")
+            except ImportError as error:
+                assert "vortex" in str(error)
+            else:
+                raise AssertionError("feature-off reader must explain how to enable Vortex")
+        PY
+    - name: Run focused Vortex correctness suites
+      run: |
+        set -euo pipefail
+        .venv/bin/python -m pytest -n 0 -q -rs \
+          --junitxml=examples/vortex_eval/artifacts/phase4-ci/correctness.xml \
+          tests/io/test_vortex.py \
+          tests/io/test_vortex_native_tasks.py \
+          tests/io/test_vortex_lifecycle.py \
+          tests/io/test_vortex_pushdowns.py \
+          tests/io/test_vortex_statistics.py \
+          tests/io/test_vortex_phase3.py 2>&1 | \
+          tee examples/vortex_eval/artifacts/phase4-ci/correctness.log
+    - name: Require enabled coverage without feature or writer skips
+      if: matrix.mode == 'enabled'
+      run: |
+        .venv/bin/python - <<'PY'
+        import xml.etree.ElementTree as ET
+
+        suites = list(ET.parse("examples/vortex_eval/artifacts/phase4-ci/correctness.xml").getroot().iter("testsuite"))
+        assert suites and sum(int(s.attrib.get("tests", 0)) for s in suites) > 0
+        assert not any(int(s.attrib.get("skipped", 0)) for s in suites), "enabled correctness requires zero skips"
+        PY
+    - name: Check native Vortex planning, range budgets, and lifecycle
+      if: matrix.mode == 'enabled'
+      run: |
+        set -euo pipefail
+        cargo test --release --locked --no-default-features -p daft-vortex -p daft-scan --lib \
+          2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/native-vortex.log
+    - name: Check benchmark harness and remote-helper ownership
+      if: matrix.mode == 'enabled'
+      run: |
+        set -euo pipefail
+        .venv/bin/python -m pytest -n 0 -q -rs \
+          --junitxml=examples/vortex_eval/artifacts/phase4-ci/harness.xml \
+          benchmarking/vortex/test_*.py examples/vortex_eval/test_phase4_services.py \
+          2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/harness.log
+    - name: Check existing native, Parquet, count, and iterator behavior
+      run: |
+        set -euo pipefail
+        # Existing Ray-only partition cases may skip under the native runner.
+        # Keep their report separate from the zero-skip Vortex acceptance gate.
+        .venv/bin/python -m pytest -n 0 -q -rs \
+          --junitxml=examples/vortex_eval/artifacts/phase4-ci/regressions.xml \
+          tests/execution/test_native_result_lifecycle.py \
+          tests/io/test_native_tasks.py tests/io/test_datasource_join.py \
+          tests/io/test_parquet.py tests/dataframe/test_count.py \
+          tests/dataframe/test_iter.py tests/dataframe/test_into_batches.py \
+          tests/dataframe/test_into_partitions.py \
+          tests/dataframe/test_show.py::test_native_runner_close_does_not_log_missing_event_loop \
+          tests/dataframe/test_show.py::test_show_limit_does_not_log_active_nodes_warning \
+          2>&1 | tee examples/vortex_eval/artifacts/phase4-ci/regressions.log
+    - name: Smoke-test benchmark correctness without timing thresholds
+      if: matrix.mode == 'enabled'
+      run: |
+        set -euo pipefail
+        .venv/bin/python -m benchmarking.vortex generate \
+          --output examples/vortex_eval/artifacts/phase4-ci/data \
+          --rows 4096 --orders sorted shuffled --layouts single multi \
+          --files 8 --batch-rows 65536
+        .venv/bin/python -m benchmarking.vortex run \
+          --manifest examples/vortex_eval/artifacts/phase4-ci/data/manifest.json \
+          --output examples/vortex_eval/artifacts/phase4-ci/report \
+          --cases scan_full scan_narrow range_0.01 group_by join \
+          --orders sorted shuffled --layouts single multi \
+          --rounds 1 --warmups 0 --allow-dev 2>&1 | \
+          tee examples/vortex_eval/artifacts/phase4-ci/benchmark-smoke.log
+    - name: Install real service prerequisites
+      if: matrix.mode == 'enabled' && (github.event_name != 'workflow_dispatch' || inputs.services)
+      run: uv pip install --python .venv/bin/python 'ray[data,client]==2.59.0'
+    - name: Build source MinIO image into the local Docker daemon
+      if: matrix.mode == 'enabled' && (github.event_name != 'workflow_dispatch' || inputs.services)
+      run: |
+        set -euo pipefail
+        docker buildx build --load -t daft-vortex-minio:phase4 \
+          - < examples/vortex_eval/minio.Dockerfile 2>&1 | \
+          tee examples/vortex_eval/artifacts/phase4-ci/minio-build.log
+    - name: Accept real HTTP, authenticated MinIO, and Ray reads with zero skips
+      if: matrix.mode == 'enabled' && (github.event_name != 'workflow_dispatch' || inputs.services)
+      run: |
+        set -euo pipefail
+        .venv/bin/python examples/vortex_eval/run_phase3_services.py \
+          --docker-image daft-vortex-minio:phase4 2>&1 | \
+          tee examples/vortex_eval/artifacts/phase4-ci/services.log
+    - name: Preserve correctness evidence
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: vortex-${{ matrix.mode }}-${{ github.run_id }}
+        if-no-files-found: warn
+        path: |
+          examples/vortex_eval/artifacts/phase4-ci/*.log
+          examples/vortex_eval/artifacts/phase4-ci/*.xml
+          examples/vortex_eval/artifacts/phase4-ci/report/
+          examples/vortex_eval/artifacts/phase4-ci/data/manifest.json

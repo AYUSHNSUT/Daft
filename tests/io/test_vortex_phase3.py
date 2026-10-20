@@ -184,7 +184,7 @@ def test_vortex_missing_http_diagnostics_redact_credentials(
         "https://sentinel-user:sentinel-password@host:invalid/data?token=sentinel-query",
     ],
 )
-@pytest.mark.parametrize("operation", ["task", "schema"])
+@pytest.mark.parametrize("operation", ["task", "schema", "metadata"])
 def test_vortex_native_task_path_errors_redact_credentials(path: str, operation: str) -> None:
     if not hasattr(_native, "read_vortex_schema"):
         pytest.skip("requires a Daft build with Rust features python,vortex")
@@ -192,8 +192,10 @@ def test_vortex_native_task_path_errors_redact_credentials(path: str, operation:
     with pytest.raises(Exception) as failure:
         if operation == "task":
             DataSourceTask.vortex(path, schema)
-        else:
+        elif operation == "schema":
             _native.read_vortex_schema(path)
+        else:
+            _native.read_vortex_metadata(path)
     assert "Vortex" in str(failure.value)
     for secret in ["sentinel-user", "sentinel-password", "sentinel-query"]:
         assert secret not in str(failure.value)
@@ -274,12 +276,18 @@ def test_vortex_io_config_and_budgets_reach_discovery_schema_and_tasks(monkeypat
         observed["schema_options"] = kwargs
         return scan_schema._schema
 
+    def metadata(path, **kwargs):
+        observed["metadata_path"] = path
+        observed["metadata_options"] = kwargs
+        return scan_schema._schema, 17
+
     def task(**kwargs):
         observed["task"] = kwargs
         return object()
 
     monkeypatch.setattr(_vortex, "glob_path_with_stats", glob)
     monkeypatch.setattr(_native, "read_vortex_schema", infer, raising=False)
+    monkeypatch.setattr(_native, "read_vortex_metadata", metadata, raising=False)
     monkeypatch.setattr(_native, "VortexSourceConfig", lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(DataSourceTask, "vortex", staticmethod(task))
     source = _vortex.VortexSource([path], io_config, 3, max_concurrent_requests=2, max_in_flight_bytes=4096)
@@ -295,9 +303,12 @@ def test_vortex_io_config_and_budgets_reach_discovery_schema_and_tasks(monkeypat
         "max_concurrent_requests": 2,
         "max_in_flight_bytes": 4096,
     }
+    assert observed["metadata_path"] == path
+    assert observed["metadata_options"] == observed["schema_options"]
     task = observed["task"]
     assert task["path"] == path
     assert task["schema"] is source._scan_schema
+    assert task["num_rows"] == 17
     assert task["storage_config"].io_config.__getstate__() == io_config.__getstate__()
     assert task["vortex_config"].max_concurrent_requests == 2
     assert task["vortex_config"].max_in_flight_bytes == 4096
@@ -335,13 +346,28 @@ def test_vortex_flotilla_plan_transport_reopens_local_file(tmp_path: Path, vorte
     assert sorted(_execute_plan(plan, inputs), key=lambda row: row["id"]) == [{"id": 13}, {"id": 14}, {"id": 15}]
 
 
-def test_vortex_flotilla_plan_transport_keeps_request_budget(tmp_path: Path, vortex_writer) -> None:
+def test_vortex_flotilla_plan_transport_keeps_request_budget(
+    tmp_path: Path, vortex_writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
     path = tmp_path / "budget.vortex"
     vortex_writer.io.write(pa.table({"id": range(6)}), str(path))
-    # Infer with an adequate budget, then carry a deliberately tiny execution
-    # budget in the serialized task. A lost config would silently read the file.
+    # Infer and plan with an adequate footer budget, then attach a deliberately
+    # tiny execution budget to the task. A lost config would silently read the file.
     source = _vortex.VortexSource([str(path)], None, 2)
-    source._max_in_flight_bytes = 1
+    original_task = DataSourceTask.vortex
+
+    def task_with_tiny_budget(**kwargs):
+        config = kwargs["vortex_config"]
+        kwargs["vortex_config"] = _native.VortexSourceConfig(
+            batch_size=config.batch_size,
+            enable_projection_pushdown=config.enable_projection_pushdown,
+            enable_filter_pushdown=config.enable_filter_pushdown,
+            max_concurrent_requests=config.max_concurrent_requests,
+            max_in_flight_bytes=1,
+        )
+        return original_task(**kwargs)
+
+    monkeypatch.setattr(DataSourceTask, "vortex", staticmethod(task_with_tiny_budget))
     plan, inputs = cloudpickle.loads(cloudpickle.dumps(_local_plan(source.read())))
     with pytest.raises(Exception, match="(?i)(budget|in.flight|exceed)"):
         _execute_plan(plan, inputs)

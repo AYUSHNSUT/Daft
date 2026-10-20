@@ -2,15 +2,15 @@
 
 **Status:** Phases 0, 1, and 2 are complete for the experimental local-reader scope. Phase 2 adds selective scans behind the same default-off `vortex` feature; see its [design](vortex-phase2-design.md) and [validation record](vortex-phase2-results.md). The [Phase 1 validation record](vortex-phase1-results.md) includes the dependency cost accepted for this fork.
 
-Phase 3 is complete for its declared I/O, resource-control, and worker scope, including real HTTP/MinIO/Ray acceptance; see the [plan](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Release-build performance evaluation remains Phase 4.
+Phase 3 is complete for its declared I/O, resource-control, and worker scope, including real HTTP/MinIO/Ray acceptance; see the [plan](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Phase 4's benchmark harness, connector documentation, personal-fork CI workflow, and Vortex footer row estimates are implemented. Release evaluation and local/user-terminal acceptance are complete for the [Phase 4 scope](vortex-phase4-design.md); the [results record](vortex-phase4-results.md) includes remaining regressions and measurement limits. GitHub/Linux workflow execution is separately unverified.
 
-**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, implementation branch `poc/vortex-phase3`.
+**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, current implementation branch `poc/vortex-phase4`, review base `poc/vortex-phase3`.
 
 **Design baseline:** `d3cd974150ba93dbbe8efef8370b129538fcee4b`; reviewed October 20, 2026.
 
 **Companion:** [test and benchmark plan](vortex-integration-test-plan.md).
 
-**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), [Phase 2 selective-scan results](vortex-phase2-results.md), and [Phase 3 I/O and scheduling validation](vortex-phase3-results.md).
+**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), [Phase 2 selective-scan results](vortex-phase2-results.md), [Phase 3 I/O and scheduling validation](vortex-phase3-results.md), [Phase 4 release results](vortex-phase4-results.md), [release benchmark instructions](../../benchmarking/vortex/README.md), and the [experimental connector guide](../connectors/vortex.md).
 
 ## Summary
 
@@ -165,9 +165,15 @@ Phase 1 may use Vortex's local file opener to keep the first reader small. That 
 
 Use half-open row ranges for any future intra-file splits. Do not use byte offsets as row boundaries. File-level counts/statistics cannot be reused as each split's count. Unknown statistics remain unknown, and compressed file size is not a materialized-memory estimate.
 
+### Phase 4: evaluate the implemented reader paths
+
+The [benchmark harness](../../benchmarking/vortex/README.md) generates matching Vortex/Parquet datasets and compares native Parquet with all four Vortex projection/filter switch combinations. Its primitive scan, filter, group-by, and join cases use independent expected results and fresh query processes. The initial release matrix covers sorted/shuffled data and single/multiple files; it does not claim canonical TPC-H coverage or compare Daft with another engine.
+
+The [connector guide](../connectors/vortex.md), installation/API navigation, and [personal-fork workflow](../../.github/workflows/vortex-experimental.yml) now exist. The workflow defines feature-on/off correctness, native reader and harness tests, benchmark correctness smoke checks, and real service acceptance. The [Phase 4 results](vortex-phase4-results.md) record release measurements, corrected join planning, feature-on/off validation, and real HTTP/MinIO/Ray acceptance. A workflow definition does not establish a successful CI run, and smoke checks do not establish performance; GitHub/Linux execution remains separately unverified.
+
 ## Expected code changes
 
-Phase 1 implements the native-reader touchpoints below, and Phase 2 adds the expression adapter and physical projection. Phase 3 adds Daft I/O and scheduling integration; dedicated performance benchmarks and public connector navigation remain later work.
+Phase 1 implements the native-reader touchpoints below, and Phase 2 adds the expression adapter and physical projection. Phase 3 adds Daft I/O and scheduling integration. Phase 4 adds footer row counts for planning, the benchmark harness, experimental connector navigation, and fork CI; its [results](vortex-phase4-results.md) distinguish completed local/user acceptance from unverified GitHub execution.
 
 | Area | Files / responsibility |
 | --- | --- |
@@ -178,7 +184,7 @@ Phase 1 implements the native-reader touchpoints below, and Phase 2 adds the exp
 | Execution | `src/daft-local-execution/src/sources/scan_task_reader.rs` dispatch; relevant display/memory-estimate match arms in `scan_task.rs` and `daft-scan` |
 | Planning | Audit `src/daft-scan/src/glob.rs` and scan-task splitting matches. Implement or explicitly reject unused Vortex routes; do not fabricate statistics |
 | Build | Workspace dependencies/member, executor dependency, optional schema-binding dependency, feature forwarding, and lockfile |
-| Verification/docs | Proposed `tests/io/test_vortex*.py`, reader Rust tests, `benchmarking/vortex/`, integration fixtures, and eventual connector/API navigation |
+| Verification/docs | `tests/io/test_vortex*.py`, reader Rust tests, integration fixtures, `benchmarking/vortex/`, `docs/connectors/vortex.md`, connector/API navigation, and `.github/workflows/vortex-experimental.yml` |
 
 Keep the reader crate below the scan layer: it accepts reader-owned options and returns schema/batches; it must not depend back on `daft-scan` and create a Cargo cycle. Put Python schema inspection on a narrow binding seam. Append format enum variants without reordering existing ones, and require matching versions/features across distributed workers; do not promise cross-build serialization compatibility.
 
@@ -188,7 +194,7 @@ Keep the reader crate below the scan layer: it accepts reader-owned options and 
 2. Establish baseline checks before implementation. Phase 0 includes `e36391a74` (`docs: fix workspace Rust doctests`) over design baseline `d3cd97415`. Record which suites actually ran and any remaining baseline failures; the doctest fix alone does not establish a clean workspace run.
 3. For each phase, describe the user-visible capability, deliberate limits, tests, dependency impact, and measured result. Use conventional commit/PR titles and Daft's existing PR template.
 4. Rebuild after Rust edits; run focused reader/scan tests, then relevant existing I/O regressions and feature-on/off checks. Broaden to workspace/Python CI when the dependency graph or scheduler-facing behavior changes. See the [test commands](vortex-integration-test-plan.md#execution-and-ci-plan).
-5. Keep this proposal outside public connector navigation until a working reader exists. Phase 4 updates installation guidance, API references, connector documentation, and `docs/SUMMARY.md` together.
+5. Keep this design in contributing documentation. Phase 4 adds the experimental connector to installation guidance, API references, connector documentation, and `docs/SUMMARY.md`; retain the explicit personal-fork and default-off feature labels.
 6. Follow [Daft's contribution conventions](../../CONTRIBUTING.md), including material AI-use disclosure. A maintainer-approved issue would be needed for a future nontrivial upstream submission; it is not a prerequisite for this authorized fork experiment.
 
 ## Risks and decision points
