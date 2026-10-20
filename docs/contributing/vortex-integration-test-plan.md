@@ -72,7 +72,7 @@ For end-to-end query consumers, test close/drop and error cleanup separately. Th
 
 ## Projection and predicate optimization: Phase 2
 
-Coverage lives in `tests/io/test_vortex_pushdowns.py` and the reader crate's semantic and instrumented I/O tests. The [Phase 2 design](vortex-phase2-design.md) specifies the exact supported predicate subset and acceptance checks.
+Coverage lives in `tests/io/test_vortex_pushdowns.py` and the reader crate's semantic and instrumented I/O tests. The [Phase 2 design](vortex-phase2-design.md) specifies the exact supported predicate subset and acceptance checks; its [completion record](vortex-phase2-results.md) lists executed results.
 
 | ID | Case | Required result |
 | --- | --- | --- |

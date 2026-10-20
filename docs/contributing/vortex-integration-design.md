@@ -1,6 +1,6 @@
 # Vortex read support: design and delivery plan
 
-**Status:** Phases 0 and 1 are complete for the experimental local-reader scope. Phase 2 implements selective scans behind the same default-off `vortex` feature; see its [detailed design and acceptance plan](vortex-phase2-design.md). The [Phase 1 validation record](vortex-phase1-results.md) includes the dependency cost accepted for this fork.
+**Status:** Phases 0, 1, and 2 are complete for the experimental local-reader scope. Phase 2 adds selective scans behind the same default-off `vortex` feature; see its [design](vortex-phase2-design.md) and [validation record](vortex-phase2-results.md). The [Phase 1 validation record](vortex-phase1-results.md) includes the dependency cost accepted for this fork.
 
 **Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, implementation branch `poc/vortex-phase2`.
 
@@ -8,7 +8,7 @@
 
 **Companion:** [test and benchmark plan](vortex-integration-test-plan.md).
 
-**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), and [Phase 2 selective-scan design](vortex-phase2-design.md).
+**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), and [Phase 2 selective-scan results](vortex-phase2-results.md).
 
 ## Summary
 

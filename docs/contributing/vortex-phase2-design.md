@@ -6,7 +6,7 @@
 
 **Delivery:** complete implementation and acceptance checks before opening a draft PR targeting `poc/vortex-phase1`. Do not merge earlier phases or submit upstream as part of this work.
 
-**Status:** implementation plan, written before Phase 2 code changes. The completion record will distinguish executed checks from remaining limits.
+**Status:** implemented and validated. This plan was written before Phase 2 code changes; the [completion record](vortex-phase2-results.md) lists executed checks, observed request-byte reductions, and remaining limits.
 
 ## Why this phase exists
 

@@ -2,7 +2,7 @@
 
 **Scope:** experimental local reader in `AYUSHNSUT/Daft`, branch `poc/vortex-phase2`, based on Phase 1 commit `8b59043e774005ec223a55fa1e02086aa0fab54a`.
 
-**Status:** final acceptance checks in progress. The [detailed design](vortex-phase2-design.md) was committed before implementation. The review PR targets `poc/vortex-phase1` and will be opened after verification finishes.
+**Status:** complete for the declared local selective-scan scope. The [detailed design](vortex-phase2-design.md) was committed before implementation. Implementation commit: `3e1a07625db58e57b43bc14b2ec565c87703e7bf`. The fork review PR targets `poc/vortex-phase1`; implementation and acceptance checks finished before PR creation.
 
 ## What changed
 
@@ -70,10 +70,14 @@ The environment is macOS arm64, Python 3.11.15, pinned Rust nightly `2026-05-27`
 | Native reader semantics, real-I/O evidence, and lifecycle regressions | 28 passed |
 | Rust format/scan configuration and serialization tests | 4 passed |
 | Python-enabled reader/scan compilation and focused reader Clippy | Passed |
-| Existing native-task/join/Parquet/count regressions and evaluation harness | 117 passed, 5 deselected |
-| Final enabled Python integration, feature-off checks, and contribution hooks | Pending final run |
+| Vortex Python API, direct-task, lifecycle, and pushdown suites | 316 passed, none skipped |
+| Final combined Python run, including existing native-task/join/Parquet/count regressions and evaluation harness | 433 passed, 5 deselected, none skipped |
+| Feature-off Vortex suites | 54 passed, 262 skipped because the native feature is disabled |
+| Enabled and disabled extension builds; feature-off fresh import and ordinary query | Passed; enabled extension restored |
+| Applicable contribution hooks, including strict mypy, pinned Ruff, dependency validation, formatting, and workspace/all-feature/all-target Clippy with `-D warnings` | Passed |
+| Saved baseline comparisons: four native settings, Parquet, Python reference | All 54 query/layout cases passed; matching checksums |
 
-The native integer matrix covers signed/unsigned 8-, 16-, 32-, and 64-bit types, six comparisons, both operand orders, and all four optimization settings. Python coverage adds public planner/task observation, independent expected values, safe fallbacks, zero-column and zero-field cardinality, limits across files, hidden schema mismatches, joins/aggregations, strict flags, and serialization. Existing direct-reader and public-consumer lifecycle tests remain in place.
+The native integer matrix covers signed/unsigned 8-, 16-, 32-, and 64-bit types, six comparisons, both operand orders, and all four optimization settings. Python coverage adds public planner/task observation, independent expected values, safe fallbacks, zero-column and zero-field cardinality, limits across files, hidden schema mismatches, joins/aggregations, strict flags, and serialization. The combined run includes the 316 Vortex cases and 117 existing-regression/harness cases. Existing direct-reader and public-consumer lifecycle tests remain in place.
 
 Two initial Python expectations were corrected after comparison with ordinary in-memory Daft and its implementation: floating equality distinguishes signed zeros, and the public projection API accepts duplicate names while deduplicating required source columns. Native scan diagnostics continue to reject duplicate physical output requests. No production behavior was changed to satisfy either assumption.
 
@@ -84,6 +88,10 @@ CARGO_BUILD_JOBS=2 cargo test --offline --locked --no-default-features -p daft-v
 CARGO_BUILD_JOBS=2 cargo test --offline --locked --no-default-features \
   -p common-file-formats -p daft-scan --lib vortex
 
+# Print the controlled positional-read evidence.
+CARGO_BUILD_JOBS=2 cargo test --offline --locked --no-default-features \
+  -p daft-vortex pushdown_tests -- --nocapture
+
 env -u CONDA_PREFIX CARGO_BUILD_JOBS=2 PYO3_PYTHON=.venv/bin/python \
   DAFT_DASHBOARD_SKIP_BUILD=1 .venv/bin/maturin develop \
   --skip-install --offline --locked --features python,vortex
@@ -93,13 +101,16 @@ DAFT_RUNNER=native DAFT_PROGRESS_BAR=0 .venv/bin/pytest -n 0 -rs \
   tests/io/test_vortex_lifecycle.py tests/io/test_vortex_pushdowns.py \
   tests/io/test_native_tasks.py tests/io/test_datasource_join.py \
   tests/io/test_parquet.py tests/dataframe/test_count.py examples/vortex_eval
+
+env CARGO_BUILD_JOBS=2 DAFT_DASHBOARD_SKIP_BUILD=1 \
+  .venv/bin/pre-commit run --from-ref 8b59043e7 --to-ref HEAD
 ```
 
 Offline commands require cached Rust dependencies; `--skip-install` reuses the configured Python environment. Rebuild with `--features python` to check feature-off behavior, then restore the enabled build. The existing debug option `DAFT_DASHBOARD_SKIP_BUILD=1` omits dashboard assets in this restricted environment; it does not disable Rust linting.
 
-The [evaluation harness](../../examples/vortex_eval/README.md) accepts independent `--disable-projection-pushdown` and `--disable-filter-pushdown` flags for `vortex-native`. It records the settings and builds fresh sources for every warmup/sample. These small correctness fixtures and development builds do not establish a performance improvement.
+The [evaluation harness](../../examples/vortex_eval/README.md) accepts independent `--disable-projection-pushdown` and `--disable-filter-pushdown` flags for `vortex-native`. It records the settings and builds fresh sources for every warmup/sample. The saved runs used the Phase 0 Vortex manifest, batch size 7, one warmup, and two measured samples per case. All four native settings and both reference formats passed all nine query/layout cases, with identical output checksums and one fixture-manifest hash. All reports record implementation commit `3e1a07625`, with no tracked changes during execution. These small correctness fixtures and development builds do not establish a performance improvement.
 
-Local logs, generated files, and baseline JSON/plan artifacts live under ignored `examples/vortex_eval/artifacts/phase2/`. The complete workspace unit suite and complete Python suite are outside this focused validation. The user's successful Phase 1 ORC/MCAP rerun remains recorded in the [Phase 1 report](vortex-phase1-results.md); those readers are unchanged here.
+Local logs, generated files, and baseline JSON/plan artifacts live under ignored `examples/vortex_eval/artifacts/phase2/`. `baseline-comparison.json` records the six-run checksum comparison; `enabled-final-source-tests.log`, `disabled-vortex-tests.log`, `native-tests-final.log`, `scan-tests.log`, and `pre-commit.log` record the acceptance results. The complete workspace unit suite and complete Python suite are outside this focused validation. The user's successful Phase 1 ORC/MCAP rerun remains recorded in the [Phase 1 report](vortex-phase1-results.md); those readers are unchanged here.
 
 ## Dependencies and remaining scope
 

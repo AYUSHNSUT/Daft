@@ -3,9 +3,10 @@
 The Phase 0 tools check fixture correctness, an optional Python reader, and
 native Vortex-to-Daft batch compatibility. Their historical results are in the
 [Phase 0 report](../../docs/contributing/vortex-phase0-results.md).
-This branch also implements the experimental Phase 1 native connector; see
-[setup, validation, and limits](../../docs/contributing/vortex-phase1-results.md).
-The [Phase 2 design](../../docs/contributing/vortex-phase2-design.md) adds
+This branch also implements the experimental native connector with Phase 2
+selective scans; see the [Phase 1 setup](../../docs/contributing/vortex-phase1-results.md)
+and [Phase 2 validation and limits](../../docs/contributing/vortex-phase2-results.md).
+The [Phase 2 design](../../docs/contributing/vortex-phase2-design.md) explains
 independent physical projection and filter-pushdown switches.
 
 Run the commands below from the repository root, using a working source-built
