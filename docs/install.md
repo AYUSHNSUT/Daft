@@ -8,6 +8,10 @@ For most users, install Daft with a single command:
 pip install -U daft
 ```
 
+The experimental Vortex reader is available only in the personal fork's optional
+source build. See [Vortex installation](connectors/vortex.md#install-from-the-fork);
+the regular package installation above does not enable it.
+
 ## Optional Dependencies
 
 Depending on your use case, you may need to install Daft with additional dependencies.

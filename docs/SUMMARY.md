@@ -66,6 +66,7 @@
             * [Blob Files](connectors/blob.md)
             * [WebDataset](connectors/webdataset.md)
             * [ORC Files](connectors/orc.md)
+            * [Vortex Files (Experimental Fork)](connectors/vortex.md)
             * [Generic File Source Options](connectors/generic-file-source-options.md)
         * Other Sources
             * [Apache Kafka](connectors/kafka.md)

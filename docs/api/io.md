@@ -76,6 +76,17 @@ Daft offers a variety of approaches to creating a DataFrame from reading various
     options:
         heading_level: 3
 
+!!! warning "Experimental personal-fork API"
+
+    `read_vortex` requires an `AYUSHNSUT/Daft` source build with the optional
+    `python,vortex` Cargo features. It is disabled by default. See the
+    [Vortex connector guide](../connectors/vortex.md) for installation and the
+    accepted version, type, storage, and runner matrix.
+
+::: daft.read_vortex
+    options:
+        heading_level: 3
+
 ::: daft.read_sql
     options:
         heading_level: 3
