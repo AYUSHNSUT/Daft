@@ -83,9 +83,10 @@ def _start_minio(image: str, environment: dict[str, str]) -> str:
         check=False,
     )
     if result.returncode:
-        raise RuntimeError(
-            "Unable to start the explicitly requested MinIO image; check Docker availability and image access"
-        )
+        detail = result.stderr.strip() or result.stdout.strip() or "Docker returned no diagnostic output"
+        for credential in (container_environment["MINIO_ROOT_USER"], container_environment["MINIO_ROOT_PASSWORD"]):
+            detail = detail.replace(credential, "<redacted>")
+        raise RuntimeError(f"Unable to start MinIO image {image!r} (docker run exited {result.returncode}):\n{detail}")
     try:
         inspected = subprocess.run(["docker", "inspect", name], text=True, capture_output=True, check=True)
         port = json.loads(inspected.stdout)[0]["NetworkSettings"]["Ports"]["9000/tcp"][0]["HostPort"]

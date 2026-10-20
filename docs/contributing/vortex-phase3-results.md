@@ -64,7 +64,7 @@ Environment: macOS arm64, Python 3.11.15, Rust nightly `2026-05-27`, PyArrow 22.
 | Enabled extension build | Passed |
 | Vortex Python API, direct tasks, lifecycle, pushdowns, and Phase 3 | 398 passed, none skipped |
 | Shared lifecycle and existing iterator/batching/preview regressions | 166 passed; 17 existing Ray-only partition cases skipped |
-| Existing native tasks, joins, Parquet, counts, and evaluation harness | 117 passed, 5 deselected, none skipped |
+| Existing native tasks, joins, Parquet, counts, and evaluation tooling | 119 passed, 5 deselected, none skipped |
 | Feature-off extension and fresh import/ordinary query/enablement error | Passed |
 | Feature-off Vortex/lifecycle selection | 137 passed; 288 skipped because Vortex is disabled |
 | Workspace/all-feature/all-target Clippy with `-D warnings` | Passed |
@@ -117,7 +117,7 @@ The [service runner](../../examples/vortex_eval/README.md#phase-3-service-accept
 
 Generated data and command logs live under ignored `examples/vortex_eval/artifacts/phase3/`. Full workspace unit tests and the entire Python suite are not represented by these focused checks.
 
-The final enabled Python selections report 681 passes in total, with five cases deselected by repository defaults and 17 existing partition cases requiring Ray. All 27 new shared lifecycle cases pass, including missing-file error propagation with ordering both enabled and disabled. Feature-off acceptance reports 137 passes and 288 expected feature skips. Native focused selections total 63 passing tests. Logs include `enabled-vortex-final-tests.log`, `enabled-result-final-tests.log`, `enabled-final-regressions.log`, `disabled-final-tests.log`, `native-result-tests.log`, `ordered-scan-completion-tests.log`, and `pre-commit-verified.log`.
+The final enabled Python selections report 683 passes in total, with five cases deselected by repository defaults and 17 existing partition cases requiring Ray. All 27 new shared lifecycle cases pass, including missing-file error propagation with ordering both enabled and disabled. Two tooling tests verify that service-startup failures preserve Docker's image/exit-code/error diagnostics while redacting generated credentials. Feature-off acceptance reports 137 passes and 288 expected feature skips. Native focused selections total 63 passing tests. Logs include `enabled-vortex-final-tests.log`, `enabled-result-final-tests.log`, `enabled-final-regressions.log`, `disabled-final-tests.log`, `native-result-tests.log`, `ordered-scan-completion-tests.log`, and `pre-commit-verified.log`; the diagnostic follow-up has `service-diagnostics-tests.log` and `service-diagnostics-pre-commit.log`.
 
 ## Dependencies and remaining scope
 
