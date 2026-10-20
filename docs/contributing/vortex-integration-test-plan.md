@@ -72,7 +72,7 @@ For end-to-end query consumers, test close/drop and error cleanup separately. Th
 
 ## Projection and predicate optimization: Phase 2
 
-Proposed file: `tests/io/test_vortex_pushdowns.py`; expression-conversion unit tests live in the reader crate.
+Coverage lives in `tests/io/test_vortex_pushdowns.py` and the reader crate's semantic and instrumented I/O tests. The [Phase 2 design](vortex-phase2-design.md) specifies the exact supported predicate subset and acceptance checks.
 
 | ID | Case | Required result |
 | --- | --- | --- |
@@ -158,7 +158,7 @@ There is no guaranteed improvement target. A useful result may be that Vortex he
 
 ## Execution and CI plan
 
-The Phase 1 native crate, tests, and `vortex` feature now exist. The [implementation record](vortex-phase1-results.md) lists checks actually run. Commands for Phase 2 pushdowns, Phase 3 services, and Phase 4 benchmarks require those later paths to be implemented.
+The native crate, Phase 2 pushdown tests, and `vortex` feature now exist. The [Phase 1 implementation record](vortex-phase1-results.md) lists its completed checks; the [Phase 2 design](vortex-phase2-design.md) gives the selective-scan validation commands. Phase 3 service tests and Phase 4 benchmarks still require those paths to be implemented.
 
 Run from the repository root after the normal development setup (`make .venv`) has completed and the required dependencies are available.
 

@@ -1,14 +1,14 @@
 # Vortex read support: design and delivery plan
 
-**Status:** Phase 0 complete; the Phase 1 native local reader is implemented behind the experimental `vortex` feature. See the [compatibility results](vortex-phase0-results.md) and [Phase 1 implementation and validation](vortex-phase1-results.md), including the dependency cost accepted for this fork.
+**Status:** Phases 0 and 1 are complete for the experimental local-reader scope. Phase 2 implements selective scans behind the same default-off `vortex` feature; see its [detailed design and acceptance plan](vortex-phase2-design.md). The [Phase 1 validation record](vortex-phase1-results.md) includes the dependency cost accepted for this fork.
 
-**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, implementation branch `poc/vortex-phase1`.
+**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, implementation branch `poc/vortex-phase2`.
 
 **Design baseline:** `d3cd974150ba93dbbe8efef8370b129538fcee4b`; reviewed October 20, 2026.
 
 **Companion:** [test and benchmark plan](vortex-integration-test-plan.md).
 
-**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md) and [native reader setup, results, and limits](vortex-phase1-results.md).
+**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), and [Phase 2 selective-scan design](vortex-phase2-design.md).
 
 ## Summary
 
@@ -39,7 +39,7 @@ result = df.where(col("value") >= 20).select("id").limit(100)
 result.show()
 ```
 
-Signature: `read_vortex(path: str | Path | list[str | Path], io_config: IOConfig | None = None, batch_size: int = 131072) -> DataFrame`. Explicit `io_config` is reserved for Phase 3 and currently rejected; use `None` for local reads.
+Signature: `read_vortex(path: str | Path | list[str | Path], io_config: IOConfig | None = None, batch_size: int = 131072, *, enable_projection_pushdown: bool = True, enable_filter_pushdown: bool = True) -> DataFrame`. Explicit `io_config` is reserved for Phase 3 and currently rejected; use `None` for local reads. The keyword-only switches independently disable physical Vortex optimizations for differential testing; Daft still applies the complete filter and final projection.
 
 | Capability | First native milestone | Later phases |
 | --- | --- | --- |

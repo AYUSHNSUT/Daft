@@ -1,13 +1,15 @@
 //! Native local-file Vortex scans.
 //!
-//! The initial reader supports flat primitive columns, exports Vortex arrays
+//! The reader supports flat primitive columns, exports Vortex arrays
 //! through Arrow, and applies complete Daft predicates before projection and
-//! limits. It does not push predicates or limits into Vortex. The stream uses
-//! the caller's Tokio runtime and does not collect the entire file.
+//! limits. It pushes required columns and a conservative predicate subset into
+//! Vortex, while retaining the complete Daft residual and every limit. The
+//! stream uses the caller's Tokio runtime and does not collect the entire file.
 
 use daft_core::prelude::SchemaRef;
 use daft_dsl::ExprRef;
 
+mod plan;
 mod read;
 
 pub use read::{read_vortex_schema, stream_vortex};
@@ -21,12 +23,18 @@ pub use python::register_python;
 pub struct VortexReadOptions {
     /// Maximum rows per decoded batch; this is not a byte-memory bound.
     pub batch_size: usize,
+    /// Read only output columns and complete residual dependencies.
+    pub enable_projection_pushdown: bool,
+    /// Evaluate safe conjuncts in Vortex, then reevaluate the complete Daft filter.
+    pub enable_filter_pushdown: bool,
 }
 
 impl Default for VortexReadOptions {
     fn default() -> Self {
         Self {
             batch_size: 128 * 1024,
+            enable_projection_pushdown: true,
+            enable_filter_pushdown: true,
         }
     }
 }

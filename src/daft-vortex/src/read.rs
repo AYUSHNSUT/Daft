@@ -21,7 +21,7 @@ use vortex::{
     session::VortexSession,
 };
 
-use crate::{VortexConvertOptions, VortexReadOptions};
+use crate::{VortexConvertOptions, VortexReadOptions, plan::plan_scan};
 
 // Daft Field has no nullability member, and its equality ignores metadata. Keep
 // this marker on the inferred scan schema and explicitly compare it for every
@@ -94,7 +94,7 @@ async fn open_file(uri: &str) -> DaftResult<(VortexSession, VortexFile)> {
 
 /// Build the Arrow export schema and the full Daft scan schema separately, so
 /// private validation metadata does not leak into output Arrow fields.
-fn schemas(
+pub(crate) fn schemas(
     uri: &str,
     session: &VortexSession,
     dtype: &DType,
@@ -177,7 +177,7 @@ fn schemas(
     ))
 }
 
-fn validate_schema(uri: &str, expected: &Schema, actual: &Schema) -> DaftResult<()> {
+pub(crate) fn validate_schema(uri: &str, expected: &Schema, actual: &Schema) -> DaftResult<()> {
     if expected.len() != actual.len() {
         return Err(DaftError::SchemaMismatch(format!(
             "Vortex {uri:?} has {} columns; expected {} in the full first-file schema",
@@ -262,27 +262,18 @@ fn stream_opened_vortex(
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let (arrow_schema, actual_schema) = schemas(uri, &session, file.dtype())?;
     validate_schema(uri, &convert_options.schema, &actual_schema)?;
-    let predicate = convert_options
-        .predicate
-        .map(|predicate| BoundExpr::try_new(predicate, &actual_schema))
-        .transpose()
-        .map_err(|error| read_error(uri, "predicate binding", error))?;
-    let projection = convert_options
-        .include_columns
-        .map(|columns| {
-            columns
-                .iter()
-                .map(
-                    |name| match actual_schema.get_fields_with_name(name).as_slice() {
-                        [(index, _)] => Ok(*index),
-                        _ => Err(DaftError::FieldNotFound(format!(
-                            "Vortex {uri:?} has no unique column {name:?}"
-                        ))),
-                    },
-                )
-                .collect::<DaftResult<Vec<_>>>()
-        })
-        .transpose()?;
+    let plan = plan_scan(
+        &actual_schema,
+        file.dtype(),
+        &read_options,
+        &convert_options,
+    )
+    .map_err(|error| read_error(uri, "scan planning", error))?;
+    let arrow_schema = Arc::new(
+        arrow_schema
+            .project(&plan.physical_indices)
+            .map_err(|error| read_error(uri, "physical Arrow schema", error))?,
+    );
     // Even limit=0 validates the full schema, including projected-away fields.
     if convert_options.limit == Some(0) {
         return Ok(futures::stream::empty().boxed());
@@ -291,6 +282,8 @@ fn stream_opened_vortex(
     let batches = file
         .scan()
         .map_err(|error| read_error(uri, "scan preparation", error))?
+        .with_projection(plan.projection)
+        .with_some_filter(plan.pushed_filter)
         .with_split_by(SplitBy::RowCount(read_options.batch_size))
         // Vortex interprets this per Vortex worker, not as a global I/O bound.
         .with_concurrency(1)
@@ -301,8 +294,8 @@ fn stream_opened_vortex(
     let state = ScanState {
         batches: Some(batches),
         reader: Some((session, file)),
-        predicate,
-        projection,
+        predicate: plan.residual,
+        projection: Some(plan.output_indices),
         remaining: convert_options.limit,
         uri: uri.to_string(),
     };
@@ -352,3 +345,7 @@ fn stream_opened_vortex(
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "pushdown_tests.rs"]
+mod pushdown_tests;

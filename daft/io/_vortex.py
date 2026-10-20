@@ -96,6 +96,9 @@ def read_vortex(
     path: str | Path | list[str | Path],
     io_config: IOConfig | None = None,
     batch_size: int = 128 * 1024,
+    *,
+    enable_projection_pushdown: bool = True,
+    enable_filter_pushdown: bool = True,
 ) -> DataFrame:
     """Read local Vortex files with the experimental native reader.
 
@@ -112,6 +115,11 @@ def read_vortex(
             this phase; explicit I/O controls are unsupported.
         batch_size: Requested maximum rows per native batch, default 131072.
             This does not establish a fixed memory bound.
+        enable_projection_pushdown: Allow Vortex to read only output columns
+            and columns needed by the complete residual filter. Default True.
+        enable_filter_pushdown: Allow conservative translation of supported
+            predicates into Vortex. Default True. The complete Daft residual
+            filter is always retained, regardless of this switch.
 
     Note:
         Requires a build with Rust features ``python,vortex``. The Python
@@ -125,11 +133,13 @@ def read_vortex(
         integers, float32/64, strings, and binary values. Nested, temporal, and
         extension types are unsupported.
 
-        Each file produces one native task. This phase reads physical columns
-        through Vortex, then Daft applies residual filters, projects output,
-        and applies limits, preserving query ordering.
-        Vortex-native predicate pruning is not implemented. Inputs must remain
-        unchanged between planning and execution.
+        Each file produces one native task. Selected columns and a small safe
+        predicate subset can reach Vortex. Daft then evaluates the complete
+        residual filter, projects output, and applies limits, preserving query
+        ordering. Unsupported predicates fall back to Daft. Enabling an
+        optimization does not guarantee fewer reads or a faster query. Disable
+        both switches to compare with the original full-column scan strategy.
+        Inputs must remain unchanged between planning and execution.
 
         Vortex uses its local opener rather than Daft's I/O adapter. Daft I/O
         byte/request metrics are unavailable for these reads.
@@ -140,6 +150,12 @@ def read_vortex(
     """
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         raise ValueError(f"batch_size must be a positive integer, received {batch_size!r}")
+    for name, value in (
+        ("enable_projection_pushdown", enable_projection_pushdown),
+        ("enable_filter_pushdown", enable_filter_pushdown),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be a bool, received {value!r}")
     paths = _input_paths(path)
     if io_config is not None:
         raise NotImplementedError(
@@ -149,14 +165,30 @@ def read_vortex(
     _require_native_runner()
     _require_vortex()
     io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
-    return VortexSource(paths, io_config, batch_size).read()
+    return VortexSource(
+        paths,
+        io_config,
+        batch_size,
+        enable_projection_pushdown=enable_projection_pushdown,
+        enable_filter_pushdown=enable_filter_pushdown,
+    ).read()
 
 
 class VortexSource(DataSource):
-    def __init__(self, paths: list[str], io_config: IOConfig | None, batch_size: int) -> None:
+    def __init__(
+        self,
+        paths: list[str],
+        io_config: IOConfig | None,
+        batch_size: int,
+        *,
+        enable_projection_pushdown: bool = True,
+        enable_filter_pushdown: bool = True,
+    ) -> None:
         self._paths = _resolve_vortex_paths(paths, io_config)
         self._batch_size = batch_size
         self._io_config = io_config
+        self._enable_projection_pushdown = enable_projection_pushdown
+        self._enable_filter_pushdown = enable_filter_pushdown
         # Preserve native metadata: it carries original field nullability for
         # strict matching, which Daft's logical types alone cannot represent.
         self._scan_schema = Schema._from_pyschema(_native.read_vortex_schema(self._paths[0]))
@@ -183,12 +215,16 @@ class VortexSource(DataSource):
 
         _require_native_runner()
         for path in self._paths:
-            # Preserve full source validation metadata. This initial reader
-            # reads all physical fields, then filters and projects in Daft.
+            # Full schema validation precedes physical optimization. The native
+            # reader retains every residual dependency before final projection.
             yield DataSourceTask.vortex(
                 path=path,
                 schema=self._scan_schema,
-                vortex_config=VortexSourceConfig(batch_size=self._batch_size),
+                vortex_config=VortexSourceConfig(
+                    batch_size=self._batch_size,
+                    enable_projection_pushdown=self._enable_projection_pushdown,
+                    enable_filter_pushdown=self._enable_filter_pushdown,
+                ),
                 pushdowns=pushdowns,
                 storage_config=StorageConfig(multithreaded_io=True, io_config=None),
             )

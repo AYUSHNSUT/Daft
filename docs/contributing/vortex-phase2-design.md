@@ -106,7 +106,7 @@ Maintain separate full-source, physical-read, and final-output schemas. Remove p
 
 Do not rely solely on `get_required_columns()`: in this checkout it does not cover every bound/unresolved column representation. Existing bound Daft column indices also cannot be reused unchanged after columns are removed. Normalize to validated source names or explicitly remap indices, then bind the complete residual to the physical-read schema.
 
-Zero physical columns are valid when neither output nor the residual needs data columns. Preserve Vortex's explicit batch row count through Arrow and the Daft zero-column constructor. Do not answer counts from footer metadata or invent a value column just to hide a cardinality bug.
+Zero physical columns are valid when neither output nor the residual needs data columns. Preserve Vortex's explicit batch row count through Arrow and the Daft zero-column constructor. Keep counts as ordinary queries over that batch stream, with `supports_count_pushdown()` false; do not add a separate source metadata-count shortcut or invent a value column to hide a cardinality bug. Vortex can derive zero-column batch cardinality without reading payloads, so a count query is not a scan-throughput measurement.
 
 ### Translate a small filter subset
 

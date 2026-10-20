@@ -541,12 +541,16 @@ impl_bincode_py_state_serialization!(McapSourceConfig);
 )]
 pub struct VortexSourceConfig {
     pub batch_size: usize,
+    pub enable_projection_pushdown: bool,
+    pub enable_filter_pushdown: bool,
 }
 
 impl Default for VortexSourceConfig {
     fn default() -> Self {
         Self {
             batch_size: 131_072,
+            enable_projection_pushdown: true,
+            enable_filter_pushdown: true,
         }
     }
 }
@@ -554,20 +558,42 @@ impl Default for VortexSourceConfig {
 impl VortexSourceConfig {
     #[must_use]
     pub fn multiline_display(&self) -> Vec<String> {
-        vec![format!("Batch size = {}", self.batch_size)]
+        vec![
+            format!("Batch size = {}", self.batch_size),
+            format!(
+                "Enable projection pushdown = {}",
+                self.enable_projection_pushdown
+            ),
+            format!("Enable filter pushdown = {}", self.enable_filter_pushdown),
+        ]
     }
+}
+
+#[cfg(feature = "python")]
+fn strict_vortex_bool(value: &pyo3::Bound<'_, PyAny>) -> PyResult<bool> {
+    use pyo3::types::{PyBool, PyBoolMethods};
+
+    Ok(value.cast::<PyBool>()?.is_true())
 }
 
 #[cfg(feature = "python")]
 #[pymethods]
 impl VortexSourceConfig {
     #[new]
-    #[pyo3(signature = (batch_size=131_072))]
-    fn new(batch_size: usize) -> PyResult<Self> {
+    #[pyo3(signature = (batch_size=131_072, *, enable_projection_pushdown=true, enable_filter_pushdown=true))]
+    fn new(
+        batch_size: usize,
+        #[pyo3(from_py_with = strict_vortex_bool)] enable_projection_pushdown: bool,
+        #[pyo3(from_py_with = strict_vortex_bool)] enable_filter_pushdown: bool,
+    ) -> PyResult<Self> {
         if batch_size == 0 {
             return Err(PyValueError::new_err("Vortex batch_size must be positive"));
         }
-        Ok(Self { batch_size })
+        Ok(Self {
+            batch_size,
+            enable_projection_pushdown,
+            enable_filter_pushdown,
+        })
     }
 }
 
