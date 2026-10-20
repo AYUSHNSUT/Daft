@@ -369,6 +369,8 @@ async fn read_vortex(
     }
     let read_options = daft_vortex::VortexReadOptions {
         batch_size: cfg.batch_size,
+        enable_projection_pushdown: cfg.enable_projection_pushdown,
+        enable_filter_pushdown: cfg.enable_filter_pushdown,
     };
     let convert_options = daft_vortex::VortexConvertOptions {
         schema: scan_task.schema.clone(),

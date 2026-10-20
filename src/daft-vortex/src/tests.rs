@@ -22,6 +22,9 @@ use crate::{
     stream_vortex,
 };
 
+#[path = "semantics_tests.rs"]
+mod semantics_tests;
+
 fn primitive_batch(value_nullable: bool) -> ArrowRecordBatch {
     let value = if value_nullable {
         vec![
@@ -201,10 +204,17 @@ async fn collect(
     batch_size: usize,
     options: VortexConvertOptions,
 ) -> DaftResult<Vec<RecordBatch>> {
-    stream_vortex(uri, VortexReadOptions { batch_size }, options)
-        .await?
-        .try_collect()
-        .await
+    stream_vortex(
+        uri,
+        VortexReadOptions {
+            batch_size,
+            ..Default::default()
+        },
+        options,
+    )
+    .await?
+    .try_collect()
+    .await
 }
 
 #[tokio::test]
@@ -215,7 +225,10 @@ async fn primitive_values_nulls_and_retained_batches_roundtrip() -> DaftResult<(
     let schema = read_vortex_schema(&uri).await?;
     let mut stream = stream_vortex(
         &uri,
-        VortexReadOptions { batch_size: 3 },
+        VortexReadOptions {
+            batch_size: 3,
+            ..Default::default()
+        },
         options(schema.clone()),
     )
     .await?;
@@ -424,7 +437,10 @@ async fn invalid_sources_and_zero_batch_size_have_pathful_errors() -> DaftResult
     let schema = read_vortex_schema(uri).await?;
     let error = stream_vortex(
         uri,
-        VortexReadOptions { batch_size: 0 },
+        VortexReadOptions {
+            batch_size: 0,
+            ..Default::default()
+        },
         options(schema.clone()),
     )
     .await

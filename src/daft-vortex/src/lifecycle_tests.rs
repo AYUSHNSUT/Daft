@@ -115,6 +115,7 @@ impl SegmentedFile {
             file,
             VortexReadOptions {
                 batch_size: CHUNK_ROWS,
+                ..Default::default()
             },
             VortexConvertOptions {
                 schema,

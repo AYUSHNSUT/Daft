@@ -29,6 +29,37 @@ def test_native_parquet_baseline_checks_all_layouts_and_queries(tmp_path: Path) 
     assert json.loads(output.read_text())["status"] == "passed"
 
 
+@pytest.mark.parametrize("settings", [{"enable_projection_pushdown": False}, {"enable_filter_pushdown": False}])
+def test_physical_pushdown_switches_cannot_mislabel_other_readers(tmp_path: Path, settings: dict) -> None:
+    with pytest.raises(ValueError, match="require source=vortex-native"):
+        run_baseline(tmp_path / "manifest.json", tmp_path / "report.json", **settings)
+
+
+@pytest.mark.parametrize("projection,filters", [(False, False), (True, False), (False, True), (True, True)])
+def test_native_vortex_baseline_checks_and_records_optimization_settings(
+    tmp_path: Path, projection: bool, filters: bool
+) -> None:
+    import daft
+
+    if not hasattr(daft.daft, "_vortex_scan_diagnostics"):
+        pytest.skip("requires the Phase 2 native Vortex extension")
+    pytest.importorskip("vortex", reason="fixture generation requires the optional vortex-data package")
+    generate_fixtures(tmp_path, rows=17, mode="both")
+    report = run_baseline(
+        tmp_path / "manifest.json",
+        tmp_path / "report.json",
+        source="vortex-native",
+        repeats=1,
+        batch_size=7,
+        enable_projection_pushdown=projection,
+        enable_filter_pushdown=filters,
+    )
+    assert report["status"] == "passed", report["cases"]
+    assert len(report["cases"]) == 9
+    assert report["reader_settings"]["enable_projection_pushdown"] is projection
+    assert report["reader_settings"]["enable_filter_pushdown"] is filters
+
+
 def test_changed_fixture_is_rejected_before_running_a_query(tmp_path: Path) -> None:
     generate_fixtures(tmp_path, rows=9, mode="parquet-only")
     path = tmp_path / "single" / "data.parquet"

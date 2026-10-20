@@ -354,8 +354,16 @@ class VortexSourceConfig:
     """Experimental native Vortex source configuration."""
 
     batch_size: int
+    enable_projection_pushdown: bool
+    enable_filter_pushdown: bool
 
-    def __init__(self, batch_size: int = 131072) -> None: ...
+    def __init__(
+        self,
+        batch_size: int = 131072,
+        *,
+        enable_projection_pushdown: bool = True,
+        enable_filter_pushdown: bool = True,
+    ) -> None: ...
 
 class DatabaseSourceConfig:
     """Configuration of a database data source."""
@@ -1346,6 +1354,16 @@ class PyDataSourceTask:
 
 def read_vortex_schema(path: str) -> PySchema:
     """Infer a supported local Vortex schema; available with the vortex feature."""
+
+def _vortex_scan_diagnostics(
+    schema: PySchema,
+    columns: list[str] | None = None,
+    predicate: PyExpr | None = None,
+    *,
+    enable_projection_pushdown: bool = True,
+    enable_filter_pushdown: bool = True,
+) -> dict[str, Any]:
+    """Inspect the shared native scan plan; available with the vortex feature."""
 
 class ScanOperatorHandle:
     """A handle to a scan operator."""

@@ -3,8 +3,11 @@
 The Phase 0 tools check fixture correctness, an optional Python reader, and
 native Vortex-to-Daft batch compatibility. Their historical results are in the
 [Phase 0 report](../../docs/contributing/vortex-phase0-results.md).
-This branch also implements the experimental Phase 1 native connector; see
-[setup, validation, and limits](../../docs/contributing/vortex-phase1-results.md).
+This branch also implements the experimental native connector with Phase 2
+selective scans; see the [Phase 1 setup](../../docs/contributing/vortex-phase1-results.md)
+and [Phase 2 validation and limits](../../docs/contributing/vortex-phase2-results.md).
+The [Phase 2 design](../../docs/contributing/vortex-phase2-design.md) explains
+independent physical projection and filter-pushdown switches.
 
 Run the commands below from the repository root, using a working source-built
 Daft environment. See the [development guide](../../docs/contributing/development.md)
@@ -54,6 +57,13 @@ DAFT_RUNNER=native .venv/bin/python examples/vortex_eval/baseline.py \
   --manifest examples/vortex_eval/artifacts/fixtures/manifest.json \
   --source vortex-native --batch-size 7 --repeats 5 \
   --output examples/vortex_eval/artifacts/vortex-native.json
+
+# Phase 2: compare the same query cases with both physical optimizations off.
+DAFT_RUNNER=native .venv/bin/python examples/vortex_eval/baseline.py \
+  --manifest examples/vortex_eval/artifacts/fixtures/manifest.json \
+  --source vortex-native --batch-size 7 --repeats 5 \
+  --disable-projection-pushdown --disable-filter-pushdown \
+  --output examples/vortex_eval/artifacts/vortex-native-unoptimized.json
 ```
 
 Each source runs a full scan, a filter with projection, and an aggregation over
@@ -62,6 +72,12 @@ result. Reports include query plans, correctness checks, individual timings,
 versions, build type, and source hashes. There is one warmup; OS caches are not
 flushed. Source construction and result conversion are timed, while fixture
 validation and result checking are outside the timer.
+
+The two disable flags apply only to `vortex-native` and can be used independently.
+Native reports record both settings, so four runs can isolate projection,
+filtering, their combination, and the Phase 1 physical strategy. All configurations
+still apply the complete Daft residual, final projection, and exact limits. These
+small development-build timings do not establish a performance improvement.
 
 `reference.py` reads projected Vortex Arrow batches through Daft's Python
 `DataSource` interface. It supports explicit local files and matching flat
@@ -118,7 +134,7 @@ DAFT_RUNNER=native .venv/bin/python examples/vortex_eval/baseline.py \
 
 This mode is recorded in the manifest and cannot produce a Vortex success result.
 
-As recorded on 20 October 2026, focused tests reported **53 passed, zero skipped**
+The historical Phase 0 run on 20 October 2026 reported **53 passed, zero skipped**
 after dependencies were installed from the user's terminal. Both readers passed
 all nine baseline cases with matching outputs using the existing development
 build. The isolated Rust probe passes offline type checking, builds, and runs on

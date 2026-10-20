@@ -995,6 +995,30 @@ mod test {
     }
 
     #[test]
+    fn vortex_config_roundtrips_independent_pushdown_switches() {
+        use common_py_serde::bincode;
+
+        let defaults = VortexSourceConfig::default();
+        assert!(defaults.enable_projection_pushdown);
+        assert!(defaults.enable_filter_pushdown);
+        for enable_projection_pushdown in [false, true] {
+            for enable_filter_pushdown in [false, true] {
+                let config = VortexSourceConfig {
+                    batch_size: 7,
+                    enable_projection_pushdown,
+                    enable_filter_pushdown,
+                };
+                let encoded =
+                    bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+                let (decoded, consumed): (VortexSourceConfig, _) =
+                    bincode::serde::decode_from_slice(&encoded, bincode::config::legacy()).unwrap();
+                assert_eq!(consumed, encoded.len());
+                assert_eq!(decoded, config);
+            }
+        }
+    }
+
+    #[test]
     fn vortex_scan_preserves_full_schema_metadata_and_unknown_statistics() {
         use common_py_serde::bincode;
 
@@ -1022,7 +1046,11 @@ mod test {
                 },
             }],
             Arc::new(SourceConfig::File(FileFormatConfig::Vortex(
-                VortexSourceConfig { batch_size: 17 },
+                VortexSourceConfig {
+                    batch_size: 17,
+                    enable_projection_pushdown: false,
+                    enable_filter_pushdown: true,
+                },
             ))),
             schema,
             Arc::new(StorageConfig::default()),
@@ -1077,7 +1105,9 @@ mod test {
         assert!(matches!(
             decoded.source_config.as_ref(),
             SourceConfig::File(FileFormatConfig::Vortex(VortexSourceConfig {
-                batch_size: 17
+                batch_size: 17,
+                enable_projection_pushdown: false,
+                enable_filter_pushdown: true,
             }))
         ));
         assert_eq!(decoded.num_rows(), None);

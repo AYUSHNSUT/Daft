@@ -122,14 +122,27 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], pa.Table]:
     return manifest, canonical
 
 
-def _query(source: str, paths: list[str], query: str, batch_size: int) -> Any:
+def _query(
+    source: str,
+    paths: list[str],
+    query: str,
+    batch_size: int,
+    *,
+    enable_projection_pushdown: bool = True,
+    enable_filter_pushdown: bool = True,
+) -> Any:
     import daft
     from daft import col
 
     if source == "parquet":
         frame = daft.read_parquet(paths)
     elif source == "vortex-native":
-        frame = daft.read_vortex(paths, batch_size=batch_size)
+        frame = daft.read_vortex(
+            paths,
+            batch_size=batch_size,
+            enable_projection_pushdown=enable_projection_pushdown,
+            enable_filter_pushdown=enable_filter_pushdown,
+        )
     else:
         from reference import read_vortex_reference
 
@@ -189,6 +202,8 @@ def run_baseline(
     source: str = "parquet",
     repeats: int = 5,
     batch_size: int = 7,
+    enable_projection_pushdown: bool = True,
+    enable_filter_pushdown: bool = True,
 ) -> dict[str, Any]:
     if source not in {"parquet", "vortex-reference", "vortex-native"}:
         raise ValueError("Source must be parquet, vortex-reference, or vortex-native")
@@ -196,6 +211,10 @@ def run_baseline(
         raise ValueError("repeats must be positive")
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if not isinstance(enable_projection_pushdown, bool) or not isinstance(enable_filter_pushdown, bool):
+        raise TypeError("Physical pushdown settings must be booleans")
+    if source != "vortex-native" and (not enable_projection_pushdown or not enable_filter_pushdown):
+        raise ValueError("Physical pushdown switches require source=vortex-native")
     os.environ.setdefault("DAFT_RUNNER", "native")
     if os.environ["DAFT_RUNNER"] != "native":
         raise ValueError("Vortex evaluation baselines require DAFT_RUNNER=native")
@@ -234,6 +253,11 @@ def run_baseline(
         },
         "cases": [],
     }
+    if source == "vortex-native":
+        report["reader_settings"].update(
+            enable_projection_pushdown=enable_projection_pushdown,
+            enable_filter_pushdown=enable_filter_pushdown,
+        )
     for layout_name, layout in manifest["layouts"].items():
         paths = [str(manifest_path.parent / relative) for relative in layout[file_format]]
         table = canonical.slice(0, 0) if layout_name == "empty" else canonical
@@ -241,14 +265,28 @@ def run_baseline(
             record: dict[str, Any] = {"layout": layout_name, "query": query}
             try:
                 plan = io.StringIO()
-                _query(source, paths, query, batch_size).explain(show_all=True, file=plan)
+                _query(
+                    source,
+                    paths,
+                    query,
+                    batch_size,
+                    enable_projection_pushdown=enable_projection_pushdown,
+                    enable_filter_pushdown=enable_filter_pushdown,
+                ).explain(show_all=True, file=plan)
                 plan_path = plans / f"{layout_name}-{query}.txt"
                 plan_path.write_text(plan.getvalue())
                 samples = []
                 digest = None
                 for iteration in range(repeats + 1):
                     started = time.perf_counter_ns()
-                    actual = _query(source, paths, query, batch_size).to_arrow()
+                    actual = _query(
+                        source,
+                        paths,
+                        query,
+                        batch_size,
+                        enable_projection_pushdown=enable_projection_pushdown,
+                        enable_filter_pushdown=enable_filter_pushdown,
+                    ).to_arrow()
                     elapsed = (time.perf_counter_ns() - started) / 1_000_000
                     digest = _check_result(query, actual, table, layout["expected_results"])
                     if iteration:
@@ -278,10 +316,18 @@ def main() -> None:
     parser.add_argument("--source", choices=("parquet", "vortex-reference", "vortex-native"), default="parquet")
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=7)
+    parser.add_argument("--disable-projection-pushdown", action="store_false", dest="enable_projection_pushdown")
+    parser.add_argument("--disable-filter-pushdown", action="store_false", dest="enable_filter_pushdown")
     args = parser.parse_args()
     try:
         result = run_baseline(
-            args.manifest, args.output, source=args.source, repeats=args.repeats, batch_size=args.batch_size
+            args.manifest,
+            args.output,
+            source=args.source,
+            repeats=args.repeats,
+            batch_size=args.batch_size,
+            enable_projection_pushdown=args.enable_projection_pushdown,
+            enable_filter_pushdown=args.enable_filter_pushdown,
         )
     except (ValueError, OSError, KeyError) as error:
         parser.exit(1, f"Baseline setup failed: {error}\n")
