@@ -13,13 +13,70 @@ import json
 import os
 import subprocess
 import sys
+import time
+import urllib.request
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from benchmarking.vortex.fixtures import load_manifest
 from benchmarking.vortex.metadata_eval import DEFAULT_CASES, QUERY_CASES, require_api, validate_options
 from examples.vortex_eval.run_phase3_services import _start_minio
 from examples.vortex_eval.run_phase4_services import _cleanup_bucket, _redact, _validate_endpoint
+
+
+def _health_snapshot(endpoint: str) -> dict[str, Any]:
+    started = time.perf_counter()
+    with urllib.request.urlopen(endpoint.rstrip("/") + "/minio/health/ready", timeout=3) as response:
+        return {"status": response.status, "elapsed_seconds": time.perf_counter() - started}
+
+
+def _service_snapshot(environment: dict[str, str], container: str | None) -> dict[str, Any]:
+    """Inspect only the owned service, outside the benchmark subprocess."""
+    snapshot: dict[str, Any] = {
+        "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+        "owns_container": container is not None,
+    }
+    endpoint = environment.get("VORTEX_MINIO_ENDPOINT")
+    if endpoint:
+        try:
+            _validate_endpoint(endpoint)
+            snapshot["health"] = _health_snapshot(endpoint)
+        except Exception as error:
+            snapshot["health"] = {"error": _redact(str(error), environment)}
+    if container is None:
+        return snapshot
+    state = (
+        '{"status":{{json .State.Status}},"running":{{json .State.Running}},'
+        '"restarting":{{json .State.Restarting}},"oom_killed":{{json .State.OOMKilled}},'
+        '"exit_code":{{json .State.ExitCode}},"error":{{json .State.Error}},'
+        '"started_at":{{json .State.StartedAt}},"finished_at":{{json .State.FinishedAt}},'
+        '"restart_count":{{json .RestartCount}},"image":{{json .Config.Image}},'
+        '"image_id":{{json .Image}}}'
+    )
+    commands = {
+        "docker_runtime": [
+            "docker",
+            "version",
+            "--format",
+            '{"client":{{json .Client.Version}},"server":{{json .Server.Version}},'
+            '"os":{{json .Server.Os}},"arch":{{json .Server.Arch}},"kernel":{{json .Server.KernelVersion}}}',
+        ],
+        "container_state": ["docker", "inspect", "--format", state, container],
+        "container_logs": ["docker", "logs", "--timestamps", "--tail", "2000", container],
+    }
+    for name, command in commands.items():
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+            snapshot[name] = {
+                "returncode": result.returncode,
+                "stdout": _redact(result.stdout or "", environment),
+                "stderr": _redact(result.stderr or "", environment),
+            }
+        except (OSError, subprocess.TimeoutExpired) as error:
+            snapshot[name] = {"error": _redact(str(error), environment)}
+    return snapshot
 
 
 def _require_environment(allow_dev: bool) -> None:
@@ -72,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
     container = None
     client = None
     created_bucket = False
+    before_evaluation = None
+    evaluation_returncode = None
     bucket = f"vortex-phase5-{uuid.uuid4().hex[:20]}"
     try:
         if not environment.get("VORTEX_MINIO_ENDPOINT"):
@@ -139,7 +198,12 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if args.allow_dev:
             command.append("--allow-dev")
+        try:
+            before_evaluation = _service_snapshot(environment, container)
+        except Exception as error:
+            before_evaluation = {"error": _redact(str(error), environment)}
         result = subprocess.run(command, cwd=Path(__file__).resolve().parents[2], env=environment, check=False)
+        evaluation_returncode = result.returncode
         if result.returncode:
             return result.returncode
         report_path = output / "report.json"
@@ -151,6 +215,19 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         raise RuntimeError(_redact(str(error), environment)) from None
     finally:
+        # Save evidence before removing the owned service, even after failed trials.
+        # Collection/persistence failures must not hide the benchmark result or skip cleanup.
+        try:
+            diagnostics = {
+                "scope": "Snapshots before/after evaluation only; no polling during timed trials",
+                "evaluation_returncode": evaluation_returncode,
+                "before_evaluation": before_evaluation,
+                "before_cleanup": _service_snapshot(environment, container),
+            }
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "service-diagnostics.json").write_text(json.dumps(diagnostics, indent=2, sort_keys=True) + "\n")
+        except Exception as error:
+            print(f"Could not save service diagnostics: {_redact(str(error), environment)}", file=sys.stderr)
         try:
             if created_bucket:
                 _cleanup_bucket(client, bucket)

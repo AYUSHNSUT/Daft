@@ -23,6 +23,7 @@ def service_lifecycle(monkeypatch, tmp_path):
     manifest = {"datasets": {"sorted/multi": {"paths": {"parquet": ["data.parquet"], "vortex": ["data.vortex"]}}}}
     monkeypatch.setattr(run_phase5_services, "load_manifest", lambda path: manifest)
     monkeypatch.setattr(run_phase5_services, "_require_environment", lambda allow_dev: None)
+    monkeypatch.setattr(run_phase5_services, "_health_snapshot", lambda _: {"status": 200, "elapsed_seconds": 0.01})
     monkeypatch.delenv("VORTEX_MINIO_ENDPOINT", raising=False)
 
     def start(image, environment):
@@ -74,6 +75,18 @@ def service_lifecycle(monkeypatch, tmp_path):
     monkeypatch.setattr(run_phase5_services, "_start_minio", start)
 
     def run(command, **kwargs):
+        if command[:2] in (["docker", "version"], ["docker", "inspect"], ["docker", "logs"]):
+            assert kwargs["timeout"] == 10
+            if command[1] == "logs":
+                assert "--timestamps" in command
+                assert command[command.index("--tail") + 1] == "2000"
+            if command[1] == "inspect":
+                assert ".Config.Env" not in command[command.index("--format") + 1]
+                assert command[-1] == "owned-phase5-container"
+            events.append(f"diagnostic:{command[1]}")
+            if outcome["value"] == "diagnostic_failure":
+                raise subprocess.TimeoutExpired(command, 10, stderr=secret)
+            return subprocess.CompletedProcess(command, 0, stdout=f"diagnostic {secret}", stderr=f"warning {secret}")
         if command[:2] == ["docker", "rm"]:
             assert command[-1] == "owned-phase5-container"
             events.append("remove_container")
@@ -163,7 +176,9 @@ def test_failed_bucket_creation_does_not_delete_a_bucket_it_did_not_create(servi
     with pytest.raises(RuntimeError, match="Create failed") as failure:
         run_phase5_services.main(state.arguments)
     assert state.secret not in str(failure.value)
-    assert state.events == ["start_container", "create_bucket", "remove_container"]
+    assert state.events[:2] == ["start_container", "create_bucket"]
+    assert state.events[-1] == "remove_container"
+    assert "delete_bucket" not in state.events
 
 
 def test_existing_endpoint_is_used_without_starting_or_removing_a_container(monkeypatch, service_lifecycle):
@@ -174,6 +189,7 @@ def test_existing_endpoint_is_used_without_starting_or_removing_a_container(monk
     assert run_phase5_services.main(state.arguments) == 0
     assert "start_container" not in state.events
     assert "remove_container" not in state.events
+    assert not any(event.startswith("diagnostic:") for event in state.events)
     assert state.events[-2:] == ["delete_objects", "delete_bucket"]
 
 
@@ -185,6 +201,43 @@ def test_nonempty_output_is_rejected_before_service_contact(service_lifecycle):
         run_phase5_services.main(state.arguments)
     assert state.events == []
     assert (state.output / "keep.txt").read_text() == "existing result"
+
+
+@pytest.mark.parametrize("outcome", ["success", "query_failure", "diagnostic_failure"])
+def test_diagnostics_are_redacted_outside_evaluation_and_before_cleanup(service_lifecycle, outcome):
+    state = service_lifecycle
+    state.outcome["value"] = outcome
+    assert run_phase5_services.main(state.arguments) == (3 if outcome == "query_failure" else 0)
+    text = (state.output / "service-diagnostics.json").read_text()
+    assert state.secret not in text
+    diagnostic = json.loads(text)
+    assert diagnostic["evaluation_returncode"] == (3 if outcome == "query_failure" else 0)
+    for key in ("before_evaluation", "before_cleanup"):
+        snapshot = diagnostic[key]
+        assert snapshot["owns_container"] is True
+        assert snapshot["health"]["status"] == 200
+        if outcome == "diagnostic_failure":
+            assert "error" in snapshot["container_state"]
+        else:
+            assert "<redacted>" in text
+    first = state.events.index("diagnostic:inspect")
+    evaluate = state.events.index("evaluate")
+    last = len(state.events) - 1 - state.events[::-1].index("diagnostic:inspect")
+    cleanup = state.events.index("delete_objects")
+    assert first < evaluate < last < cleanup
+
+
+def test_health_failure_is_recorded_without_exposing_credentials(monkeypatch):
+    def failure(_):
+        raise RuntimeError("endpoint failed with private-credential")
+
+    monkeypatch.setattr(run_phase5_services, "_health_snapshot", failure)
+    result = run_phase5_services._service_snapshot(
+        {"VORTEX_MINIO_ENDPOINT": "http://127.0.0.1:9000", "VORTEX_MINIO_SECRET_KEY": "private-credential"},
+        None,
+    )
+    assert result["health"] == {"error": "endpoint failed with <redacted>"}
+    assert result["owns_container"] is False
 
 
 @pytest.mark.parametrize("options", [["--concurrency", "8"], ["--concurrency", "1", "65"], ["--rounds", "0"]])

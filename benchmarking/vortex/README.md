@@ -214,3 +214,13 @@ digests and failures, and record build/binary/source/fixture identity. Reports
 show Parquet/Vortex query ratios and Vortex concurrency-1/concurrency-8 ratios
 separately. OS caches remain retained. A concurrency setting is not a global
 memory or CPU bound; each active file retains its own request/byte budgets.
+
+Each trial also saves UTC subprocess start/completion times, its process exit
+code, and full redacted worker stderr. These diagnostics are separate from the
+worker's query or metadata timer. The MinIO helper saves
+`service-diagnostics.json` before cleanup, including service health and, for a
+container it owns, selected container state, Docker versions and bounded logs.
+It takes snapshots before and after the evaluation without polling during
+trials. A failed trial still fails the comparison; diagnostics add no retries or
+pauses between trials. Use a new output directory for each attempt so failed
+runs remain available.

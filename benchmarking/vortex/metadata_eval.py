@@ -16,6 +16,7 @@ import statistics
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -427,6 +428,12 @@ def run(
         spec = {**entry, "manifest": str(manifest_path), "storage_root": storage_root, "allow_dev": allow_dev}
         spec_path, result_path = output / "trials" / f"{index:05d}-spec.json", output / "trials" / f"{index:05d}.json"
         spec_path.write_text(json.dumps(spec, sort_keys=True) + "\n")
+        started_at = datetime.now(timezone.utc).isoformat()
+        process_started = time.perf_counter()
+        worker_stderr = ""
+        returncode = None
+        completed_at = None
+        process_elapsed = None
         try:
             completed = subprocess.run(
                 [
@@ -444,15 +451,34 @@ def run(
                 timeout=timeout,
                 check=False,
             )
+            completed_at = datetime.now(timezone.utc).isoformat()
+            process_elapsed = time.perf_counter() - process_started
+            returncode = completed.returncode
+            worker_stderr = completed.stderr or ""
             if completed.returncode or not result_path.exists():
-                raise RuntimeError(f"Trial exit={completed.returncode}: {redacted(completed.stderr[-6000:])}")
+                raise RuntimeError(f"Trial exit={completed.returncode}: {redacted(worker_stderr[-6000:])}")
             trial = {**entry, **json.loads(result_path.read_text())}
             if "plan" in trial:
                 relative = f"plans/{index:05d}-{entry['dataset'].replace('/', '-')}-{entry['case']}-{entry['reader']}-metadata{entry['metadata_concurrency']}.txt"
                 (output / relative).write_text(trial.pop("plan"))
                 trial["plan"] = relative
         except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as error:
+            if isinstance(error, subprocess.TimeoutExpired):
+                captured = error.stderr or ""
+                worker_stderr = captured.decode(errors="replace") if isinstance(captured, bytes) else captured
             trial = {**entry, "status": "failed", "error": redacted(str(error))}
+        if completed_at is None:
+            completed_at = datetime.now(timezone.utc).isoformat()
+            process_elapsed = time.perf_counter() - process_started
+        stderr_path = f"trials/{index:05d}-stderr.log"
+        (output / stderr_path).write_text(redacted(worker_stderr))
+        trial.update(
+            subprocess_started_at_utc=started_at,
+            subprocess_completed_at_utc=completed_at,
+            subprocess_elapsed_seconds=process_elapsed,
+            subprocess_returncode=returncode,
+            worker_stderr=stderr_path,
+        )
         report["trials"].append(trial)
         result_path.write_text(json.dumps(trial, indent=2, sort_keys=True, allow_nan=False) + "\n")
         if (index + 1) % round_size == 0:

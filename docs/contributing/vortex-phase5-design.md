@@ -20,6 +20,16 @@ This phase measures metadata cost and overlaps independent file metadata reads. 
 4. Add an isolated comparison harness. Compare concurrency 1 with 8 in the same optimized build, using identical existing fixtures, independent result checks, interleaved trials, and fresh processes. Keep metadata-only and end-to-end query measurements separate.
 5. Validate enabled/disabled builds, existing Vortex/Parquet/task/iterator behavior, and real authenticated HTTP/MinIO/Ray service acceptance. Publish results and remaining regressions, then open the personal-fork PR against Phase 4.
 
+Remote acceptance also exposed a shared S3 transport problem: the HTTP client
+created a new connector for each request, discarding its connection pool. Both
+formats failed during bursts of Docker Desktop port-forwarding errors. Restore
+SDK-managed connector reuse while retaining proxy, TLS and timeout settings;
+test TCP reuse, distinct timeout pools, proxy routing and read timeouts. This
+repair affects both readers, so the remote comparison must use a fresh build
+and report, with no samples pooled from the failed attempt. It does not cache
+file metadata or change retry settings. Preserve trial stderr/timestamps and
+service diagnostics before cleanup; do not add pacing or retry failed trials.
+
 ## Data flow and resource bounds
 
 The constructor continues to infer the full first-file schema. On each `get_tasks` invocation, the source partitions its resolved, deduplicated paths into bounded windows. A native batch runs independent footer reads concurrently with ordered results. Each returned count is associated with its original path and passed into the existing native scan-task metadata.
@@ -38,7 +48,7 @@ Public source serialization includes the concurrency setting. Native tasks retai
 | Source planning | Bounded window sizes, exact count/path association, configuration forwarding, duplicate paths, and fresh counts across repeated/pickled materialization |
 | Concurrency | Delayed authenticated HTTP files prove overlap at concurrency above one, sequential behavior at one, and the configured active-file bound; failures release owned work |
 | Correctness | Existing joins still build the small dimension and probe fact rows; filters, limits, full schema/nullability checks, lifecycle and credential redaction remain correct |
-| Builds | Rebuilt native extension, focused Rust tests, applicable Clippy/format/dependency checks, and feature-off import/query/enablement behavior |
+| Builds | Rebuilt native extension, focused Rust tests in debug and release profiles, applicable Clippy/format/dependency checks, and feature-off import/query/enablement behavior |
 | Services | Real HTTP/MinIO/Ray tests with zero service skips; controlled remote comparison uses the existing local MinIO image |
 | Performance | At least 20 measured repetitions for the short targeted comparison plus warmups; preserve every sample, CPU/RSS, provenance, and regressions |
 

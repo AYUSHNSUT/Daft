@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -162,12 +162,16 @@ def test_invalid_endpoint_cannot_create_artifacts(tmp_path, monkeypatch):
     assert not target.exists()
 
 
-def test_orchestrator_retains_failures_and_continues_other_modes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure_mode", ["exit", "timeout"])
+def test_orchestrator_retains_failures_and_continues_other_modes(tmp_path, monkeypatch, failure_mode):
     path = tmp_path / "manifest.json"
     path.write_text("{}")
     monkeypatch.setattr(evaluation, "load_manifest", lambda _: manifest())
     monkeypatch.setattr(evaluation, "require_api", lambda: None)
     monkeypatch.setattr(evaluation, "environment", lambda: {"build_type": "dev"})
+    secret = "worker-private-credential"
+    monkeypatch.setenv("DAFT_VORTEX_BENCH_IO_JSON", json.dumps({"s3": {"access_key": secret}}))
+    stderr = f"early message {secret}\n" + "x" * 7000 + "\nlast message"
     seen = []
 
     def child(command, **kwargs):
@@ -175,10 +179,12 @@ def test_orchestrator_retains_failures_and_continues_other_modes(tmp_path, monke
         seen.append(spec)
         assert kwargs["env"]["DAFT_ANALYTICS_ENABLED"] == "0"
         if spec["mode"] == "query" and spec["metadata_concurrency"] == 8:
-            return subprocess.CompletedProcess(command, 1, stderr="controlled failure")
+            if failure_mode == "timeout":
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"], stderr=stderr.encode())
+            return subprocess.CompletedProcess(command, 1, stderr=stderr)
         value = sample(spec["mode"], spec["metadata_concurrency"], spec["iteration"], 1, spec["reader"])
         Path(command[command.index("--output") + 1]).write_text(json.dumps(value))
-        return subprocess.CompletedProcess(command, 0, stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout=secret, stderr=stderr)
 
     monkeypatch.setattr(evaluation.subprocess, "run", child)
     target = tmp_path / "report"
@@ -189,6 +195,18 @@ def test_orchestrator_retains_failures_and_continues_other_modes(tmp_path, monke
     assert sum(trial["status"] == "failed" for trial in result["trials"]) == 1
     assert json.loads((target / "report.json").read_text())["status"] == "failed"
     assert (target / "report.md").is_file()
+    for trial in result["trials"]:
+        started = datetime.fromisoformat(trial["subprocess_started_at_utc"])
+        completed = datetime.fromisoformat(trial["subprocess_completed_at_utc"])
+        assert started.tzinfo is not None and completed >= started
+        assert trial["subprocess_elapsed_seconds"] >= 0
+        assert trial["subprocess_returncode"] == (
+            0 if trial["status"] == "passed" else (1 if failure_mode == "exit" else None)
+        )
+        log = (target / trial["worker_stderr"]).read_text()
+        assert len(log) > 7000 and log.startswith("early message <redacted>") and log.endswith("last message")
+        assert secret not in log
+    assert all(secret not in file.read_text() for file in target.rglob("*") if file.is_file())
 
 
 @pytest.mark.parametrize("reader_name", ["vortex", "parquet"])
