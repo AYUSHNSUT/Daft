@@ -43,9 +43,9 @@ Parquet keeps its normal optimizations. Writer defaults and codec settings are r
 - Use value reductions or drain native batches; neither metadata-only counts nor terminal/Python object rendering measure scan throughput.
 - Run one warmup and at least five measured trials per reported configuration, with a deterministic randomized/interleaved order. Preserve individual samples, median, spread, failures, and regressions.
 - Validate results against an independent oracle outside the timer. Compare integer results exactly and document any floating-point tolerance before measuring. Save optimized/physical plans outside the timing interval.
-- Report wall time, process CPU, peak process RSS with its measurement scope, encoded file sizes, and available requested-read bytes/counts. Unsupported metrics are explicitly unavailable rather than zero. Explain planning-versus-execution counter boundaries.
+- Report wall time, process CPU, peak process RSS with its measurement scope, encoded file sizes, and available execution-source returned-byte counters. Public execution metrics do not expose request counts; report them as unavailable rather than zero. Planning/discovery reads are included in wall time but may be absent from execution-source counters. These counters are not physical device I/O measurements.
 - Identify OS cache state honestly. Repeated runs are warm-cache experiments; a fresh process alone does not establish a cold OS cache. Keep profiling separate from benchmark timings.
-- Record CPU/thread budgets, Vortex request/byte budgets, batch size, file count, hardware, storage path class, and cache policy. Do not publish credentials or signed URLs in artifacts.
+- Record CPU/thread budgets, Vortex request/byte budgets, batch size, file count, hardware, storage path class, and cache policy. Daft compute threads and concurrent scan tasks can be constrained, but separate I/O/Vortex workers mean this is not a globally single-core experiment. Do not publish credentials or signed URLs in artifacts.
 
 ## Tests and acceptance
 
