@@ -12,6 +12,7 @@ from benchmarking.vortex.fixtures import CASES, SCHEMA, batches, generate, load_
 from benchmarking.vortex.run import (
     CONFIGS,
     check_output,
+    file_read_telemetry,
     io_settings,
     query,
     redacted,
@@ -128,6 +129,44 @@ def test_report_retains_failures_and_regressions():
         check_output([{"rows": 2}], [{"rows": 1}])
 
 
+@pytest.mark.parametrize("reported_bytes", [0, 4096])
+def test_local_parquet_file_bytes_are_unavailable_even_when_a_counter_exists(reported_bytes):
+    metrics = [{"category": "Source", "type": "ScanTask", "stats": [("bytes.read", {"value": reported_bytes})]}]
+    result = file_read_telemetry(metrics, config="parquet", storage_root=None)
+    assert result["source_read_bytes"] is None
+    assert result["source_read_bytes_coverage"] == "unavailable"
+    assert "Local Parquet" in result["source_read_bytes_unavailable_reason"]
+    assert result["raw_file_source_read_bytes"] == reported_bytes
+
+
+@pytest.mark.parametrize(
+    "config,storage_root",
+    [("vortex_11", None), ("vortex_11", "s3://bucket"), ("parquet", "s3://bucket"), ("parquet", "https://host/prefix")],
+)
+def test_file_bytes_exclude_join_in_memory_source_and_preserve_instrumented_paths(config, storage_root):
+    metrics = [
+        {"category": "Source", "type": "ScanTask", "stats": [("bytes.read", {"value": 1024})]},
+        {"category": "Source", "type": "ScanTask", "stats": [("bytes.read", {"value": 512})]},
+        {"category": "Source", "type": "InMemoryScan", "stats": [("bytes.read", {"value": 2048})]},
+        {"category": "BlockingSink", "type": "ScanTask", "stats": [("bytes.read", {"value": 8192})]},
+    ]
+    result = file_read_telemetry(metrics, config=config, storage_root=storage_root)
+    assert result["source_read_bytes"] == 1536
+    assert result["raw_file_source_read_bytes"] == 1536
+    assert result["raw_non_file_source_read_bytes"] == 2048
+    assert result["source_read_bytes_coverage"] == "executed_file_sources"
+    assert result["source_read_bytes_unavailable_reason"] is None
+
+
+def test_missing_file_counter_is_unavailable_while_instrumented_zero_is_valid():
+    metrics = [{"category": "Source", "type": "InMemoryScan", "stats": [("bytes.read", {"value": 2048})]}]
+    missing = file_read_telemetry(metrics, config="vortex_11", storage_root=None)
+    assert missing["source_read_bytes"] is None
+    assert missing["raw_file_source_read_bytes"] is None
+    metrics.append({"category": "Source", "type": "ScanTask", "stats": [("bytes.read", {"value": 0})]})
+    assert file_read_telemetry(metrics, config="vortex_11", storage_root=None)["source_read_bytes"] == 0
+
+
 def test_remote_paths_and_secret_redaction(fixture_dir, monkeypatch):
     manifest = load_manifest(fixture_dir / "manifest.json")
     dataset = manifest["datasets"]["sorted/single"]
@@ -235,4 +274,8 @@ def test_isolated_cli_report(fixture_dir, tmp_path):
     assert len(report["trials"]) == 5
     assert {r["output_sha256"] for r in report["trials"]} == {report["trials"][0]["output_sha256"]}
     assert all(r["peak_rss_bytes"] > 0 and r["read_requests"] is None for r in report["trials"])
+    parquet = next(trial for trial in report["trials"] if trial["config"] == "parquet")
+    assert parquet["source_read_bytes"] is None
+    assert parquet["source_read_bytes_coverage"] == "unavailable"
+    assert all(trial["source_read_bytes"] > 0 for trial in report["trials"] if trial["config"] != "parquet")
     assert (tmp_path / "report" / "report.md").is_file()

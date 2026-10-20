@@ -103,9 +103,19 @@ Reports retain every sample/error, expected-output digest, median/min/max times,
 CPU seconds, process peak RSS, encoded file sizes, and source read bytes where
 available. CPU seconds include process threads. RSS is the isolated process
 high-water mark through query completion, including imports/runtime initialization;
-it is not a query allocation delta or total-memory bound. Source read bytes exclude
-planning/discovery reads, and they are not disk-device I/O. Request counts are
-explicitly unavailable because the current source snapshot does not export them.
+it is not a query allocation delta or total-memory bound. Source read bytes include
+only executed file-source nodes (`category=Source`, `type=ScanTask`), including
+their metadata/payload reads. Separate discovery/schema planning and in-memory
+sources, such as the join dimension, are excluded. These are returned bytes, not
+disk-device I/O.
+
+Local Parquet positional reads bypass the relevant I/O statistics, so its
+`source_read_bytes` is explicitly unavailable (`null`), even if a raw counter is
+zero or partial. Vortex local/remote and remote Parquet counters are retained when
+exported. Each trial records coverage/reason fields, raw file/non-file source
+counters for diagnostics, and the original operator metrics; raw counters must
+not be interpreted as complete local Parquet bytes. Request counts remain
+unavailable because the current source snapshot does not export them.
 
 `--threads N` controls Daft compute threads; `--scan-tasks N` controls concurrent
 Daft scan tasks. Neither caps every Vortex/Tokio I/O worker. Defaults preserve the

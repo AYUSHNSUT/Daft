@@ -228,6 +228,36 @@ def environment() -> dict[str, Any]:
     }
 
 
+def file_read_telemetry(
+    operator_metrics: list[dict[str, Any]] | None, *, config: str, storage_root: str | None
+) -> dict[str, Any]:
+    """Separate file-source counters from in-memory sources and known coverage gaps."""
+    file_counts: list[int] = []
+    other_source_counts: list[int] = []
+    for row in operator_metrics or []:
+        if row.get("category") != "Source":
+            continue
+        target = file_counts if row.get("type") == "ScanTask" else other_source_counts
+        target.extend(int(descriptor["value"]) for key, descriptor in row.get("stats", []) if key == "bytes.read")
+    raw_file_bytes = sum(file_counts) if file_counts else None
+    reason = None
+    if config == "parquet" and not storage_root:
+        reason = "Local Parquet positional reads bypass file-source I/O statistics; reported counters are incomplete"
+    elif raw_file_bytes is None:
+        reason = "No bytes.read counter exported by an executed Source/ScanTask node"
+    return {
+        "source_read_bytes": raw_file_bytes if reason is None else None,
+        "source_read_bytes_unavailable_reason": reason,
+        "source_read_bytes_coverage": "executed_file_sources" if reason is None else "unavailable",
+        "source_read_bytes_note": (
+            "Returned bytes reported by executed Source/ScanTask nodes, including their metadata/payload I/O; "
+            "excludes separate discovery/schema planning and in-memory sources; not physical-device I/O"
+        ),
+        "raw_file_source_read_bytes": raw_file_bytes,
+        "raw_non_file_source_read_bytes": sum(other_source_counts) if other_source_counts else None,
+    }
+
+
 def worker(spec: dict[str, Any]) -> dict[str, Any]:
     import daft
     from daft.context import get_context, set_execution_config
@@ -251,19 +281,9 @@ def worker(spec: dict[str, Any]) -> dict[str, Any]:
     # Small aggregate outputs, oracle checks and diagnostic plans are outside timing.
     actual = frame.to_arrow().to_pylist()
     digest = check_output(actual, manifest["oracle"][spec["case"]])
-    io_bytes = None
-    io_reason: str | None = "source bytes.read metric unavailable"
     operator_metrics = None
     try:
         operator_metrics = frame.metrics.to_pylist()
-        counts = [
-            int(descriptor["value"])
-            for row in operator_metrics
-            for key, descriptor in row["stats"]
-            if key == "bytes.read"
-        ]
-        if counts:
-            io_bytes, io_reason = sum(counts), None
         for metric in operator_metrics:
             metric["duration_seconds"] = metric.pop("duration").total_seconds()
     except (AttributeError, ValueError, KeyError, TypeError):
@@ -278,8 +298,7 @@ def worker(spec: dict[str, Any]) -> dict[str, Any]:
         "peak_rss_bytes": peak_rss_bytes,
         "output_sha256": digest,
         "output": actual,
-        "source_read_bytes": io_bytes,
-        "source_read_bytes_unavailable_reason": io_reason,
+        **file_read_telemetry(operator_metrics, config=spec["config"], storage_root=spec.get("storage_root")),
         "read_requests": None,
         "read_requests_unavailable_reason": "SourceSnapshot does not export request counts",
         "operator_metrics": operator_metrics,
@@ -374,7 +393,8 @@ def markdown(report: dict[str, Any]) -> str:
         "",
         "No cache flush was performed; preflight hashes and warmups read the fixtures. A fresh process is not a cold OS cache.",
         "Peak RSS is the trial process high-water mark through query completion, including imports/runtime setup, not an allocation delta.",
-        "Source read bytes exclude planning/discovery; request counts and physical-device I/O are unavailable.",
+        "Source read bytes cover executed file sources only and exclude planning/discovery and in-memory sources. Local Parquet coverage is unavailable; raw counters are diagnostic only.",
+        "Request counts and physical-device I/O are unavailable.",
         "Queries use native value reductions; scan_full touches every column and scan_narrow touches id/value. This is not canonical TPC-H.",
         "Vortex has one Daft task per file; compute-thread settings do not cap every I/O/Vortex thread. See report.json for full provenance.",
         "",
