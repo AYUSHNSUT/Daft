@@ -2,7 +2,7 @@
 
 **Scope:** personal `AYUSHNSUT/Daft` fork. Branch `poc/vortex-phase5` starts at Phase 4 commit `e23bd0b1002d069a09cda84dfdb7e0d46fbb9799`; review target is `poc/vortex-phase4`.
 
-**Status:** implementation and validation in progress. The [Phase 4 results](vortex-phase4-results.md) supply the baseline; the [connector guide](../connectors/vortex.md) defines supported inputs and semantics.
+**Status:** implementation and local/user-terminal validation are complete for this fork's declared scope. The [Phase 5 results](vortex-phase5-results.md) record the metadata comparison, final remote acceptance, shared S3 connector repair and MCAP HTTP compatibility correction. The [Phase 4 results](vortex-phase4-results.md) supply the historical baseline; GitHub/Linux CI for the final revision remains separately unverified. The [connector guide](../connectors/vortex.md) defines supported inputs and semantics.
 
 ## Problem and objective
 
@@ -64,7 +64,7 @@ A failed metadata read must not create tasks with invented zero rows. Repeated p
 
 ## Evaluation and follow-up
 
-Use the existing approximately 1 GiB local fixtures and smaller MinIO corpus. Start with sorted/shuffled and one/eight-file layouts, narrow projections, selective predicates, and joins; retain a wide-scan guard. Measure the full source-creation-through-collection interval and metadata-only time/counters separately. Increase repetitions or investigate outliers before claiming a repeatable gain.
+The completed comparison uses the existing approximately 1 GiB local fixtures and smaller MinIO corpus, with 20 measured repetitions plus warmups. Concurrency 8 lowers the local eight-file metadata-call median by 19.9–23.8% and the final MinIO median by 14.2%, with unchanged requests/returned bytes. End-to-end effects are smaller, observed ranges overlap, and Parquet retains lower medians in all five final remote queries. The [results record](vortex-phase5-results.md) keeps the original local build and final remote build separate and includes remaining regressions and resource costs.
 
 Request merging, discovery fast paths, removal of exact residual predicates, layout-aligned execution splits, and conversion/encoding changes remain subsequent independently measured work. They should follow the remaining bottlenecks rather than be bundled into a metadata experiment.
 

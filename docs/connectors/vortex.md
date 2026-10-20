@@ -183,7 +183,9 @@ schema/count pairs and metadata-only elapsed time plus Daft I/O counters. These
 diagnostics exclude discovery and query execution. Counters are logical I/O
 operations and returned bytes, not physical network traffic or device reads.
 The [Phase 5 design](../contributing/vortex-phase5-design.md) describes the bounded
-metadata comparison and its freshness requirements.
+metadata comparison and its freshness requirements. Its
+[results](../contributing/vortex-phase5-results.md) separate metadata-only cost
+from end-to-end query changes and record final HTTP/MinIO/Ray acceptance.
 
 ## Compatibility matrix
 
@@ -245,3 +247,9 @@ paths; they do not rank Daft against DataFusion or Velox.
 The [Phase 4 results](../contributing/vortex-phase4-results.md) record release-build
 local and MinIO measurements, the join-planning correction, remaining regressions,
 and feature-on/off validation.
+
+The [Phase 5 results](../contributing/vortex-phase5-results.md) compare metadata
+concurrency 1 with 8 in each build. Final MinIO metadata-call medians are 14.2%
+lower at 8 with unchanged requests/returned bytes; query medians improve by
+4.2–9.3% versus 1, while Parquet retains the lower median in all five queries.
+Observed ranges overlap, and these results do not imply a universal speedup.

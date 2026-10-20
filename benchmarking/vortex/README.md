@@ -173,6 +173,9 @@ public-cloud latency or throughput. It does not measure Ray scaling.
 
 ## Metadata planning comparison
 
+The [Phase 5 results](../../docs/contributing/vortex-phase5-results.md) record
+the completed local and MinIO comparisons, build identities and remaining regressions.
+
 Phase 5 adds a separate harness for `read_vortex(metadata_concurrency=...)`.
 It compares Vortex concurrency 1 and 8 in the same release build, alongside
 contemporaneous Parquet query trials. Metadata-only trials report fresh bulk

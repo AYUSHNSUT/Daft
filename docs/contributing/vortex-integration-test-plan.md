@@ -4,7 +4,14 @@
 
 The [Phase 5 plan](vortex-phase5-design.md) adds ordered bulk metadata reads,
 fresh bounded planning windows, HTTP concurrency/failure tests, and a separate
-same-build metadata comparison. Its implementation and acceptance are in progress.
+same-build metadata comparison. Implementation and local/user-terminal acceptance
+are complete; the [results](vortex-phase5-results.md) record 1,428 original local
+trials and 357 final remote trials under separate build identities. Final user
+validation includes 17 HTTP/MinIO/Ray passes with zero skips, four S3 transport
+passes, 112 ORC/MCAP passes with one optional S3 skip, and 2,300 unfiltered Rust
+passes with 20 existing ignores. The shared S3 connector and MCAP HTTP fallback
+regressions are corrected. Final GitHub/Linux execution remains separately
+unverified.
 
 ## Test strategy
 
