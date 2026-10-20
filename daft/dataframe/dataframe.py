@@ -539,19 +539,16 @@ class DataFrame:
         For nested data such as List or Struct arrays, however, this can be expensive. You may wish to set `column_format` to "arrow" such that the nested data is returned as Arrow scalars.
 
         Args:
-            results_buffer_size: how many partitions to allow in the results buffer (defaults to the total number of CPUs
-                available on the machine).
+            results_buffer_size: Maximum queued result partitions during execution. The default, `"num_cpus"`,
+                uses `multiprocessing.cpu_count()`. On the native runner, `None` uses a capacity of one partition.
             column_format: the format of the columns to iterate over. One of "python" or "arrow". Defaults to "python".
 
-        Note: A quick note on configuring asynchronous/parallel execution using `results_buffer_size`.
-            The `results_buffer_size` kwarg controls how many results Daft will allow to be in the buffer while iterating.
-            Once this buffer is filled, Daft will not run any more work until some partition is consumed from the buffer.
+        Note:
+            Native execution can hold one additional result while waiting to enqueue it. Results already returned
+            to the caller and buffers inside operators are additional. A full result queue slows result delivery;
+            it does not stop all upstream work or bound total query memory.
 
-            * Increasing this value means the iterator will consume more memory and CPU resources but have higher throughput
-            * Decreasing this value means the iterator will consume lower memory and CPU resources, but have lower throughput
-            * Setting this value to `None` means the iterator will consume as much resources as it deems appropriate per-iteration
-
-            The default value is the total number of CPUs available on the current machine.
+            Close the returned iterator when stopping early to release its native query resources.
 
         Returns:
             Iterator[dict[str, Any]]: An iterator over the rows of the DataFrame, where each row is a dictionary
@@ -602,15 +599,20 @@ class DataFrame:
             )
 
             # Iterate through partitions.
-            for partition in partitions_iter:
-                if column_format == "python":
-                    yield from python_iter_rows(partition.to_pydict(), len(partition))
-                elif column_format == "arrow":
-                    yield from arrow_iter_rows(partition.to_arrow())
-                else:
-                    raise ValueError(
-                        f"Unsupported column_format: {column_format}, supported formats are 'python' and 'arrow'"
-                    )
+            try:
+                for partition in partitions_iter:
+                    if column_format == "python":
+                        yield from python_iter_rows(partition.to_pydict(), len(partition))
+                    elif column_format == "arrow":
+                        yield from arrow_iter_rows(partition.to_arrow())
+                    else:
+                        raise ValueError(
+                            f"Unsupported column_format: {column_format}, supported formats are 'python' and 'arrow'"
+                        )
+            finally:
+                close = getattr(partitions_iter, "close", None)
+                if close is not None:
+                    close()
 
     @DataframePublicAPI
     def to_arrow_iter(
@@ -620,15 +622,15 @@ class DataFrame:
         """Return an iterator of pyarrow recordbatches for this dataframe.
 
         Args:
-            results_buffer_size: how many partitions to allow in the results buffer (defaults to the total number of CPUs
-                available on the machine).
-        Note: A quick note on configuring asynchronous/parallel execution using `results_buffer_size`.
-            The `results_buffer_size` kwarg controls how many results Daft will allow to be in the buffer while iterating.
-            Once this buffer is filled, Daft will not run any more work until some partition is consumed from the buffer.
-            * Increasing this value means the iterator will consume more memory and CPU resources but have higher throughput
-            * Decreasing this value means the iterator will consume lower memory and CPU resources, but have lower throughput
-            * Setting this value to `None` means the iterator will consume as much resources as it deems appropriate per-iteration
-            The default value is the total number of CPUs available on the current machine.
+            results_buffer_size: Maximum queued result partitions during execution. The default, `"num_cpus"`,
+                uses `multiprocessing.cpu_count()`. On the native runner, `None` uses a capacity of one partition.
+
+        Note:
+            Native execution can hold one additional result while waiting to enqueue it. Results already returned
+            to the caller and buffers inside operators are additional. A full result queue slows result delivery;
+            it does not stop all upstream work or bound total query memory.
+
+            Close the returned iterator when stopping early to release its native query resources.
 
         Returns:
             Iterator[pyarrow.RecordBatch]: An iterator over the RecordBatches of the DataFrame.
@@ -665,8 +667,13 @@ class DataFrame:
             )
 
             # Iterate through partitions.
-            for partition in partitions_iter:
-                yield from partition.to_arrow().to_batches()
+            try:
+                for partition in partitions_iter:
+                    yield from partition.to_arrow().to_batches()
+            finally:
+                close = getattr(partitions_iter, "close", None)
+                if close is not None:
+                    close()
 
     @DataframePublicAPI
     def iter_partitions(
@@ -678,18 +685,15 @@ class DataFrame:
         or a ray ObjectRef (if using Ray runner backend).
 
         Args:
-            results_buffer_size: how many partitions to allow in the results buffer (defaults to the total number of CPUs
-                available on the machine).
+            results_buffer_size: Maximum queued result partitions during execution. The default, `"num_cpus"`,
+                uses `multiprocessing.cpu_count()`. On the native runner, `None` uses a capacity of one partition.
 
-        Note: A quick note on configuring asynchronous/parallel execution using `results_buffer_size`.
-            The `results_buffer_size` kwarg controls how many results Daft will allow to be in the buffer while iterating.
-            Once this buffer is filled, Daft will not run any more work until some partition is consumed from the buffer.
+        Note:
+            Native execution can hold one additional result while waiting to enqueue it. Results already returned
+            to the caller and buffers inside operators are additional. A full result queue slows result delivery;
+            it does not stop all upstream work or bound total query memory.
 
-            * Increasing this value means the iterator will consume more memory and CPU resources but have higher throughput
-            * Decreasing this value means the iterator will consume lower memory and CPU resources, but have lower throughput
-            * Setting this value to `None` means the iterator will consume as much resources as it deems appropriate per-iteration
-
-            The default value is the total number of CPUs available on the current machine.
+            Close the returned iterator when stopping early to release its native query resources.
 
         Returns:
             Iterator[Union[MicroPartition, ray.ObjectRef]]: An iterator over the partitions of the DataFrame.
@@ -737,8 +741,13 @@ class DataFrame:
             results_iter: Iterator[MaterializedResult[Any]] = get_or_create_runner().run_iter(
                 self._builder, results_buffer_size=results_buffer_size
             )
-            for result in results_iter:
-                yield result.partition()
+            try:
+                for result in results_iter:
+                    yield result.partition()
+            finally:
+                close = getattr(results_iter, "close", None)
+                if close is not None:
+                    close()
 
     def _populate_preview(self) -> None:
         """Populates the preview of the DataFrame, if it is not already populated."""

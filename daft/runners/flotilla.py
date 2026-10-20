@@ -254,39 +254,42 @@ class RaySwordfishActor:
                 buf_bytes = 0
                 return merged
 
-            async for partition in result_handle:
-                if isinstance(partition, FlightPartitionRef):
-                    is_flight_shuffle = True
-                    metas.append(PartitionMetadata.from_flight_partition_ref(partition))
-                    partition_refs.append(partition)
-                    continue
-                if not isinstance(partition, PyMicroPartition):
-                    break
-                mp = MicroPartition._from_pymicropartition(partition)
-                if target_bytes <= 0:
-                    metas.append(PartitionMetadata.from_table(mp))
-                    yield mp
-                    continue
-                buf.append(mp)
-                # An unknown size collapses to target_bytes so we flush immediately rather than
-                # buffering unboundedly when size metadata is missing.
-                buf_bytes += mp.size_bytes() or target_bytes
-                if buf_bytes >= target_bytes:
+            try:
+                async for partition in result_handle:
+                    if isinstance(partition, FlightPartitionRef):
+                        is_flight_shuffle = True
+                        metas.append(PartitionMetadata.from_flight_partition_ref(partition))
+                        partition_refs.append(partition)
+                        continue
+                    if not isinstance(partition, PyMicroPartition):
+                        break
+                    mp = MicroPartition._from_pymicropartition(partition)
+                    if target_bytes <= 0:
+                        metas.append(PartitionMetadata.from_table(mp))
+                        yield mp
+                        continue
+                    buf.append(mp)
+                    # An unknown size collapses to target_bytes so we flush immediately rather than
+                    # buffering unboundedly when size metadata is missing.
+                    buf_bytes += mp.size_bytes() or target_bytes
+                    if buf_bytes >= target_bytes:
+                        yield flush()
+
+                # batch flight partition refs before sending the scheduler
+                if partition_refs:
+                    yield FlightPartitions(partition_refs)
+
+                if buf:
                     yield flush()
 
-            # batch flight partition refs before sending the scheduler
-            if partition_refs:
-                yield FlightPartitions(partition_refs)
-
-            if buf:
-                yield flush()
-
-            stats = await result_handle.try_finish()
-            yield SwordfishTaskMetadata(
-                partition_metadatas=metas,
-                stats=stats.encode(),
-                is_flight_shuffle=is_flight_shuffle,
-            )
+                stats = await result_handle.try_finish()
+                yield SwordfishTaskMetadata(
+                    partition_metadatas=metas,
+                    stats=stats.encode(),
+                    is_flight_shuffle=is_flight_shuffle,
+                )
+            finally:
+                await result_handle.aclose()
 
 
 @ray.remote  # type: ignore[untyped-decorator]

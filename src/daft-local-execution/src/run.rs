@@ -1,3 +1,5 @@
+#[cfg(any(feature = "python", test))]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -39,9 +41,35 @@ use {
     daft_micropartition::python::PyMicroPartition,
     daft_partition_refs::PyFlightPartitionRef,
     pyo3::{
-        Bound, IntoPyObject, PyAny, PyRef, PyResult, Python, pyclass, pymethods, sync::MutexExt,
+        Bound, IntoPyObject, PyAny, PyRef, PyResult, Python,
+        exceptions::{PyTypeError, PyValueError},
+        pyclass, pymethods,
+        sync::MutexExt,
+        types::{PyAnyMethods, PyBool, PyInt},
     },
 };
+
+#[cfg(feature = "python")]
+fn extract_results_buffer_size(value: &Bound<'_, PyAny>) -> PyResult<Option<usize>> {
+    if value.is_none() {
+        return Ok(None);
+    }
+    if value.is_instance_of::<PyBool>() || value.cast::<PyInt>().is_err() {
+        return Err(PyTypeError::new_err(
+            "results_buffer_size must be a positive integer or None",
+        ));
+    }
+    let size = value.extract::<usize>().map_err(|_| {
+        PyValueError::new_err("results_buffer_size must be a positive integer or None")
+    })?;
+    if size == 0 || size > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(PyValueError::new_err(format!(
+            "results_buffer_size must be between 1 and {} or None",
+            tokio::sync::Semaphore::MAX_PERMITS,
+        )));
+    }
+    Ok(Some(size))
+}
 
 use crate::{
     ExecutionRuntimeContext,
@@ -57,6 +85,101 @@ use crate::{
 enum ExecutionEngineResultItem {
     Partition(MicroPartition),
     FlightPartitionRef(FlightPartitionRef),
+}
+
+#[derive(Clone)]
+enum ResultSender {
+    Bounded(Sender<ExecutionEngineResultItem>),
+    Unbounded(UnboundedSender<ExecutionEngineResultItem>),
+}
+
+impl ResultSender {
+    async fn send(&self, item: ExecutionEngineResultItem) {
+        match self {
+            Self::Bounded(sender) => {
+                let _ = sender.send(item).await;
+            }
+            Self::Unbounded(sender) => {
+                let _ = sender.send(item);
+            }
+        }
+    }
+}
+
+enum ResultReceiver {
+    Bounded(crate::channel::Receiver<ExecutionEngineResultItem>),
+    Unbounded(crate::channel::UnboundedReceiver<ExecutionEngineResultItem>),
+}
+
+impl ResultReceiver {
+    async fn recv(&mut self) -> Option<ExecutionEngineResultItem> {
+        match self {
+            Self::Bounded(receiver) => receiver.recv().await,
+            Self::Unbounded(receiver) => receiver.recv().await,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ResultOutput {
+    sender: ResultSender,
+    cancel: CancellationToken,
+}
+
+impl ResultOutput {
+    async fn send(self, item: ExecutionEngineResultItem) {
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => {}
+            () = self.sender.send(item) => {}
+        }
+    }
+}
+
+fn create_result_channel(capacity: Option<usize>) -> (ResultOutput, ExecutionEngineResult) {
+    let (sender, receiver) = match capacity {
+        Some(capacity) => {
+            let (sender, receiver) = create_channel(capacity);
+            (
+                ResultSender::Bounded(sender),
+                ResultReceiver::Bounded(receiver),
+            )
+        }
+        None => {
+            let (sender, receiver) = create_unbounded_channel();
+            (
+                ResultSender::Unbounded(sender),
+                ResultReceiver::Unbounded(receiver),
+            )
+        }
+    };
+    let cancel = CancellationToken::new();
+    (
+        ResultOutput {
+            sender,
+            cancel: cancel.clone(),
+        },
+        ExecutionEngineResult {
+            receiver,
+            cancel,
+            exhausted: false,
+        },
+    )
+}
+
+fn result_buffer_capacity(
+    is_flotilla_worker: bool,
+    requested: Option<usize>,
+) -> DaftResult<Option<usize>> {
+    if requested.is_some_and(|size| size == 0 || size > tokio::sync::Semaphore::MAX_PERMITS) {
+        return Err(common_error::DaftError::ValueError(format!(
+            "results_buffer_size must be between 1 and {} or None",
+            tokio::sync::Semaphore::MAX_PERMITS,
+        )));
+    }
+    // Local callers always have a finite result queue. Shared Flotilla workers
+    // keep their existing transport unless a caller explicitly opts in.
+    Ok(requested.or_else(|| (!is_flotilla_worker).then_some(1)))
 }
 
 /// Global tokio runtime shared by all NativeExecutor instances
@@ -99,12 +222,12 @@ pub(crate) struct EnqueueInputMessage {
     /// Plan inputs grouped by source_id
     inputs: HashMap<SourceId, Input>,
     /// Sender for results of this input_id
-    result_sender: UnboundedSender<ExecutionEngineResultItem>,
+    result_sender: ResultOutput,
 }
 
 /// Routes pipeline messages to per-input_id channels.
 struct MessageRouter {
-    output_senders: HashMap<InputId, UnboundedSender<ExecutionEngineResultItem>>,
+    output_senders: HashMap<InputId, ResultOutput>,
     /// Wall-clock start instant when each `input_id` was enqueued to the pipeline.
     input_start_times: HashMap<InputId, Instant>,
 }
@@ -118,39 +241,41 @@ impl MessageRouter {
     }
 
     /// Route a message to the appropriate channel based on its input_id.
-    fn route_message(&mut self, msg: PipelineMessage) {
+    fn route_message(&mut self, msg: PipelineMessage) -> Option<BoxFuture<'static, ()>> {
         match msg {
             PipelineMessage::Flush(input_id) => {
                 self.input_start_times.remove(&input_id);
                 self.output_senders.remove(&input_id);
+                None
             }
             PipelineMessage::Morsel {
                 input_id,
                 partition,
-            } => {
-                if let Some(sender) = self.output_senders.get(&input_id) {
-                    let _ = sender.send(ExecutionEngineResultItem::Partition(partition));
-                }
-            }
+            } => self.output_senders.get(&input_id).cloned().map(|sender| {
+                sender
+                    .send(ExecutionEngineResultItem::Partition(partition))
+                    .boxed()
+            }),
             PipelineMessage::FlightPartitionRef {
                 input_id,
                 partition_ref,
-            } => {
-                if let Some(sender) = self.output_senders.get(&input_id) {
-                    let _ =
-                        sender.send(ExecutionEngineResultItem::FlightPartitionRef(partition_ref));
-                }
-            }
+            } => self.output_senders.get(&input_id).cloned().map(|sender| {
+                sender
+                    .send(ExecutionEngineResultItem::FlightPartitionRef(partition_ref))
+                    .boxed()
+            }),
         }
     }
 
-    fn insert_output_sender(
-        &mut self,
-        input_id: InputId,
-        sender: UnboundedSender<ExecutionEngineResultItem>,
-    ) {
+    fn insert_output_sender(&mut self, input_id: InputId, sender: ResultOutput) {
         self.input_start_times.insert(input_id, Instant::now());
         self.output_senders.insert(input_id, sender);
+    }
+
+    fn has_unfinished_consumers(&self) -> bool {
+        self.output_senders
+            .values()
+            .any(|output| !output.cancel.is_cancelled())
     }
 }
 
@@ -168,9 +293,13 @@ impl Drop for MessageRouter {
 /// Per-plan execution state
 struct PlanState {
     task_handle: RuntimeTask<DaftResult<()>>,
+    cancel: CancellationToken,
     enqueue_input_sender: Sender<EnqueueInputMessage>,
     stats_handle: RuntimeStatsManagerHandle,
     active_input_ids: HashSet<InputId>,
+    // A canceled input can still have work/Flush messages in the shared
+    // pipeline. Its id must not be assigned to a new consumer in this plan.
+    abandoned_input_ids: HashSet<InputId>,
     skipped_corrupt_files: Arc<std::sync::Mutex<Vec<(String, String, bool)>>>,
 }
 
@@ -208,7 +337,7 @@ impl PyNativeExecutor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (local_physical_plan, daft_ctx, input_id, inputs, context=None, maintain_order=true))]
+    #[pyo3(signature = (local_physical_plan, daft_ctx, input_id, inputs, context=None, maintain_order=true, *, results_buffer_size=None))]
     pub fn run<'py>(
         &self,
         py: Python<'py>,
@@ -218,31 +347,39 @@ impl PyNativeExecutor {
         inputs: HashMap<SourceId, Input>,
         context: Option<HashMap<String, String>>,
         maintain_order: bool,
+        #[pyo3(from_py_with = extract_results_buffer_size)] results_buffer_size: Option<usize>,
     ) -> PyResult<Bound<'py, pyo3::PyAny>> {
         let daft_ctx: &DaftContext = daft_ctx.into();
         let plan = local_physical_plan.plan.clone();
         let exec_cfg = daft_ctx.execution_config();
         let subscribers = daft_ctx.subscribers();
         let (fingerprint, enqueue_future) = {
-            self.executor.lock_py_attached(py).unwrap().run(
-                &plan,
-                exec_cfg,
-                subscribers,
-                context,
-                inputs,
-                input_id,
-                maintain_order,
-            )?
+            self.executor
+                .lock_py_attached(py)
+                .unwrap()
+                .run_with_result_buffer(
+                    &plan,
+                    exec_cfg,
+                    subscribers,
+                    context,
+                    inputs,
+                    input_id,
+                    maintain_order,
+                    results_buffer_size,
+                )?
         };
 
         let executor = self.executor.clone();
+        let registration = InputRegistration {
+            executor,
+            fingerprint,
+            input_id,
+            active: AtomicBool::new(true),
+        };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let result = enqueue_future.await?;
             Ok(PyResultReceiver {
-                result: Arc::new(tokio::sync::Mutex::new(Some(result))),
-                fingerprint,
-                input_id,
-                executor,
+                handle: Arc::new(ResultHandle::new(result, registration)),
             })
         })
     }
@@ -346,12 +483,16 @@ async fn run_execution_loop(
     let mut message_router = MessageRouter::new();
     let mut input_senders = Some(input_senders);
     let mut input_exhausted = false;
+    // Keep at most one result outside the bounded receiver. While a send is
+    // blocked, still observe cancellation, input registration, and task errors.
+    let mut pending_output: Option<BoxFuture<'static, ()>> = None;
+    let mut drain_workers = false;
 
     let (result, finish_status) = loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => {
-                println!("Execution engine cancelled");
+                log::debug!("Execution engine cancelled");
                 break (Ok(()), QueryEndState::Canceled);
             }
             _ = tokio::signal::ctrl_c() => {
@@ -382,27 +523,90 @@ async fn run_execution_loop(
                     input_exhausted = true;
                 }
             }
-            msg = output_receiver.recv() => {
+            () = async { pending_output.as_mut().unwrap().await }, if pending_output.is_some() => {
+                pending_output = None;
+            }
+            msg = output_receiver.recv(), if pending_output.is_none() => {
                 match msg {
                     Some(msg) => {
-                        message_router.route_message(msg);
+                        pending_output = message_router.route_message(msg);
                     }
                     None => {
-                        // Pipeline finished. Close result channels so waiters
-                        // unblock, then drain runtime tasks.
-                        drop(message_router);
-                        let res = runtime_handle.shutdown().await;
-                        let status = if res.is_ok() { QueryEndState::Finished } else { QueryEndState::Failed };
-                        break (res, status);
+                        // A channel can close before a nested worker reports its
+                        // error. Without a successful Flush, do not abort that
+                        // worker and turn the failure into successful EOF.
+                        drain_workers = message_router.has_unfinished_consumers();
+                        break (Ok(()), QueryEndState::Finished);
                     }
                 }
             }
         }
     };
 
+    drop(pending_output);
+    // No more inputs can run once the root output closes. Mark the pipeline
+    // dead before waking consumers, including while delayed errors drain.
+    drop(enqueue_input_rx);
+    drop(message_router);
+    drop(output_receiver);
+    drop(input_senders);
+    let (result, finish_status) = finish_runtime_tasks(
+        &mut runtime_handle,
+        &cancel,
+        drain_workers,
+        result,
+        finish_status,
+    )
+    .await;
     stats_manager.finish(finish_status).await;
     flush_opentelemetry_providers();
     result
+}
+
+async fn finish_runtime_tasks(
+    runtime_handle: &mut ExecutionRuntimeContext,
+    cancel: &CancellationToken,
+    drain_workers: bool,
+    mut result: DaftResult<()>,
+    mut finish_status: QueryEndState,
+) -> (DaftResult<()>, QueryEndState) {
+    if drain_workers {
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    finish_status = QueryEndState::Canceled;
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    finish_status = QueryEndState::Canceled;
+                    break;
+                }
+                joined = runtime_handle.join_next() => {
+                    match joined {
+                        None => break,
+                        Some(Ok(())) => {},
+                        Some(Err(error)) => {
+                            result = Err(error);
+                            finish_status = QueryEndState::Failed;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Explicit close and genuine Flush/limit completion still abort pending
+    // work; they must not wait for blocked or unneeded upstream input.
+    let shutdown_result = runtime_handle.shutdown().await;
+    if result.is_ok()
+        && matches!(finish_status, QueryEndState::Finished)
+        && let Err(error) = shutdown_result
+    {
+        result = Err(error);
+        finish_status = QueryEndState::Failed;
+    }
+    (result, finish_status)
 }
 
 pub struct NativeExecutor {
@@ -455,6 +659,31 @@ impl NativeExecutor {
         input_id: InputId,
         maintain_order: bool,
     ) -> DaftResult<(u64, BoxFuture<'static, DaftResult<ExecutionEngineResult>>)> {
+        self.run_with_result_buffer(
+            local_physical_plan,
+            exec_cfg,
+            subscribers,
+            additional_context,
+            inputs,
+            input_id,
+            maintain_order,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_with_result_buffer(
+        &mut self,
+        local_physical_plan: &LocalPhysicalPlanRef,
+        exec_cfg: Arc<DaftExecutionConfig>,
+        subscribers: Vec<Arc<dyn Subscriber>>,
+        additional_context: Option<HashMap<String, String>>,
+        inputs: HashMap<SourceId, Input>,
+        input_id: InputId,
+        maintain_order: bool,
+        results_buffer_size: Option<usize>,
+    ) -> DaftResult<(u64, BoxFuture<'static, DaftResult<ExecutionEngineResult>>)> {
+        let capacity = result_buffer_capacity(self.is_flotilla_worker, results_buffer_size)?;
         let (query_id, fingerprint, task_id) = parse_context(additional_context.as_ref());
 
         if self.is_flotilla_worker {
@@ -488,7 +717,7 @@ impl NativeExecutor {
         };
 
         if !self.plans.contains_key(&fingerprint) {
-            let cancel = self.cancel.clone();
+            let cancel = self.cancel.child_token();
             let additional_context = additional_context.unwrap_or_default();
             let shuffle_address = self.shuffle_address();
             let ctx = BuilderContext::new_with_context(
@@ -515,7 +744,7 @@ impl NativeExecutor {
 
             let input_senders = Arc::new(input_senders);
             let task = run_execution_loop(
-                cancel,
+                cancel.clone(),
                 stats_manager,
                 enqueue_input_rx,
                 input_senders,
@@ -528,9 +757,11 @@ impl NativeExecutor {
                 fingerprint,
                 PlanState {
                     task_handle,
+                    cancel,
                     enqueue_input_sender: enqueue_input_tx,
                     stats_handle,
                     active_input_ids: HashSet::new(),
+                    abandoned_input_ids: HashSet::new(),
                     skipped_corrupt_files: ctx.skipped_corrupt_files.clone(),
                 },
             );
@@ -538,12 +769,21 @@ impl NativeExecutor {
 
         let plan_state = self.plans.get_mut(&fingerprint).unwrap();
         let enqueue_input_sender = plan_state.enqueue_input_sender.clone();
-        plan_state.active_input_ids.insert(input_id);
+        if plan_state.abandoned_input_ids.contains(&input_id) {
+            return Err(common_error::DaftError::ValueError(format!(
+                "input_id {input_id} was abandoned and cannot be reused while plan {fingerprint} remains active"
+            )));
+        }
+        if !plan_state.active_input_ids.insert(input_id) {
+            return Err(common_error::DaftError::ValueError(format!(
+                "input_id {input_id} is already active for plan {fingerprint}"
+            )));
+        }
 
         Ok((
             fingerprint,
             async move {
-                let (result_tx, result_rx) = create_unbounded_channel();
+                let (result_tx, result) = create_result_channel(capacity);
                 let enqueue_msg = EnqueueInputMessage {
                     input_id,
                     inputs,
@@ -560,9 +800,7 @@ impl NativeExecutor {
                     dispatch_task_start_event(&subscribers, &event);
                 }
 
-                Ok(ExecutionEngineResult {
-                    receiver: result_rx,
-                })
+                Ok(result)
             }
             .boxed(),
         ))
@@ -628,6 +866,31 @@ impl NativeExecutor {
         self.plans.remove(&fingerprint);
     }
 
+    /// Abandon one result consumer. Other inputs sharing the pipeline remain
+    /// active; only the last consumer can cancel the entire plan.
+    #[cfg(any(feature = "python", test))]
+    fn cancel_input(&mut self, fingerprint: u64, input_id: InputId) -> BoxFuture<'static, ()> {
+        let Some(plan) = self.plans.get_mut(&fingerprint) else {
+            return async {}.boxed();
+        };
+        if !plan.active_input_ids.remove(&input_id) {
+            return async {}.boxed();
+        }
+        if !plan.active_input_ids.is_empty() {
+            plan.abandoned_input_ids.insert(input_id);
+            return async {}.boxed();
+        }
+        let plan = self.plans.remove(&fingerprint).unwrap();
+        plan.cancel.cancel();
+        drop(plan.enqueue_input_sender);
+        async move {
+            // Deliberate cancellation must not replace the consumer's error.
+            // Normal EOF uses try_finish and still propagates execution errors.
+            let _ = plan.task_handle.await;
+        }
+        .boxed()
+    }
+
     fn repr_ascii(
         logical_plan_builder: &LogicalPlanBuilder,
         cfg: Arc<DaftExecutionConfig>,
@@ -677,12 +940,21 @@ impl Drop for NativeExecutor {
 }
 
 pub struct ExecutionEngineResult {
-    receiver: crate::channel::UnboundedReceiver<ExecutionEngineResultItem>,
+    receiver: ResultReceiver,
+    cancel: CancellationToken,
+    exhausted: bool,
 }
 
 impl ExecutionEngineResult {
     async fn next(&mut self) -> Option<ExecutionEngineResultItem> {
-        self.receiver.recv().await
+        tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => None,
+            item = self.receiver.recv() => {
+                self.exhausted = item.is_none();
+                item
+            }
+        }
     }
 
     /// Consume all pipeline output for this input_id until EOF, returning any
@@ -693,7 +965,7 @@ impl ExecutionEngineResult {
     /// production Python `__anext__` loop does.
     pub async fn collect_partitions_for_testing(mut self) -> Vec<MicroPartition> {
         let mut out = Vec::new();
-        while let Some(item) = self.receiver.recv().await {
+        while let Some(item) = self.next().await {
             if let ExecutionEngineResultItem::Partition(p) = item {
                 out.push(p);
             }
@@ -702,15 +974,97 @@ impl ExecutionEngineResult {
     }
 }
 
-#[cfg_attr(
-    feature = "python",
-    pyclass(module = "daft.daft", name = "PyResultReceiver", frozen)
-)]
-pub struct PyResultReceiver {
-    result: Arc<tokio::sync::Mutex<Option<ExecutionEngineResult>>>,
+impl Drop for ExecutionEngineResult {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+/// Also owns registration while the asynchronous enqueue is pending. Dropping
+/// that future must not leave a plan/input in the executor registry.
+#[cfg(any(feature = "python", test))]
+struct InputRegistration {
+    executor: Arc<Mutex<NativeExecutor>>,
     fingerprint: u64,
     input_id: InputId,
-    executor: Arc<Mutex<NativeExecutor>>,
+    active: AtomicBool,
+}
+
+#[cfg(any(feature = "python", test))]
+impl Drop for InputRegistration {
+    fn drop(&mut self) {
+        if self.active.swap(false, Ordering::AcqRel)
+            && let Ok(mut executor) = self.executor.lock()
+        {
+            let cleanup = executor.cancel_input(self.fingerprint, self.input_id);
+            get_global_runtime().spawn(cleanup);
+        }
+    }
+}
+
+#[cfg(any(feature = "python", test))]
+struct ResultHandle {
+    result: tokio::sync::Mutex<Option<ExecutionEngineResult>>,
+    cancel: CancellationToken,
+    registration: InputRegistration,
+}
+
+#[cfg(any(feature = "python", test))]
+impl ResultHandle {
+    fn new(result: ExecutionEngineResult, registration: InputRegistration) -> Self {
+        Self {
+            cancel: result.cancel.clone(),
+            result: tokio::sync::Mutex::new(Some(result)),
+            registration,
+        }
+    }
+
+    async fn next(&self) -> Option<ExecutionEngineResultItem> {
+        let mut result = self.result.lock().await;
+        match result.as_mut() {
+            Some(result) => result.next().await,
+            None => None,
+        }
+    }
+
+    async fn finish(&self, abandon: bool) -> DaftResult<ExecutionStats> {
+        // Both finish and close stop consumption. Wake any pending next before
+        // acquiring its mutex; the recorded EOF distinguishes normal finish.
+        self.cancel.cancel();
+        let mut result_guard = self.result.lock().await;
+        let Some(result) = result_guard.take() else {
+            return Ok(ExecutionStats::new(QueryID::from(""), vec![]));
+        };
+        let exhausted = result.exhausted;
+        drop(result);
+        self.registration.active.store(false, Ordering::Release);
+        let InputRegistration {
+            executor,
+            fingerprint,
+            input_id,
+            ..
+        } = &self.registration;
+        if abandon || !exhausted {
+            let cleanup = executor
+                .lock()
+                .unwrap()
+                .cancel_input(*fingerprint, *input_id);
+            cleanup.await;
+            Ok(ExecutionStats::new(QueryID::from(""), vec![]))
+        } else {
+            let finish = executor
+                .lock()
+                .unwrap()
+                .try_finish(*fingerprint, *input_id)?;
+            finish.await
+        }
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyclass(module = "daft.daft", name = "PyResultReceiver", frozen)]
+pub struct PyResultReceiver {
+    handle: Arc<ResultHandle>,
 }
 
 #[cfg(feature = "python")]
@@ -721,14 +1075,9 @@ impl PyResultReceiver {
     }
 
     fn __anext__<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, pyo3::PyAny>> {
-        let result = self.result.clone();
+        let handle = self.handle.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut result = result.lock().await;
-            let part = result
-                .as_mut()
-                .expect("PyResultReceiver.__anext__() should not be called after try_finish().")
-                .next()
-                .await;
+            let part = handle.next().await;
             Python::attach(|py| {
                 Ok(match part {
                     None => py.None(),
@@ -750,22 +1099,19 @@ impl PyResultReceiver {
     }
 
     fn try_finish<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let result = self.result.clone();
-        let executor = self.executor.clone();
-        let fingerprint = self.fingerprint;
-        let input_id = self.input_id;
+        let handle = self.handle.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // Take the result to drop the receiver
-            let mut result = result.lock().await;
-            let _ = result
-                .take()
-                .expect("PyResultReceiver.try_finish() should not be called more than once.");
-            drop(result);
-
-            // Delegate to NativeExecutor::try_finish
-            let finish_future = executor.lock().unwrap().try_finish(fingerprint, input_id)?;
-            let stats = finish_future.await?;
+            let stats = handle.finish(false).await?;
             Ok(PyExecutionStats::from(stats))
+        })
+    }
+
+    fn aclose<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.handle.clone();
+        handle.cancel.cancel();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            handle.finish(true).await?;
+            Ok(())
         })
     }
 }
@@ -777,3 +1123,7 @@ fn dispatch_task_start_event(subscribers: &[Arc<dyn Subscriber>], event: &Event)
         }
     }
 }
+
+#[cfg(test)]
+#[path = "run_tests.rs"]
+mod tests;

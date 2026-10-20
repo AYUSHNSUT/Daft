@@ -124,12 +124,12 @@ class NativeRunner(Runner[MicroPartition]):
         heartbeat.start()
 
         try:
-            return (yield from self._optimize_and_execute(builder, query_id))
+            return (yield from self._optimize_and_execute(builder, query_id, results_buffer_size))
         finally:
             heartbeat.stop()
 
     def _optimize_and_execute(
-        self, builder: LogicalPlanBuilder, query_id: str
+        self, builder: LogicalPlanBuilder, query_id: str, results_buffer_size: int | None = None
     ) -> Generator[LocalMaterializedResult, None, ExecutionMetadata]:
         ctx = get_context()
 
@@ -156,6 +156,7 @@ class NativeRunner(Runner[MicroPartition]):
             inputs,
             ctx,
             {"query_id": query_id},
+            results_buffer_size=results_buffer_size,
         )
 
         try:
@@ -190,12 +191,19 @@ class NativeRunner(Runner[MicroPartition]):
             query_result = PyQueryResult(QueryEndState.Failed, err_msg)
             ctx._notify_query_end(query_id, query_result)
             raise e
+        finally:
+            # Propagate abandonment explicitly through the async/native bridge.
+            results_gen.close()
 
     def run_iter_tables(
         self, builder: LogicalPlanBuilder, results_buffer_size: int | None = None
     ) -> Iterator[MicroPartition]:
-        for result in self.run_iter(builder, results_buffer_size=results_buffer_size):
-            yield result.partition()
+        results = self.run_iter(builder, results_buffer_size=results_buffer_size)
+        try:
+            for result in results:
+                yield result.partition()
+        finally:
+            results.close()
 
     def run(self, builder: LogicalPlanBuilder) -> tuple[PartitionCacheEntry, ExecutionMetadata]:
         results_gen = self.run_iter(builder)
@@ -209,6 +217,8 @@ class NativeRunner(Runner[MicroPartition]):
                 i += 1
         except StopIteration as e:
             metadata = e.value
+        finally:
+            results_gen.close()
 
         pset_entry = self.put_partition_set_into_cache(result_pset)
         return pset_entry, metadata
