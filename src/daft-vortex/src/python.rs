@@ -1,19 +1,55 @@
+use common_io_config::python::IOConfig;
 use daft_core::{prelude::Field, python::PySchema};
 use daft_dsl::python::PyExpr;
-use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict, wrap_pyfunction};
+use pyo3::{
+    exceptions::{PyTypeError, PyValueError},
+    prelude::*,
+    types::{PyBool, PyDict, PyInt},
+    wrap_pyfunction,
+};
 use vortex::{VortexSessionDefault, arrow::ArrowSessionExt, session::VortexSession};
 
 use crate::{
     VortexConvertOptions, VortexReadOptions, plan::plan_scan, read::NULLABILITY_METADATA_KEY,
 };
 
-#[pyfunction]
-fn read_vortex_schema(py: Python<'_>, uri: &str) -> PyResult<PySchema> {
+fn strict_vortex_budget(value: &Bound<'_, PyAny>) -> PyResult<usize> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(
+            "Vortex request budgets must be positive integers, not bool",
+        ));
+    }
+    let budget = value.cast::<PyInt>()?.extract::<usize>()?;
+    if budget == 0 {
+        return Err(PyValueError::new_err(
+            "Vortex request budgets must be positive integers",
+        ));
+    }
+    Ok(budget)
+}
+
+#[pyfunction(signature = (uri, io_config=None, *, max_concurrent_requests=8, max_in_flight_bytes=67108864))]
+fn read_vortex_schema(
+    py: Python<'_>,
+    uri: &str,
+    io_config: Option<IOConfig>,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_concurrent_requests: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_in_flight_bytes: usize,
+) -> PyResult<PySchema> {
     let uri = uri.to_string();
     py.detach(move || {
+        let options = VortexReadOptions {
+            max_concurrent_requests,
+            max_in_flight_bytes,
+            ..Default::default()
+        };
+        crate::io::validate_options(&options)?;
+        let client = daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())?;
+        let stats = daft_io::IOStatsContext::new("Vortex schema inference");
         let runtime = common_runtime::get_io_runtime(true);
-        let schema = runtime
-            .block_within_async_context(async move { crate::read_vortex_schema(&uri).await })??;
+        let schema = runtime.block_within_async_context(async move {
+            crate::read_vortex_schema(&uri, client, stats, options).await
+        })??;
         Ok(schema.into())
     })
 }

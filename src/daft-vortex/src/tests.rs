@@ -17,13 +17,35 @@ use vortex::{
     file::WriteOptionsSessionExt, io::session::RuntimeSessionExt, session::VortexSession,
 };
 
-use crate::{
-    VortexConvertOptions, VortexReadOptions, read::NULLABILITY_METADATA_KEY, read_vortex_schema,
-    stream_vortex,
-};
+use crate::{VortexConvertOptions, VortexReadOptions, read::NULLABILITY_METADATA_KEY};
 
 #[path = "semantics_tests.rs"]
 mod semantics_tests;
+
+async fn read_vortex_schema(uri: &str) -> DaftResult<SchemaRef> {
+    crate::read_vortex_schema(
+        uri,
+        Arc::new(daft_io::IOClient::new(Default::default())?),
+        daft_io::IOStatsContext::new("Vortex schema test"),
+        VortexReadOptions::default(),
+    )
+    .await
+}
+
+async fn stream_vortex(
+    uri: &str,
+    read: VortexReadOptions,
+    convert: VortexConvertOptions,
+) -> DaftResult<futures::stream::BoxStream<'static, DaftResult<RecordBatch>>> {
+    crate::stream_vortex(
+        uri,
+        Arc::new(daft_io::IOClient::new(Default::default())?),
+        daft_io::IOStatsContext::new("Vortex scan test"),
+        read,
+        convert,
+    )
+    .await
+}
 
 fn primitive_batch(value_nullable: bool) -> ArrowRecordBatch {
     let value = if value_nullable {
@@ -409,8 +431,8 @@ async fn unsupported_nested_type_is_rejected_at_schema_inference() {
 #[tokio::test]
 async fn invalid_sources_and_zero_batch_size_have_pathful_errors() -> DaftResult<()> {
     for uri in [
-        "s3://bucket/data.vortex",
-        "https://example.com/data.vortex",
+        "gs://bucket/data.vortex",
+        "ftp://example.com/data.vortex",
         "file://remote-host/data.vortex",
     ] {
         assert!(
@@ -497,7 +519,90 @@ async fn file_uris_preserve_literal_percent_names_and_reject_hosts() -> DaftResu
         let uri = format!("{uri}{suffix}");
         let error = read_vortex_schema(&uri).await.unwrap_err().to_string();
         assert!(error.contains("query or fragment"));
-        assert!(error.contains(&uri));
+        assert!(error.contains(&crate::io::display_uri(&uri)));
+        assert!(!error.contains(suffix));
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn rejected_source_urls_redact_credentials_and_queries_before_io() {
+    for (uri, expected) in [
+        (
+            "gs://user:password-sentinel@example.test/data?token=query-sentinel#fragment-sentinel",
+            "supports only",
+        ),
+        (
+            "https://user:password-sentinel@example.test:invalid/data?token=query-sentinel",
+            "Invalid Vortex URL",
+        ),
+        (
+            "file://user:password-sentinel@example.test/data?token=query-sentinel",
+            "Invalid Vortex URL",
+        ),
+        (
+            "file://localhost/data?token=query-sentinel#fragment-sentinel",
+            "query or fragment",
+        ),
+        (
+            "file:///tmp/data?token=query-sentinel#fragment-sentinel",
+            "query or fragment",
+        ),
+        (
+            "s3:///data?token=query-sentinel#fragment-sentinel",
+            "requires a host",
+        ),
+    ] {
+        let error = read_vortex_schema(uri).await.unwrap_err().to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains(&crate::io::display_uri(uri)), "{error}");
+        for secret in ["password-sentinel", "query-sentinel", "fragment-sentinel"] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+}
+
+#[test]
+fn schema_validation_redacts_signed_source_urls() {
+    use vortex::dtype::{DType, Nullability};
+
+    use crate::read::{schemas, validate_schema};
+
+    let uri =
+        "https://user:password-sentinel@example.test/data?token=query-sentinel#fragment-sentinel";
+    let session = VortexSession::default();
+    let top_level_error = schemas(uri, &session, &DType::Bool(Nullability::NonNullable))
+        .unwrap_err()
+        .to_string();
+    let nested_schema = ArrowSchema::new(vec![Field::new(
+        "nested",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+        true,
+    )]);
+    let nested_dtype = session.arrow().from_arrow_schema(&nested_schema).unwrap();
+    let nested_error = schemas(uri, &session, &nested_dtype)
+        .unwrap_err()
+        .to_string();
+    let arrow = primitive_batch(true).schema();
+    let dtype = session.arrow().from_arrow_schema(&arrow).unwrap();
+    let (_, schema) = schemas(uri, &session, &dtype).unwrap();
+    let mismatch_error = validate_schema(uri, &Schema::empty(), &schema)
+        .unwrap_err()
+        .to_string();
+    let plain = Schema::try_from(arrow.as_ref()).unwrap();
+    let marker_error = validate_schema(uri, &plain, &schema)
+        .unwrap_err()
+        .to_string();
+    for (error, expected) in [
+        (top_level_error, "top-level struct"),
+        (nested_error, "flat primitive"),
+        (mismatch_error, "full first-file schema"),
+        (marker_error, "source nullability"),
+    ] {
+        assert!(error.contains(expected), "{error}");
+        assert!(error.contains("https://example.test/data"), "{error}");
+        for secret in ["password-sentinel", "query-sentinel", "fragment-sentinel"] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
 }

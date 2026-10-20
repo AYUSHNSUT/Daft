@@ -14,10 +14,8 @@ use daft_dsl::{
 use futures::TryStreamExt;
 use vortex::{VortexSessionDefault, arrow::ArrowSessionExt, session::VortexSession};
 
-use super::{options, primitive_batch, write_batch};
-use crate::{
-    VortexConvertOptions, VortexReadOptions, plan::plan_scan, read_vortex_schema, stream_vortex,
-};
+use super::{options, primitive_batch, read_vortex_schema, stream_vortex, write_batch};
+use crate::{VortexConvertOptions, VortexReadOptions, plan::plan_scan};
 
 struct IntegerCase {
     name: &'static str,
@@ -116,6 +114,7 @@ async fn result_ids(
             batch_size: 3,
             enable_projection_pushdown: projection,
             enable_filter_pushdown: filter,
+            ..Default::default()
         },
         convert,
     )
@@ -365,6 +364,7 @@ async fn reordered_and_empty_projections_preserve_values_and_cardinality() {
                 batch_size: 3,
                 enable_projection_pushdown: projection,
                 enable_filter_pushdown: filter,
+                ..Default::default()
             };
             let mut convert = options(schema.clone());
             convert.include_columns = Some(vec!["text".into(), "id".into()]);

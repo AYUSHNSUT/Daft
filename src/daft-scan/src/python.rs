@@ -214,7 +214,7 @@ impl PyDataSourceTask {
         )
     }
 
-    /// Create a task that reads a local Vortex file using the native reader.
+    /// Create a task that reads a supported Vortex file URL using the native reader.
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
     #[pyo3(signature = (
@@ -257,24 +257,25 @@ impl PyDataSourceTask {
         #[cfg(feature = "vortex")]
         {
             let vortex_config = vortex_config.unwrap_or_default();
-            if vortex_config.batch_size == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "Vortex batch_size must be positive",
-                ));
-            }
-            let (source_type, _) =
-                daft_io::parse_url(&path).map_err(common_error::DaftError::from)?;
-            if source_type != daft_io::SourceType::File {
-                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                    "The experimental Vortex reader supports local files only",
-                ));
-            }
-            if storage_config
-                .as_ref()
-                .is_some_and(|config| config.io_config.is_some())
+            if vortex_config.batch_size == 0
+                || vortex_config.max_concurrent_requests == 0
+                || vortex_config.max_in_flight_bytes == 0
             {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Vortex batch_size and request budgets must be positive",
+                ));
+            }
+            let (source_type, _) = daft_io::parse_url(&path).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "Vortex input must be a valid local path, HTTP(S) URL, or S3 URL",
+                )
+            })?;
+            if !matches!(
+                source_type,
+                daft_io::SourceType::File | daft_io::SourceType::Http | daft_io::SourceType::S3
+            ) {
                 return Err(pyo3::exceptions::PyNotImplementedError::new_err(
-                    "The experimental Vortex reader does not support IOConfig",
+                    "The experimental Vortex reader supports only local, HTTP(S), and S3 files",
                 ));
             }
             if num_rows.is_some() || stats.is_some() {
