@@ -2,7 +2,7 @@
 
 **Status:** Phases 0, 1, and 2 are complete for the experimental local-reader scope. Phase 2 adds selective scans behind the same default-off `vortex` feature; see its [design](vortex-phase2-design.md) and [validation record](vortex-phase2-results.md). The [Phase 1 validation record](vortex-phase1-results.md) includes the dependency cost accepted for this fork.
 
-Phase 3 is complete for its declared I/O, resource-control, and worker scope, including real HTTP/MinIO/Ray acceptance; see the [plan](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Phase 4's benchmark harness, connector documentation, and personal-fork CI workflow are implemented. Release-build evaluation, validation, and the results report remain in progress under the [Phase 4 plan](vortex-phase4-design.md); no performance conclusion is established yet.
+Phase 3 is complete for its declared I/O, resource-control, and worker scope, including real HTTP/MinIO/Ray acceptance; see the [plan](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Phase 4's benchmark harness, connector documentation, personal-fork CI workflow, and Vortex footer row estimates are implemented. Release evaluation and local/user-terminal acceptance are complete for the [Phase 4 scope](vortex-phase4-design.md); the [results record](vortex-phase4-results.md) includes remaining regressions and measurement limits. GitHub/Linux workflow execution is separately unverified.
 
 **Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, current implementation branch `poc/vortex-phase4`, review base `poc/vortex-phase3`.
 
@@ -10,7 +10,7 @@ Phase 3 is complete for its declared I/O, resource-control, and worker scope, in
 
 **Companion:** [test and benchmark plan](vortex-integration-test-plan.md).
 
-**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), [Phase 2 selective-scan results](vortex-phase2-results.md), [Phase 3 I/O and scheduling validation](vortex-phase3-results.md), [release benchmark instructions](../../benchmarking/vortex/README.md), and the [experimental connector guide](../connectors/vortex.md).
+**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), [Phase 2 selective-scan results](vortex-phase2-results.md), [Phase 3 I/O and scheduling validation](vortex-phase3-results.md), [Phase 4 release results](vortex-phase4-results.md), [release benchmark instructions](../../benchmarking/vortex/README.md), and the [experimental connector guide](../connectors/vortex.md).
 
 ## Summary
 
@@ -169,11 +169,11 @@ Use half-open row ranges for any future intra-file splits. Do not use byte offse
 
 The [benchmark harness](../../benchmarking/vortex/README.md) generates matching Vortex/Parquet datasets and compares native Parquet with all four Vortex projection/filter switch combinations. Its primitive scan, filter, group-by, and join cases use independent expected results and fresh query processes. The initial release matrix covers sorted/shuffled data and single/multiple files; it does not claim canonical TPC-H coverage or compare Daft with another engine.
 
-The [connector guide](../connectors/vortex.md), installation/API navigation, and [personal-fork workflow](../../.github/workflows/vortex-experimental.yml) now exist. The workflow defines feature-on/off correctness, native reader and harness tests, benchmark correctness smoke checks, and real service acceptance. A workflow definition does not establish a successful CI run, and smoke checks do not establish performance. Keep release measurements, validation outcomes, and remaining environment restrictions explicit until the [Phase 4 acceptance gates](vortex-phase4-design.md#tests-and-acceptance) are satisfied.
+The [connector guide](../connectors/vortex.md), installation/API navigation, and [personal-fork workflow](../../.github/workflows/vortex-experimental.yml) now exist. The workflow defines feature-on/off correctness, native reader and harness tests, benchmark correctness smoke checks, and real service acceptance. The [Phase 4 results](vortex-phase4-results.md) record release measurements, corrected join planning, feature-on/off validation, and real HTTP/MinIO/Ray acceptance. A workflow definition does not establish a successful CI run, and smoke checks do not establish performance; GitHub/Linux execution remains separately unverified.
 
 ## Expected code changes
 
-Phase 1 implements the native-reader touchpoints below, and Phase 2 adds the expression adapter and physical projection. Phase 3 adds Daft I/O and scheduling integration. Phase 4 implements the benchmark harness, experimental connector navigation, and fork CI; its validation and results remain in progress.
+Phase 1 implements the native-reader touchpoints below, and Phase 2 adds the expression adapter and physical projection. Phase 3 adds Daft I/O and scheduling integration. Phase 4 adds footer row counts for planning, the benchmark harness, experimental connector navigation, and fork CI; its [results](vortex-phase4-results.md) distinguish completed local/user acceptance from unverified GitHub execution.
 
 | Area | Files / responsibility |
 | --- | --- |

@@ -1,6 +1,6 @@
 # Vortex integration: test and benchmark plan
 
-**Status:** acceptance plan for the [fork design](vortex-integration-design.md). Phases 0 through 3 are complete for their declared scopes; Phase 3's I/O and worker acceptance is recorded in its [design](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Phase 4's harness, connector documentation, and personal-fork CI workflow are implemented. Release-performance evaluation, validation, and the results report remain in progress under the [Phase 4 plan](vortex-phase4-design.md).
+**Status:** acceptance plan for the [fork design](vortex-integration-design.md). Phases 0 through 3 are complete for their declared scopes; Phase 3's I/O and worker acceptance is recorded in its [design](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Phase 4's harness, connector documentation, personal-fork workflow, and footer row estimates are implemented. The [Phase 4 results](vortex-phase4-results.md) record completed release evaluation and local/user-terminal acceptance under its [plan](vortex-phase4-design.md); GitHub/Linux workflow execution remains separately unverified.
 
 ## Test strategy
 
@@ -162,7 +162,7 @@ There is no guaranteed improvement target. A useful result may be that Vortex he
 
 ## Execution and CI plan
 
-The native crate, selective-scan tests, and default-off `vortex` feature exist. Historical acceptance is recorded in [Phase 1](vortex-phase1-results.md), [Phase 2](vortex-phase2-results.md), and [Phase 3](vortex-phase3-results.md). Phase 4 adds the implemented benchmark harness, [connector guide](../connectors/vortex.md), and [experimental workflow](../../.github/workflows/vortex-experimental.yml); validation and release results are still in progress.
+The native crate, selective-scan tests, and default-off `vortex` feature exist. Historical acceptance is recorded in [Phase 1](vortex-phase1-results.md), [Phase 2](vortex-phase2-results.md), and [Phase 3](vortex-phase3-results.md). Phase 4 adds the benchmark harness, [connector guide](../connectors/vortex.md), footer-count regression coverage, and [experimental workflow](../../.github/workflows/vortex-experimental.yml); its [validation record](vortex-phase4-results.md) reports release results and completed local/user-terminal checks separately from unverified GitHub execution.
 
 The workflow is restricted to `AYUSHNSUT/Daft` and the declared phase branches. It defines enabled/disabled builds, focused correctness and existing regressions, native reader tests, harness/helper tests, and a small CLI correctness smoke run without timing thresholds. The enabled service gate requires real HTTP, authenticated MinIO, and Ray checks with zero skips when selected; manual dispatch can explicitly omit those service checks. Large performance measurements remain separate manual runs. Record actual CI outcomes separately from the existence of these checks.
 

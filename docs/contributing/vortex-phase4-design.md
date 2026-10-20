@@ -2,7 +2,7 @@
 
 **Scope:** experimental `AYUSHNSUT/Daft` fork, branch `poc/vortex-phase4`, based on Phase 3 commit `e90b54bb2acd4eb42935c51474ce2c551c52d834`. Review base: `poc/vortex-phase3`.
 
-**Status:** implementation and validation in progress. The [integration design](vortex-integration-design.md) and [test plan](vortex-integration-test-plan.md#benchmark-protocol) define the preceding phases and measurement contract.
+**Status:** implementation and local/user-terminal acceptance complete for the declared experimental scope; see the [results and validation record](vortex-phase4-results.md). GitHub/Linux workflow execution remains separately unverified. The [integration design](vortex-integration-design.md) and [test plan](vortex-integration-test-plan.md#benchmark-protocol) define the preceding phases and measurement contract.
 
 ## Questions and boundaries
 
@@ -14,7 +14,7 @@ The existing TPC-H queries contain date predicates that this reader cannot load 
 
 ## Benchmark-driven scope adjustment: planning cardinality
 
-The initial local measurements exposed a join-planning gap: unknown Vortex source statistics became zero rows/bytes, so the existing planner chose the large fact input as the hash-build side. The user authorized a Phase 4 fix limited to Vortex footer metadata. Global statistics handling and join-selection rules remain unchanged. Rebuilt validation and replacement performance measurements are pending; no improvement from this fix is claimed yet.
+The initial local measurements exposed a join-planning gap: unknown Vortex source statistics became zero rows/bytes, so the existing planner chose the large fact input as the hash-build side. The user authorized a Phase 4 fix limited to Vortex footer metadata. Global statistics handling and join-selection rules remain unchanged. Rebuilt validation and replacement measurements verify the corrected build side; the [results record](vortex-phase4-results.md) retains both the original regression and current performance, including remaining remote regressions and timing variability.
 
 The native `read_vortex_metadata` helper returns the full schema and unsigned file row count through configured Daft I/O. `VortexSource.get_tasks` refreshes every file's footer for each materialization and passes the count through the existing native task metadata path, retaining the original full scan schema. This avoids permanently cached counts in reused/pickled sources and adds planning I/O before execution, using the same configuration and request budgets. It does not provide snapshot isolation. The task factory accepts nonnegative row counts while still rejecting column statistics and aggregation pushdowns. Exact counts describe input files; ordinary Daft filter/limit estimation rules apply, and `supports_count_pushdown` remains false.
 

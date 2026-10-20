@@ -226,3 +226,7 @@ scope, full selectivity matrix, reports, and resource accounting. Performance ru
 require the build-command provenance above. Keep warm-cache
 and cold-cache claims distinct. These comparisons measure this fork's two reader
 paths; they do not rank Daft against DataFusion or Velox.
+
+The [Phase 4 results](../contributing/vortex-phase4-results.md) record release-build
+local and MinIO measurements, the join-planning correction, remaining regressions,
+and feature-on/off validation.
