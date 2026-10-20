@@ -6,7 +6,7 @@
 
 **Review base:** `poc/vortex-phase2`. Keep this work separate from earlier phases and upstream. Open the fork review PR after implementation and acceptance work; distinguish unavailable external checks from passing checks.
 
-**Status:** implementation and acceptance plan. A completion record will report actual commands, results, and unresolved limits.
+**Status:** implemented with local acceptance complete; real service acceptance is pending. The [validation record](vortex-phase3-results.md) reports actual commands, results, and limits.
 
 ## Problem and intended behavior
 
@@ -74,15 +74,17 @@ daft.read_vortex(
 )
 ```
 
-Both new controls require positive integers, excluding booleans. The native schema binding receives the same configuration and budgets so footer reads cannot bypass them. The scan configuration preserves settings across serialization and displays their requested values.
+Both new controls require positive integers, excluding booleans. The request count must fit Tokio's semaphore limit; the byte budget must also fit `u32::MAX` because weighted semaphore acquisition takes a 32-bit permit count. Oversized settings return errors rather than overflowing or panicking. The native schema binding receives the same configuration and budgets so footer reads cannot bypass them. The scan configuration preserves settings across serialization and displays their requested values.
 
 Permits are shared by clones of one opened positional reader and cover request execution, response collection, and alignment. A single Vortex request larger than `max_in_flight_bytes` returns a clear error; it does not receive an unaccounted exception. Users can raise the budget for files whose encoded segments require larger requests. Cancellation and error paths release acquired permits, including when a future is dropped while waiting.
 
-These limits bound outstanding requested bytes and requests **per opened reader**. They do not cap retained decoded batches, caches, all concurrent files, join/aggregation state, or process RSS. Track those distinctions in tests and results rather than advertising a total-query memory guarantee.
+These limits bound active asynchronous range calls and their requested bytes **per opened reader**. Cancellation releases the adapter permits; an already-dispatched blocking filesystem operation can still finish afterward. The limits do not cap physical OS I/O, retained decoded batches, caches, all concurrent files, join/aggregation state, or process RSS. Track those distinctions in tests and results rather than advertising a total-query memory guarantee.
 
 ## Local backpressure and cancellation
 
-Forward the existing `results_buffer_size` argument through the local runner and native executor instead of dropping it. Resolve an omitted local value to a bounded capacity of one result partition. Validate explicit capacities before execution. Keep the existing distributed shared-plan behavior unless an explicit bounded setting is supported and tested; do not silently change Flotilla scheduling to solve the local consumer problem.
+Forward the existing `results_buffer_size` argument through the local runner and native executor instead of dropping it. At the native executor boundary, resolve an omitted or `None` local value to a bounded capacity of one result partition. Public DataFrame iterators retain their existing `"num_cpus"` default and resolve it before calling the runner; explicitly passing `None` selects the local capacity of one. Validate explicit capacities before execution. Keep the existing distributed shared-plan behavior unless an explicit bounded setting is supported and tested; do not silently change Flotilla scheduling to solve the local consumer problem.
+
+A capacity of N bounds queued results; the router can hold one additional pending result while waiting to send. Source and operator buffers remain separate. Flotilla's omitted capacity retains its existing unbounded transport.
 
 Distinguish successful completion from abandonment:
 
@@ -93,6 +95,8 @@ Distinguish successful completion from abandonment:
 - Close must be idempotent and safe around a pending asynchronous `next()` call.
 
 Add explicit asynchronous receiver close and propagate cleanup through `iter_partitions`, `to_arrow_iter`, and `iter_rows`. Do not rely on garbage collection timing as the primary cancellation mechanism. Already-running blocking OS reads may complete; cancellation promises must identify which asynchronous work is actually interruptible.
+
+Closing one input in a shared plan stops its delivery but can leave its upstream work running while other inputs remain active. Closing the last input aborts the plan. An abandoned input ID cannot be reused until that plan is removed, preventing late messages from reaching a replacement consumer; normally exhausted IDs remain reusable. A caller retaining an iterator after `break` must explicitly close it. Preserve the existing query-finished notification for intentional preview/iterator closure; interruption retains the canceled notification.
 
 Shared scheduler changes need ordinary in-memory and existing-reader regressions, independent of Vortex. No fixed sleep or wall-clock race belongs in deterministic acceptance tests; use barriers/events and counters.
 

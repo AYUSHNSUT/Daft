@@ -2,13 +2,15 @@
 
 **Status:** Phases 0, 1, and 2 are complete for the experimental local-reader scope. Phase 2 adds selective scans behind the same default-off `vortex` feature; see its [design](vortex-phase2-design.md) and [validation record](vortex-phase2-results.md). The [Phase 1 validation record](vortex-phase1-results.md) includes the dependency cost accepted for this fork.
 
-**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, implementation branch `poc/vortex-phase2`.
+Phase 3 is in acceptance on its own branch; see the [I/O, resource-control, and worker plan](vortex-phase3-design.md) and [validation record](vortex-phase3-results.md). Remote and worker acceptance remains separate from implemented local behavior.
+
+**Scope:** `AYUSHNSUT/Daft`; integration branch `poc/vortex-eval`, implementation branch `poc/vortex-phase3`.
 
 **Design baseline:** `d3cd974150ba93dbbe8efef8370b129538fcee4b`; reviewed October 20, 2026.
 
 **Companion:** [test and benchmark plan](vortex-integration-test-plan.md).
 
-**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), and [Phase 2 selective-scan results](vortex-phase2-results.md).
+**Current experiment:** [fixture and baseline instructions](../../examples/vortex_eval/README.md), [Phase 1 results](vortex-phase1-results.md), [Phase 2 selective-scan results](vortex-phase2-results.md), and [Phase 3 I/O and scheduling validation](vortex-phase3-results.md).
 
 ## Summary
 
@@ -39,7 +41,7 @@ result = df.where(col("value") >= 20).select("id").limit(100)
 result.show()
 ```
 
-Signature: `read_vortex(path: str | Path | list[str | Path], io_config: IOConfig | None = None, batch_size: int = 131072, *, enable_projection_pushdown: bool = True, enable_filter_pushdown: bool = True) -> DataFrame`. Explicit `io_config` is reserved for Phase 3 and currently rejected; use `None` for local reads. The keyword-only switches independently disable physical Vortex optimizations for differential testing; Daft still applies the complete filter and final projection.
+The API accepts `path`, optional `io_config`, and `batch_size=131072`. Keyword-only options are `enable_projection_pushdown=True`, `enable_filter_pushdown=True`, `max_concurrent_requests=8`, and `max_in_flight_bytes=67108864`. Phase 3 carries explicit configuration into Daft I/O and serializes the per-reader budgets. See its validation record for remote and worker acceptance. The switches independently disable physical Vortex optimizations for differential testing; Daft still applies the complete filter and final projection.
 
 | Capability | First native milestone | Later phases |
 | --- | --- | --- |
@@ -165,7 +167,7 @@ Use half-open row ranges for any future intra-file splits. Do not use byte offse
 
 ## Expected code changes
 
-Phase 1 implements the native-reader touchpoints below. Expression/I/O adapters, dedicated performance benchmarks, and public connector navigation remain later work.
+Phase 1 implements the native-reader touchpoints below, and Phase 2 adds the expression adapter and physical projection. Phase 3 adds Daft I/O and scheduling integration; dedicated performance benchmarks and public connector navigation remain later work.
 
 | Area | Files / responsibility |
 | --- | --- |
@@ -196,7 +198,7 @@ Keep the reader crate below the scan layer: it accepts reader-owned options and 
 | Library/API and encoding compatibility drift | Pin the tested release and writer options; maintain compatibility fixtures; isolate Vortex-specific types |
 | Conversion erases scan benefits | Measure scan, conversion, and end-to-end time separately; do not expand scope into compressed Daft operators |
 | Incorrect pruning, limits, or missing filter columns | Residual-first correctness contract and differential tests before optimization |
-| Reader/executor concurrency multiplies memory use | Measure reader concurrency and cleanup in Phase 1; define and enforce end-to-end budgets and cancellation behavior in Phase 3 |
+| Reader/executor concurrency multiplies memory use | Measure reader concurrency and cleanup; Phase 3 bounds active asynchronous range calls per reader and local queued results, with explicit cancellation limits; total RSS remains unbounded |
 | New dependencies exceed existing CI budget | Inventory the graph in Phase 0; justify any fork-specific policy change explicitly |
 | One-task-per-file underuses a large single file | Use several files initially; compare equal parallelism; add tested row-range splitting only when measurements justify it |
 | Local success is mistaken for cloud/distributed support | Separate per-scheme and Ray gates; never serialize open handles or credentials into diagnostics |
