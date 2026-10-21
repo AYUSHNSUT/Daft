@@ -60,6 +60,7 @@ def _require_vortex(*, metadata_reuse: bool = False, row_count_planning: bool = 
         or not hasattr(_native, "_io_glob_bulk")
         or not hasattr(_native.PyDataSourceTask, "vortex")
         or not hasattr(getattr(_native, "VortexSourceConfig", None), "metadata_snapshot")
+        or not hasattr(getattr(_native, "VortexSourceConfig", None), "enable_large_offsets")
         or (metadata_reuse and not hasattr(_native, "_read_vortex_metadata_bulk_cached"))
         or (row_count_planning and not hasattr(_native, "_read_vortex_row_counts_bulk"))
         or (row_count_planning and metadata_reuse and not hasattr(_native, "_read_vortex_row_counts_bulk_cached"))
@@ -282,6 +283,10 @@ def read_vortex(
     discovery_concurrency: int = 8,
     enable_metadata_reuse: bool = False,
     enable_row_count_planning: bool = False,
+    enable_large_offsets: bool = False,
+    enable_execution_session_reuse: bool = False,
+    enable_file_pruning: bool = False,
+    enable_layout_splitting: bool = False,
 ) -> DataFrame:
     """Read Vortex files with the experimental native reader.
 
@@ -334,6 +339,14 @@ def read_vortex(
             Every executed file still receives full schema validation before projection; unsupported
             schemas can therefore fail during execution instead of planning. Footer row counts retain
             join statistics.
+
+        enable_large_offsets: Request large-offset Arrow strings/binary directly. Experimental, default False.
+        enable_execution_session_reuse: Share Vortex session initialization within each fresh scan processor.
+            Per-file readers, metadata and validators remain independent. Experimental, default False.
+        enable_file_pruning: Reject files proven not to match by footer statistics after full schema validation.
+            Unknown statistics retain the ordinary scan. Experimental, default False.
+        enable_layout_splitting: Align SDK splits to layout boundaries with batch_size as the maximum row count.
+            Experimental, default False.
 
     Note:
         Requires a build with Rust features ``python,vortex``. The Python
@@ -388,6 +401,18 @@ def read_vortex(
         raise TypeError("enable_metadata_reuse must be a bool")
     if not isinstance(enable_row_count_planning, bool):
         raise TypeError("enable_row_count_planning must be a bool")
+    for name, value in (
+        ("enable_large_offsets", enable_large_offsets),
+        ("enable_execution_session_reuse", enable_execution_session_reuse),
+        ("enable_file_pruning", enable_file_pruning),
+        ("enable_layout_splitting", enable_layout_splitting),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be a bool")
+    if any(
+        (enable_large_offsets, enable_execution_session_reuse, enable_file_pruning, enable_layout_splitting)
+    ) and not hasattr(_native.VortexSourceConfig, "enable_large_offsets"):
+        raise ImportError("Rebuild Daft with the experimental Vortex reader controls")
     paths = _input_paths(path)
     _require_vortex(metadata_reuse=enable_metadata_reuse, row_count_planning=enable_row_count_planning)
     io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
@@ -406,6 +431,10 @@ def read_vortex(
         discovery_concurrency=discovery_concurrency,
         enable_metadata_reuse=enable_metadata_reuse,
         enable_row_count_planning=enable_row_count_planning,
+        enable_large_offsets=enable_large_offsets,
+        enable_execution_session_reuse=enable_execution_session_reuse,
+        enable_file_pruning=enable_file_pruning,
+        enable_layout_splitting=enable_layout_splitting,
     ).read()
 
 
@@ -427,6 +456,10 @@ class VortexSource(DataSource):
         discovery_concurrency: int = 8,
         enable_metadata_reuse: bool = False,
         enable_row_count_planning: bool = False,
+        enable_large_offsets: bool = False,
+        enable_execution_session_reuse: bool = False,
+        enable_file_pruning: bool = False,
+        enable_layout_splitting: bool = False,
     ) -> None:
         _validate_metadata_concurrency(metadata_concurrency)
         _validate_read_controls(
@@ -436,6 +469,18 @@ class VortexSource(DataSource):
             raise TypeError("enable_metadata_reuse must be a bool")
         if not isinstance(enable_row_count_planning, bool):
             raise TypeError("enable_row_count_planning must be a bool")
+        if not isinstance(enable_large_offsets, bool):
+            raise TypeError("enable_large_offsets must be a bool")
+        self._enable_large_offsets = enable_large_offsets
+        if not isinstance(enable_execution_session_reuse, bool):
+            raise TypeError("enable_execution_session_reuse must be a bool")
+        self._enable_execution_session_reuse = enable_execution_session_reuse
+        if not isinstance(enable_file_pruning, bool):
+            raise TypeError("enable_file_pruning must be a bool")
+        self._enable_file_pruning = enable_file_pruning
+        if not isinstance(enable_layout_splitting, bool):
+            raise TypeError("enable_layout_splitting must be a bool")
+        self._enable_layout_splitting = enable_layout_splitting
         self._enable_row_count_planning = enable_row_count_planning
         self._enable_metadata_reuse = enable_metadata_reuse
         self._paths = _resolve_vortex_paths(paths, io_config, discovery_concurrency)
@@ -546,6 +591,10 @@ class VortexSource(DataSource):
                             enable_read_coalescing=self._enable_read_coalescing,
                             read_coalesce_gap_bytes=self._read_coalesce_gap_bytes,
                             read_coalesce_max_bytes=self._read_coalesce_max_bytes,
+                            enable_large_offsets=self._enable_large_offsets,
+                            enable_execution_session_reuse=self._enable_execution_session_reuse,
+                            enable_file_pruning=self._enable_file_pruning,
+                            enable_layout_splitting=self._enable_layout_splitting,
                             metadata_snapshot=snapshot,
                         ),
                         pushdowns=pushdowns,

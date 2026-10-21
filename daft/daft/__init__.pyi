@@ -354,6 +354,10 @@ class VortexSourceConfig:
     """Experimental native Vortex source configuration."""
 
     batch_size: int
+    enable_large_offsets: bool
+    enable_execution_session_reuse: bool
+    enable_file_pruning: bool
+    enable_layout_splitting: bool
     enable_projection_pushdown: bool
     enable_filter_pushdown: bool
     max_concurrent_requests: int
@@ -374,6 +378,10 @@ class VortexSourceConfig:
         enable_read_coalescing: bool = True,
         read_coalesce_gap_bytes: int = 65536,
         read_coalesce_max_bytes: int = 4194304,
+        enable_large_offsets: bool = False,
+        enable_execution_session_reuse: bool = False,
+        enable_file_pruning: bool = False,
+        enable_layout_splitting: bool = False,
         metadata_snapshot: bytes | None = None,
     ) -> None: ...
 

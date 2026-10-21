@@ -4,6 +4,13 @@ The maintained [Parquet vs Vortex comparison](../../docs/contributing/parquet-vs
 contains current timings, earlier workload coverage and measurement conditions.
 Update it after each completed performance evaluation using its update rules.
 
+The [reader-experiment design](../../docs/contributing/vortex-phase8-design.md)
+documents the independent reader controls, multiple-session comparisons and
+complete candidate selection used by `python -m benchmarking.vortex.phase8`.
+Its final/guard stages freeze every effective option; the older policy runner
+retains its historical behavior. `python -m benchmarking.vortex.sample_cpu`
+collects a separate macOS all-thread stack sample outside benchmark timings.
+
 Run from the repository root. This harness compares two reader paths in the same
 Daft build. It does not compare Daft with other engines or constitute canonical
 TPC-H. Vortex 0.88.0, PyArrow, and NumPy are required for fixture generation.

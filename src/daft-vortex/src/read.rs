@@ -115,6 +115,12 @@ fn input_uri(uri: &str) -> DaftResult<String> {
     local_path(uri).map(|path| path.to_string_lossy().into_owned())
 }
 
+/// Fresh scan-processor state. Never serialized or shared between queries.
+#[derive(Default)]
+pub struct VortexExecutionContext {
+    session: OnceLock<VortexSession>,
+}
+
 fn session_for_open(
     phase: Phase,
     uri: &str,
@@ -122,7 +128,11 @@ fn session_for_open(
 ) -> VortexSession {
     let create = |uri| {
         let trace = diagnostics::begin(phase, "session_creation", uri);
-        let session = VortexSession::default().with_tokio();
+        let session = if diagnostics::instant_ns().is_some() {
+            VortexSession::default().with_handle(crate::runtime::handle())
+        } else {
+            VortexSession::default().with_tokio()
+        };
         diagnostics::complete(trace, false);
         session
     };
@@ -176,6 +186,15 @@ pub(crate) fn schemas(
     session: &VortexSession,
     dtype: &DType,
 ) -> DaftResult<(ArrowSchemaRef, SchemaRef)> {
+    schemas_with_offsets(uri, session, dtype, false)
+}
+
+fn schemas_with_offsets(
+    uri: &str,
+    session: &VortexSession,
+    dtype: &DType,
+    large_offsets: bool,
+) -> DaftResult<(ArrowSchemaRef, SchemaRef)> {
     let safe_uri = display_uri(uri);
     let uri = safe_uri.as_str();
     if !matches!(dtype, DType::Struct(_, Nullability::NonNullable)) {
@@ -204,6 +223,12 @@ pub(crate) fn schemas(
             )));
         }
         let target = match field.data_type() {
+            ArrowDataType::Utf8View | ArrowDataType::Utf8 if large_offsets => {
+                ArrowDataType::LargeUtf8
+            }
+            ArrowDataType::BinaryView | ArrowDataType::Binary if large_offsets => {
+                ArrowDataType::LargeBinary
+            }
             ArrowDataType::Utf8View => ArrowDataType::Utf8,
             ArrowDataType::BinaryView => ArrowDataType::Binary,
             ArrowDataType::Null
@@ -651,7 +676,10 @@ pub async fn stream_vortex(
         io_stats,
         &read_options,
         Phase::ExecutionOpen,
-        None,
+        read_options
+            .execution_context
+            .as_ref()
+            .map(|context| &context.session),
     )
     .await?;
     stream_opened_vortex(
@@ -675,7 +703,12 @@ fn stream_opened_vortex(
     first_batch: Option<diagnostics::Span>,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     let trace = diagnostics::begin(Phase::ExecutionOpen, "schema_conversion", Some(uri));
-    let schema = schemas(uri, &session, file.dtype());
+    let schema = schemas_with_offsets(
+        uri,
+        &session,
+        file.dtype(),
+        read_options.enable_large_offsets,
+    );
     diagnostics::complete(trace, schema.is_err());
     let (arrow_schema, actual_schema) = schema?;
     let trace = diagnostics::begin(Phase::ExecutionOpen, "schema_validation", Some(uri));
@@ -692,6 +725,18 @@ fn stream_opened_vortex(
     .map_err(|error| read_error(uri, "scan planning", error));
     diagnostics::complete(trace, plan.is_err());
     let plan = plan?;
+    if read_options.enable_file_pruning
+        && let Some(predicate) = &plan.pruning_filter
+    {
+        let trace = diagnostics::begin(Phase::ExecutionOpen, "file_pruning", Some(uri));
+        // Unknown or unusable statistics retain the normal scan path.
+        let pruned = file.can_prune(predicate).unwrap_or(false);
+        diagnostics::complete(trace, false);
+        if pruned {
+            diagnostics::complete(first_batch, false);
+            return Ok(futures::stream::empty().boxed());
+        }
+    }
     let trace = diagnostics::begin(Phase::ExecutionOpen, "stream_preparation", Some(uri));
     let prepared = (|| -> DaftResult<_> {
         let arrow_schema = Arc::new(
@@ -709,7 +754,13 @@ fn stream_opened_vortex(
             .map_err(|error| read_error(uri, "scan preparation", error))?
             .with_projection(plan.projection)
             .with_some_filter(plan.pushed_filter)
-            .with_split_by(SplitBy::RowCount(read_options.batch_size))
+            .with_split_by(if read_options.enable_layout_splitting {
+                SplitBy::LayoutSubSplitting {
+                    max_rows: read_options.batch_size as u64,
+                }
+            } else {
+                SplitBy::RowCount(read_options.batch_size)
+            })
             // Vortex interprets this per Vortex worker, not as a global I/O bound.
             .with_concurrency(1)
             .into_record_batch_stream(arrow_schema)
@@ -792,6 +843,10 @@ fn stream_opened_vortex(
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "reader_controls_tests.rs"]
+mod reader_controls_tests;
 
 #[cfg(test)]
 #[path = "pushdown_tests.rs"]

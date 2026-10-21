@@ -192,9 +192,9 @@ def validate(cases, datasets, experiments, rounds, warmups, diagnostic_rounds, t
 
 def markdown(report):
     lines = [
-        "# Phase 7 paired diagnosis",
+        f"# {report['experiment']}",
         "",
-        f"Correctness/provenance status: {report['status']}. This report is not acceptance.",
+        f"Report status: {report['status']}; performance gate: {report['performance_gate']['status']}.",
         "Fresh sources and complete queries share one process and its connections. Source creation remains timed.",
         "Pairs are adjacent with balanced AB/BA order. Ratios below one favor B; no significance claim is made.",
         "",
@@ -249,6 +249,9 @@ def run(
     storage_root=None,
     timeout=600,
     allow_dev=False,
+    configuration_set=None,
+    comparison_set=None,
+    experiment_name="phase7_paired_diagnosis",
 ):
     validate(cases, datasets, experiments, rounds, warmups, diagnostic_rounds, timeout, allow_dev)
     manifest_path, output = Path(manifest_path).resolve(), Path(output).resolve()
@@ -274,7 +277,10 @@ def run(
     output.mkdir(parents=True, exist_ok=True)
     for directory in ("trials", "diagnostics", "profiles", "plans"):
         (output / directory).mkdir()
-    pairs, available = comparisons(experiments), configurations()
+    pairs = comparisons(experiments) if comparison_set is None else comparison_set
+    available = configurations() if configuration_set is None else configuration_set
+    if not pairs or any(len(pair) != 2 or any(name not in available for name in pair) for pair in pairs.values()):
+        raise ValueError("Each comparison must reference exactly two declared configurations")
     used = {name for pair in pairs.values() for name in pair}
     configs = {name: config for name, config in available.items() if name in used}
     settings = {
@@ -295,7 +301,7 @@ def run(
     frozen.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n")
     report = {
         "report_version": 1,
-        "experiment": "phase7_paired_diagnosis",
+        "experiment": experiment_name,
         "status": "running",
         "purpose": "development correctness smoke" if allow_dev else "paired exploratory diagnosis; not acceptance",
         "performance_gate": {"status": "not_evaluated", "reason": "Existing acceptance thresholds remain unchanged"},

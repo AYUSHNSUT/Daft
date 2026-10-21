@@ -540,6 +540,11 @@ impl_bincode_py_state_serialization!(McapSourceConfig);
 )]
 pub struct VortexSourceConfig {
     pub batch_size: usize,
+    pub enable_large_offsets: bool,
+    pub enable_execution_session_reuse: bool,
+    pub enable_file_pruning: bool,
+    pub enable_layout_splitting: bool,
+
     pub enable_projection_pushdown: bool,
     pub enable_filter_pushdown: bool,
     pub max_concurrent_requests: usize,
@@ -568,6 +573,11 @@ impl Default for VortexSourceConfig {
     fn default() -> Self {
         Self {
             batch_size: 131_072,
+            enable_large_offsets: false,
+            enable_execution_session_reuse: false,
+            enable_file_pruning: false,
+            enable_layout_splitting: false,
+
             enable_projection_pushdown: true,
             enable_filter_pushdown: true,
             max_concurrent_requests: 8,
@@ -585,6 +595,13 @@ impl VortexSourceConfig {
     pub fn multiline_display(&self) -> Vec<String> {
         let mut display = vec![
             format!("Batch size = {}", self.batch_size),
+            format!("enable_large_offsets = {}", self.enable_large_offsets),
+            format!(
+                "enable_execution_session_reuse = {}",
+                self.enable_execution_session_reuse
+            ),
+            format!("enable_file_pruning = {}", self.enable_file_pruning),
+            format!("enable_layout_splitting = {}", self.enable_layout_splitting),
             format!(
                 "Enable projection pushdown = {}",
                 self.enable_projection_pushdown
@@ -676,6 +693,10 @@ impl VortexSourceConfig {
         enable_read_coalescing=true,
         read_coalesce_gap_bytes=65_536,
         read_coalesce_max_bytes=4_194_304,
+        enable_large_offsets=false,
+        enable_execution_session_reuse=false,
+        enable_file_pruning=false,
+        enable_layout_splitting=false,
         metadata_snapshot=None,
     ))]
     fn new(
@@ -687,6 +708,10 @@ impl VortexSourceConfig {
         #[pyo3(from_py_with = strict_vortex_bool)] enable_read_coalescing: bool,
         #[pyo3(from_py_with = strict_vortex_coalesce_gap)] read_coalesce_gap_bytes: usize,
         #[pyo3(from_py_with = strict_vortex_budget)] read_coalesce_max_bytes: usize,
+        #[pyo3(from_py_with = strict_vortex_bool)] enable_large_offsets: bool,
+        #[pyo3(from_py_with = strict_vortex_bool)] enable_execution_session_reuse: bool,
+        #[pyo3(from_py_with = strict_vortex_bool)] enable_file_pruning: bool,
+        #[pyo3(from_py_with = strict_vortex_bool)] enable_layout_splitting: bool,
         metadata_snapshot: Option<Vec<u8>>,
     ) -> PyResult<Self> {
         if batch_size == 0 {
@@ -717,6 +742,11 @@ impl VortexSourceConfig {
         }
         Ok(Self {
             batch_size,
+            enable_large_offsets,
+            enable_execution_session_reuse,
+            enable_file_pruning,
+            enable_layout_splitting,
+
             enable_projection_pushdown,
             enable_filter_pushdown,
             max_concurrent_requests,
