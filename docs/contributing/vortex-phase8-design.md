@@ -30,8 +30,9 @@ Only diagnostic sessions install a stateless wrapper around the SDK's existing
 Tokio executor. It records task queue lifetime and async task poll/suspension
 envelopes, plus synchronous CPU-closure/blocking-I/O wall envelopes. It delegates
 spawn and abort behavior to the same Tokio executor. Uninstrumented sessions use
-the existing runtime path. Dropped work and panics retain cancellation markers;
-the SDK's own panic propagation remains intact.
+the existing runtime path. Executor envelopes record completion or cancellation.
+The SDK retains its existing error/panic propagation; failures handled inside
+SDK tasks may only be visible at reader or query boundaries.
 
 The wrapper does not label all CPU closures as decoding: preparation and other
 SDK work may also be present. Async polling is wall time, not thread CPU.
@@ -63,6 +64,67 @@ Parquet. The local guard covers all four layouts and requires each candidate
 median at most 1.05 times the declared previous Vortex baseline. Correct outputs,
 complete profiles and unchanged provenance are required independently of the
 performance gates. No defaults change based on diagnostic results.
+
+## Completed diagnosis and candidate decision
+
+Three independent local sessions and three independent MinIO sessions passed
+full query/output, provenance and profile-completeness checks. They contain
+25,200 query executions, including warmups, and 1,800 separate diagnostic
+captures with zero dropped/unfinished events. One additional local session
+overlapped disk cleanup and is preserved separately; its declared replacement
+uses the same seed. The [maintained comparison](parquet-vs-vortex.md) records all
+Parquet/Vortex workload rows and report identities without pooling sessions.
+
+The table below compares each individual option with the previous Vortex
+baseline. These are changes in query latency, not Parquet/Vortex speed ratios.
+Ranges span independent session medians, not confidence intervals.
+
+| Control | Local result | MinIO result | Decision |
+| --- | --- | --- | --- |
+| Large offsets | Full reductions take 1.0–3.7% less time; most other differences are small or mixed | No repeatable full-reduction improvement | Keep opt-in; no promotion based on local results alone |
+| Session reuse | Sorted/multi range and equality take 9.9–11.0% and 10.9–13.4% less time; shuffled/multi filters also improve | Narrow scans take 1.1–6.6% less time and full reductions 0.5–3.4% less; joins take 3.1–5.3% more time; filters vary | Validate this option alone in independent acceptance |
+| Whole-file pruning | No repeatable latency benefit across the matrix | Differences vary by session | Keep opt-in; investigate applicable footer-stat coverage |
+| Layout sub-splitting | Full reductions take 11.2–24.3% more time across all layouts | No consistent improvement across all cases | Exclude from the current acceptance candidate |
+| All four controls | Full reductions take 8.0–19.1% more time | Only narrow scans and joins beat Parquet in every session | Exclude the bundle from the current acceptance candidate |
+
+The frozen candidate will enable session reuse only, retaining the baseline
+settings for all other controls. The first remote session supplies evidence by
+position, not by best timing. Independent acceptance still requires all five
+remote medians below Parquet and every local median within 5% of the baseline.
+The diagnosis does not establish that these gates will pass.
+
+The CLI case-selection fix and a sorted-JSON schedule-validation fix change the
+Python harness only; the native binary is unchanged. The validator reconstructs
+comparison order from the serialized summary list because JSON object key order
+is sorted when saving reports. Raw schedules are then checked exactly against
+that order and the recorded seed. Regression tests cover the real serialization
+format and duplicate comparison entries. A fresh qualifying diagnosis on the
+final harness revision will precede candidate freezing and final acceptance.
+
+### What the profiles explain
+
+These examples use the first local session's three separate diagnostic captures
+for sorted/multi data. Values are medians of observed wall unions, not exclusive
+CPU or values to add together. They never enter performance medians.
+
+- Session reuse changes execution-time session creation from eight calls to one.
+  In the range filter, its observed wall union falls from 1.020 ms to 0.186 ms.
+  Schema inference and planning still create their own sessions; those costs
+  are deliberately outside the execution-only lifetime being shared.
+- Large offsets move the full-reduction Arrow-conversion wall union from
+  47.221 ms to 0.568 ms. The complete instrumented query moves from 167.615 ms to
+  163.517 ms. The much smaller end-to-end gain shows why the removed conversion
+  envelope must not be claimed as independently removable query time; export,
+  overlapping decode work and downstream processing still need stack evidence.
+- Layout splitting increases full-reduction conversion calls from 64 to 488 and
+  SDK task-queue events from 89 to 513. Their wall unions rise from 47.221 ms to
+  70.071 ms and 1.732 ms to 76.318 ms, respectively. These overlapping intervals
+  support investigating batch fragmentation and scheduling overhead; they do
+  not establish an additive or exclusive CPU breakdown.
+
+All-thread stack sampling remains a separate terminal-side diagnostic. Allocator
+live bytes, exclusive decoder CPU and physical transport/server attribution are
+still unavailable; task spans and SDK send counts do not fill those gaps.
 
 ## Validation and execution
 
@@ -108,7 +170,7 @@ by name; this command does not choose the fastest option automatically:
 ```bash
 .venv/bin/python -m benchmarking.vortex.phase8 --stage freeze \
   --report examples/vortex_eval/artifacts/phase8/remote/session-01/report.json \
-  --config combined --output examples/vortex_eval/artifacts/phase8/candidate.json
+  --config sessions --output examples/vortex_eval/artifacts/phase8/candidate.json
 
 .venv/bin/python -m examples.vortex_eval.run_phase8_services --stage final \
   --selection examples/vortex_eval/artifacts/phase8/candidate.json \
