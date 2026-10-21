@@ -26,7 +26,7 @@ use crate::{
 ///
 /// TODO(desmond): In the future these trees should keep track of current cost estimates.
 #[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) enum JoinOrderTree {
     Relation(usize, usize),                                // (ID, cardinality).
     Join(Box<Self>, Box<Self>, Vec<JoinCondition>, usize), // (subtree, subtree, join conditions, cardinality).
@@ -122,7 +122,7 @@ impl Display for JoinNode {
 }
 
 #[derive(Clone)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub(super) struct JoinCondition {
     pub left_on: String,
     pub right_on: String,

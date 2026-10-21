@@ -9,7 +9,7 @@ import math
 from collections import Counter
 from pathlib import Path
 
-from . import phase7, remote_eval
+from . import phase7, profile, remote_eval
 from .fixtures import file_hash
 from .metadata_eval import QUERY_CASES
 from .run import environment
@@ -157,13 +157,20 @@ def request_ledger(report):
 def validate_diagnosis(report):
     """Rebuild the schedule and summaries before trusting candidate evidence."""
     settings = report["settings"]
+    provenance = report.get("environment", {})
     if (
         report.get("experiment") != "phase8_paired_diagnosis"
         or report.get("status") != "passed"
-        or not report.get("provenance_unchanged")
+        or report.get("provenance_unchanged") is not True
         or settings.get("development_only")
         or not str(report.get("storage_root", "")).startswith("s3://")
         or set(settings["cases"]) != set(QUERY_CASES)
+        or provenance.get("build_type") != "release"
+        or not provenance.get("build_command")
+        or not provenance.get("git_head")
+        or not provenance.get("native_binaries_sha256")
+        or provenance.get("tracked_changes") is not False
+        or any(provenance.get(key) != report.get("environment_after", {}).get(key) for key in phase7.IDENTITY_KEYS)
     ):
         raise ValueError("Freeze requires a complete successful release remote diagnosis across all five cases")
     phase7.validate(
@@ -186,6 +193,23 @@ def validate_diagnosis(report):
     if len(comparison_order) != len(settings["comparisons"]) or set(comparison_order) != set(settings["comparisons"]):
         raise ValueError("Diagnosis summary must retain every scheduled comparison exactly once")
     pairs = {name: settings["comparisons"][name] for name in comparison_order}
+    declared = configurations()
+    configs = settings["configurations"]
+    if (
+        not pairs
+        or any(not isinstance(pair, (list, tuple)) or len(pair) != 2 for pair in pairs.values())
+        or set(configs) != {name for pair in pairs.values() for name in pair}
+        or not set(configs) <= declared.keys()
+        or set(settings["configuration_sha256"]) != set(configs)
+        or any(phase7.fingerprint(config) != settings["configuration_sha256"][name] for name, config in configs.items())
+    ):
+        raise ValueError("Diagnosis configurations must match exactly the compared configurations and their hashes")
+    for name, config in configs.items():
+        if name == "parquet":
+            if config != declared["parquet"]:
+                raise ValueError("Diagnosis Parquet configuration differs from the baseline")
+        else:
+            validate_configuration(config)
     jobs = phase7.schedule(
         settings["cases"],
         settings["datasets"],
@@ -194,18 +218,51 @@ def validate_diagnosis(report):
         settings["rounds"],
         settings["seed"],
     )
-    configs = settings["configurations"]
     if len(jobs) != len(report["trials"]) or any(
         any(trial.get(key) != value for key, value in job.items())
         or trial.get("configuration") != configs[job["config"]]
         or trial.get("diagnostic", False)
         or trial.get("execution_mode") != "persistent-process"
+        or trial.get("status") != "passed"
+        or type(trial.get("wall_seconds")) not in (int, float)
+        or not math.isfinite(trial["wall_seconds"])
+        or trial["wall_seconds"] <= 0
         for trial, job in zip(report["trials"], jobs)
     ):
         raise ValueError("Diagnosis trials/configurations differ from the complete frozen schedule")
     recomputed = phase7.summarize(report["trials"], settings["cases"], settings["datasets"], pairs, settings["rounds"])
     if recomputed != report["summary"] or any(row["status"] != "passed" for row in recomputed):
         raise ValueError("Diagnosis summary must match complete paired raw trials")
+    # The runner keeps declaration order when selecting used configurations.
+    # Recover that order explicitly because saved JSON sorts object keys.
+    diagnostic_jobs = remote_eval.base_schedule(
+        settings["cases"],
+        settings["datasets"],
+        [name for name in declared if name in configs],
+        0,
+        settings["diagnostic_rounds"],
+        settings["seed"],
+    )
+    diagnostics = report.get("diagnostics", [])
+    if len(diagnostics) != len(diagnostic_jobs) or any(
+        any(trial.get(key) != value for key, value in job.items())
+        or trial.get("configuration") != configs[job["config"]]
+        or trial.get("diagnostic") is not True
+        or trial.get("execution_mode") != "persistent-process"
+        or trial.get("status") != "passed"
+        or trial.get("diagnostics_complete") is not True
+        or trial.get("profile_complete") is not True
+        for trial, job in zip(diagnostics, diagnostic_jobs)
+    ):
+        raise ValueError("Diagnosis requires every complete capture in the frozen diagnostic schedule")
+    if any(not profile.summarize(trial.get("diagnostics"))["complete"] for trial in diagnostics):
+        raise ValueError("Diagnosis profiles must contain complete raw captures without dropped or unfinished events")
+    outputs = {}
+    for trial in [*report["trials"], *diagnostics]:
+        digest = trial.get("output_sha256")
+        key = trial["dataset"], trial["case"]
+        if not isinstance(digest, str) or not digest or outputs.setdefault(key, digest) != digest:
+            raise ValueError("Diagnosis outputs must agree across measured trials, warmups and diagnostics")
 
 
 def freeze(report_path, config_name, output):

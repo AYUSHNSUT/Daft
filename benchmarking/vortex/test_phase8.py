@@ -8,6 +8,7 @@ import pytest
 
 from benchmarking.vortex import phase7, phase8
 from benchmarking.vortex.test_phase7 import fake_run as fake_run  # noqa: PLC0414
+from benchmarking.vortex.test_profile import capture
 
 
 def test_independent_candidates_change_only_one_control():
@@ -136,8 +137,9 @@ def test_original_performance_thresholds_are_preserved(stage, ratio, expected):
 
 
 def release_report():
-    configs = phase8.configurations()
     pairs = phase8.comparisons(["aa", "sessions", "combined", "parquet"])
+    used = {name for pair in pairs.values() for name in pair}
+    configs = {name: config for name, config in phase8.configurations().items() if name in used}
     cases, datasets, rounds = list(phase8.QUERY_CASES), ["sorted/multi"], 20
     trials = phase7.schedule(cases, datasets, pairs, 1, rounds, 11)
     for trial in trials:
@@ -148,11 +150,31 @@ def release_report():
             configuration=configs[trial["config"]],
             execution_mode="persistent-process",
         )
+    diagnostics = phase8.remote_eval.base_schedule(cases, datasets, list(configs), 0, 3, 11)
+    for trial in diagnostics:
+        trial.update(
+            status="passed",
+            output_sha256="oracle",
+            configuration=configs[trial["config"]],
+            execution_mode="persistent-process",
+            diagnostic=True,
+            diagnostics_complete=True,
+            profile_complete=True,
+            diagnostics=capture(),
+        )
+    provenance = {
+        "git_head": "source",
+        "native_binaries_sha256": {"native": "binary"},
+        "build_type": "release",
+        "build_command": "attested",
+        "tracked_changes": False,
+    }
     return {
         "experiment": "phase8_paired_diagnosis",
         "status": "passed",
         "provenance_unchanged": True,
-        "environment": {"git_head": "source", "native_binaries_sha256": {"native": "binary"}},
+        "environment": provenance,
+        "environment_after": copy.deepcopy(provenance),
         "storage_root": "s3://local",
         "manifest_sha256": "fixture",
         "settings": {
@@ -168,6 +190,7 @@ def release_report():
             "configuration_sha256": {name: phase7.fingerprint(config) for name, config in configs.items()},
         },
         "trials": trials,
+        "diagnostics": diagnostics,
         "summary": phase7.summarize(trials, cases, datasets, pairs, rounds),
     }
 
@@ -191,6 +214,103 @@ def test_diagnosis_rejects_summary_order_that_differs_from_raw_schedule():
     report = release_report()
     report["summary"][:2] = reversed(report["summary"][:2])
     with pytest.raises(ValueError, match="schedule"):
+        phase8.validate_diagnosis(report)
+
+
+@pytest.mark.parametrize("mutation", ["unmeasured", "missing_hash", "changed_hash"])
+def test_freeze_rejects_unmeasured_or_unidentified_configuration(tmp_path, mutation):
+    report = release_report()
+    if mutation == "unmeasured":
+        report["settings"]["configurations"]["offsets"] = phase8.configurations()["offsets"]
+        report["settings"]["configuration_sha256"]["offsets"] = phase7.fingerprint(phase8.configurations()["offsets"])
+    elif mutation == "missing_hash":
+        del report["settings"]["configuration_sha256"]["combined"]
+    else:
+        report["settings"]["configuration_sha256"]["baseline"] = "changed"
+    path, selected = tmp_path / "report.json", tmp_path / "selection.json"
+    path.write_text(json.dumps(report, sort_keys=True))
+    with pytest.raises(ValueError, match="configurations"):
+        phase8.freeze(path, "offsets" if mutation == "unmeasured" else "combined", selected)
+    assert not selected.exists()
+
+
+@pytest.mark.parametrize("mutation", ["failed", "missing_time", "nonfinite_time", "output"])
+def test_diagnosis_rejects_invalid_warmup_even_when_measured_pairs_pass(mutation):
+    report = release_report()
+    warmup = next(trial for trial in report["trials"] if trial["warmup"])
+    if mutation == "failed":
+        warmup["status"] = "failed"
+    elif mutation == "missing_time":
+        del warmup["wall_seconds"]
+    elif mutation == "nonfinite_time":
+        warmup["wall_seconds"] = float("nan")
+    else:
+        warmup["output_sha256"] = "different"
+    with pytest.raises(ValueError, match="schedule|outputs"):
+        phase8.validate_diagnosis(report)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "duplicate",
+        "reordered",
+        "failed",
+        "configuration",
+        "capture_incomplete",
+        "profile_incomplete",
+        "output",
+    ],
+)
+def test_diagnosis_rejects_incomplete_or_mismatched_diagnostic_evidence(mutation):
+    report = release_report()
+    trial = report["diagnostics"][0]
+    if mutation == "missing":
+        report["diagnostics"].pop()
+    elif mutation == "duplicate":
+        report["diagnostics"][1] = copy.deepcopy(trial)
+    elif mutation == "reordered":
+        report["diagnostics"][:2] = reversed(report["diagnostics"][:2])
+    elif mutation == "failed":
+        trial["status"] = "failed"
+    elif mutation == "configuration":
+        trial["configuration"] = {"reader": "wrong"}
+    elif mutation == "capture_incomplete":
+        trial["diagnostics_complete"] = False
+    elif mutation == "profile_incomplete":
+        trial["profile_complete"] = False
+    else:
+        trial["output_sha256"] = "different"
+    with pytest.raises(ValueError, match="diagnostic schedule|outputs"):
+        phase8.validate_diagnosis(report)
+
+
+@pytest.mark.parametrize(
+    "origin,field", [("python", "dropped_events"), ("native", "dropped_events"), ("native", "unfinished_events")]
+)
+def test_diagnosis_recomputes_capture_completeness_instead_of_trusting_flags(origin, field):
+    report = release_report()
+    report["diagnostics"][0]["diagnostics"][origin][field] = 1
+    with pytest.raises(ValueError, match="complete raw captures"):
+        phase8.validate_diagnosis(report)
+
+
+@pytest.mark.parametrize("mutation", ["debug", "dirty", "unattested", "changed_native"])
+def test_diagnosis_requires_unchanged_attested_release_provenance(mutation):
+    report = release_report()
+    if mutation == "debug":
+        report["environment"]["build_type"] = "dev"
+        report["environment_after"]["build_type"] = "dev"
+    elif mutation == "dirty":
+        report["environment"]["tracked_changes"] = True
+        report["environment_after"]["tracked_changes"] = True
+    elif mutation == "unattested":
+        report["environment"]["build_command"] = None
+        report["environment_after"]["build_command"] = None
+    else:
+        report["environment_after"]["native_binaries_sha256"] = {"native": "changed"}
+    with pytest.raises(ValueError, match="release remote diagnosis"):
         phase8.validate_diagnosis(report)
 
 

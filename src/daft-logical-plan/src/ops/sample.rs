@@ -11,7 +11,7 @@ use crate::{
 };
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(debug_assertions, derive(Debug))]
+#[cfg_attr(any(debug_assertions, test), derive(Debug))]
 pub struct Sample {
     pub plan_id: Option<usize>,
     pub node_id: Option<usize>,

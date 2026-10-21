@@ -3,8 +3,9 @@
 Branch: `poc/vortex-phase8`, based on `cb351ae6a` (`poc/vortex-phase7`). This
 iteration executes M1/M2 and the first contained candidates D1/S1/S4/D3 from
 the [performance worklist](vortex-performance-worklist.md). M3 gains bounded
-SDK task envelopes; exclusive CPU/allocation and physical transport attribution
-remain investigations with explicit unavailable coverage.
+SDK task envelopes and local all-thread stack captures; exclusive CPU/allocation
+and physical transport attribution remain investigations with explicit
+unavailable coverage.
 
 ## Reader candidates
 
@@ -87,11 +88,9 @@ Ranges span independent session medians, not confidence intervals.
 | Layout sub-splitting | Full reductions take 11.2–24.3% more time across all layouts | No consistent improvement across all cases | Exclude from the current acceptance candidate |
 | All four controls | Full reductions take 8.0–19.1% more time | Only narrow scans and joins beat Parquet in every session | Exclude the bundle from the current acceptance candidate |
 
-The frozen candidate will enable session reuse only, retaining the baseline
-settings for all other controls. The first remote session supplies evidence by
-position, not by best timing. Independent acceptance still requires all five
-remote medians below Parquet and every local median within 5% of the baseline.
-The diagnosis does not establish that these gates will pass.
+The frozen candidate enables session reuse only, retaining the baseline
+settings for all other controls. It was selected before independent acceptance,
+without replacing it based on acceptance results.
 
 The CLI case-selection fix and a sorted-JSON schedule-validation fix change the
 Python harness only; the native binary is unchanged. The validator reconstructs
@@ -99,7 +98,76 @@ comparison order from the serialized summary list because JSON object key order
 is sorted when saving reports. Raw schedules are then checked exactly against
 that order and the recorded seed. Regression tests cover the real serialization
 format and duplicate comparison entries. A fresh qualifying diagnosis on the
-final harness revision will precede candidate freezing and final acceptance.
+final harness revision preceded candidate freezing and final acceptance.
+
+### Independent acceptance outcome
+
+The [saved acceptance](../../examples/vortex_eval/artifacts/phase8/acceptance-20261021T164449Z-51632/acceptance.json)
+measured source `b36572cc6` and native SHA-256 `307b4452a633d577787e47e4162246660ec7495db56d885adf416aa6da42a568`.
+Qualification used seed 3149; remote final used 4159; the local guard used 5167.
+Independent auditing reconstructed raw schedules, checked every output against
+the fixture oracle, recomputed summaries/gates, and verified candidate, source,
+native, fixture and report identities. The three runs contain 3,160 query
+executions (3,000 measured, 160 warmups) and 270 separate complete diagnostic
+captures, with zero dropped/unfinished events.
+
+- **Remote speed gate: failed.** All outputs are correct, but range, equality
+  and full reduction take 4.63%, 2.64% and 2.27% more time than Parquet. Narrow
+  scans and joins are 1.397× and 1.145× as fast. All five cases have 50 measured
+  pairs, balanced 25/25 by order, after three warmups.
+- **Local regression guard: passed all 20 cases.** Candidate/previous-Vortex
+  medians range from 13.69% less time to 1.56% more time, inside the fixed 5%
+  limit. Dedicated Parquet/candidate pairs win 18/20, retaining sorted/multi
+  range and equality losses. Every comparison has 20 measured pairs and one
+  warmup across all four layouts.
+- **Decision:** retain the controls as experiments with defaults false. Do not
+  promote session reuse or claim a universal win. Preserve the failed speed
+  gate; no candidate switching or rerunning timing samples to obtain a pass.
+
+The [maintained comparison](parquet-vs-vortex.md) contains every dedicated
+Parquet/candidate median and the hashes of qualification and both confirmation
+reports. Compatibility failures are tracked separately below; they do not
+convert a completed speed comparison into a passing acceptance result.
+
+### Acceptance follow-up and compatibility
+
+The terminal run passed ORC/MCAP (**112 passed, one external-S3 test skipped**)
+and all **seven S3 pooling tests**. Its service suite had **41 passes and four
+failures**: the existing metadata-reuse assertion rejected normal background SDK
+task teardown now exposed by the new diagnostic envelopes. Local reproduction
+confirmed correct rows, zero errors and complete captures in all four parameter
+combinations. The corrected assertion permits only unattributed execution
+`sdk_task`/`sdk_task_queue` cancellations, still rejecting every error, actual
+I/O cancellation and incomplete capture. Eight regression checks pass; the full
+HTTP/MinIO/Ray rerun passes **53 tests with zero skips**. Its log is
+`examples/vortex_eval/artifacts/phase8/services-recheck.log`.
+
+The workspace's release tests initially failed to compile because several
+existing assertions required debug-only `Debug` implementations. Test-only
+derivations and SQL assertions now compile in release mode. The agent-side
+workspace retry reached test execution, then public-S3 cases failed with native
+DNS lookup errors. That incomplete run is retained. The terminal rerun of
+`cargo test --offline --locked --release --no-default-features --workspace --no-fail-fast`
+passes **2,320 tests, zero failures and 20 ignored**, including doctests. Its
+source, tracked diff and native extension identities stayed unchanged. The
+result and hashed log are in
+`examples/vortex_eval/artifacts/phase8/workspace-terminal-20261021T174013Z-92294/`.
+
+The release wheel rebuild and full workspace, all-features, all-targets Clippy
+check with warnings denied also pass. Logs are `release-wheel-recheck.log` and
+`clippy-final-recheck.log` under the Phase 8 artifacts directory. The wheel was
+not installed over the measured extension; the Rust follow-ups affect tests
+only. Formatting, dependency validation and applicable pre-commit checks pass.
+Release caches are retained and incremental compilation is disabled to avoid
+recreating the removed debug build directory.
+
+Review also hardened saved-report qualification: configurations must be exactly
+those compared, warmups must pass, diagnostic schedules and raw captures must be
+complete, and outputs/provenance must agree. The original qualification report
+passes the stricter validator without rerunning its measurements. The complete
+benchmark-harness suite passes **225 tests**. These follow-ups change validation,
+tests and documentation; the recorded performance evidence retains its original
+source/native identity and the failed remote speed gate.
 
 ### What the profiles explain
 
@@ -122,9 +190,49 @@ CPU or values to add together. They never enter performance medians.
   support investigating batch fragmentation and scheduling overhead; they do
   not establish an additive or exclusive CPU breakdown.
 
-All-thread stack sampling remains a separate terminal-side diagnostic. Allocator
-live bytes, exclusive decoder CPU and physical transport/server attribution are
-still unavailable; task spans and SDK send counts do not fill those gaps.
+### What the stack captures add
+
+Six terminal-side macOS `sample` captures succeeded, each requesting ten seconds
+at a one-millisecond interval after a warmup. They cover local sorted/multi full
+reductions with baseline, session reuse, large offsets and layout splitting,
+plus equality filters with baseline and session reuse. Source/native identity
+remained unchanged and outputs matched across variants. Raw `stacks.txt` and
+`sample.json` files are under `sample-*` in the saved acceptance directory.
+
+These are all-thread wall snapshots, including suspended threads, not exclusive
+CPU or percentages of query latency. The following counts come from collapsed
+top-of-stack observations; entries with fewer than five observations are omitted
+by the sampler. Counts locate work, not throughput or speedups.
+
+| Observation | Baseline full | Large-offset full | Layout-split full |
+| --- | ---: | ---: | ---: |
+| FSST decompression | 7,735 | 8,243 | 6,880 |
+| Memory copying (`memmove`) | 8,589 | 8,966 | 7,806 |
+| Arrow offset cast (`cast_byte_container`) | 1,497 | No entry at least 5 | 1,622 |
+| Daft string-length frames | 4,539 | 4,896 | 3,824 |
+| `mmap` | 5,549 | 5,723 | 8,514 |
+
+- Large offsets remove the visible offset-cast hotspot while string
+  materialization and read-buffer copying remain. Of baseline `memmove` leaf
+  observations, 5,221 occur under `VarBinBuilder` and 3,286 under Tokio's
+  `Take<File>::poll_read`; large offsets retain 5,351 and 3,530 respectively.
+- For equality filters, ArcSwap registry-related leaf observations fall from
+  2,493 to 99 with session reuse. Stacks include session/kernel registration,
+  corroborating the separately measured reduction in session creation.
+- Layout splits show more mapping/view-building activity alongside the already
+  observed increase in batches/tasks. This supports investigating fragmentation;
+  it does not assign its latency penalty to a single function.
+- String-length work belongs to the Daft reduction query and may affect both
+  formats. These captures include no Parquet or remote MinIO workload, so they
+  cannot quantify the remote format gap.
+
+Idle runtime pools dominate the wait observations; their frequency does not
+prove lock contention. Sampling also covers inter-query GC, result serialization
+and stdin waits outside the query timer. Queries continue during sampler symbol
+processing, so total diagnostic iterations cannot normalize the ten-second
+stack counts. Use paired Parquet/Vortex captures bracketed by query-active
+intervals next. Allocator live bytes, exclusive decoder CPU and physical
+transport/server attribution remain unavailable.
 
 ## Validation and execution
 
@@ -143,7 +251,8 @@ still unavailable; task spans and SDK send counts do not fill those gaps.
 5. Complete authenticated HTTP/MinIO/Ray and compatibility/workspace checks,
    updating [the single comparison](parquet-vs-vortex.md) with measured outcomes
    and limitations. Push and open the fork-only PR into the previous branch after
-   required validation. Environment-dependent checks are pending until executed.
+   required validation. These checks are complete; the remote performance gate
+   remains failed as recorded above.
 
 Example local diagnosis (new output directory each time):
 

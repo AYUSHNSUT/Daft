@@ -38,6 +38,7 @@ def main(argv=None):
         "DAFT_VORTEX_BENCH_BUILD_COMMAND": frozen["build_command"],
         "CI": "1",
         "CARGO_BUILD_JOBS": "2",
+        "CARGO_INCREMENTAL": "0",
     }
     python = str(root / ".venv/bin/python")
     jobs = [
@@ -80,7 +81,16 @@ def main(argv=None):
         ),
         (
             "workspace-rust",
-            ["cargo", "test", "--offline", "--locked", "--no-default-features", "--workspace", "--no-fail-fast"],
+            [
+                "cargo",
+                "test",
+                "--offline",
+                "--locked",
+                "--release",
+                "--no-default-features",
+                "--workspace",
+                "--no-fail-fast",
+            ],
         ),
     ]
     report = {"status": "running", "frozen": frozen, "checks": []}

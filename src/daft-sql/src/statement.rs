@@ -426,7 +426,7 @@ mod test {
 
         if let Statement::Use(use_stmt) = plan {
             assert_eq!(use_stmt.catalog, "mycatalog");
-            assert_eq!(use_stmt.namespace, None);
+            assert_eq!(use_stmt.namespace.map(Identifier::path), None);
         } else {
             panic!("Expected Use statement");
         }
@@ -443,8 +443,8 @@ mod test {
         if let Statement::Use(use_stmt) = plan {
             assert_eq!(use_stmt.catalog, "mycatalog");
             assert_eq!(
-                use_stmt.namespace,
-                Some(Identifier::try_new(vec!["myschema"])?)
+                use_stmt.namespace.map(Identifier::path),
+                Some(vec!["myschema".to_string()])
             );
             Ok(())
         } else {
@@ -464,8 +464,8 @@ mod test {
         if let Statement::Use(use_stmt) = plan {
             assert_eq!(use_stmt.catalog, "mycatalog");
             assert_eq!(
-                use_stmt.namespace,
-                Some(Identifier::try_new(vec!["myschema", "mysubschema"])?)
+                use_stmt.namespace.map(Identifier::path),
+                Some(vec!["myschema".to_string(), "mysubschema".to_string()])
             );
             Ok(())
         } else {
@@ -601,13 +601,12 @@ mod test {
         let statement = parse_sql(sql);
         let session = Session::default();
         let mut planner = SQLPlanner::new(&session);
-        let result = planner.plan_statement(&statement);
-        assert!(result.is_err());
+        let Err(error) = planner.plan_statement(&statement) else {
+            panic!("CREATE TABLE with duplicate column names should be rejected");
+        };
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Duplicate column name: a")
+            error.to_string().contains("Duplicate column name: a"),
+            "unexpected planning error: {error}"
         );
     }
 }
