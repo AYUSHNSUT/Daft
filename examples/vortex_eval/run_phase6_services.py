@@ -53,6 +53,7 @@ def main(argv=None):
     parser.add_argument("--warmups", type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--execution-mode", choices=("fresh-process", "persistent-process"), default="fresh-process")
     parser.add_argument("--diagnostics", action="store_true")
     parser.add_argument("--allow-dev", action="store_true", help="Correctness smoke only; no performance gate")
     args = parser.parse_args(argv)
@@ -60,7 +61,7 @@ def main(argv=None):
     warmups = (3 if args.stage == "final" else 1) if args.warmups is None else args.warmups
     selection_path = args.selection.resolve() if args.selection else None
     if selection_path:
-        selected = load_selection(selection_path, args.allow_dev)
+        selected = load_selection(selection_path, args.allow_dev, execution_mode=args.execution_mode)
         if args.stage != "final":
             parser.error("A frozen selection applies only to the final stage")
         args.candidate_policy = selected["policy"]
@@ -150,6 +151,8 @@ def main(argv=None):
             str(args.seed),
             "--timeout",
             str(args.timeout),
+            "--execution-mode",
+            args.execution_mode,
         ]
         if selection_path:
             command += ["--selection", str(selection_path)]
@@ -168,6 +171,9 @@ def main(argv=None):
         report = json.loads(report_path.read_text())
         if report.get("status") != "passed" or report.get("experiment") != "remote_read_policy":
             raise RuntimeError("Remote evaluation report did not pass")
+        settings = report.get("settings")
+        if not isinstance(settings, dict) or settings.get("execution_mode") != args.execution_mode:
+            raise RuntimeError("Remote evaluation report execution mode differs from the requested comparison")
         if (
             args.stage == "final"
             and not args.allow_dev

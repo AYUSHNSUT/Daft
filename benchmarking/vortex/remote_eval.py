@@ -7,6 +7,7 @@ summaries. Existing Phase 4/5 fixtures, oracles and reports are left unchanged.
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import math
@@ -23,6 +24,7 @@ from typing import Any
 
 from .fixtures import cutoff, file_hash, load_manifest
 from .metadata_eval import QUERY_CASES, range_summary
+from .persistent import PersistentWorker
 from .run import check_output, environment, file_read_telemetry, io_config, io_settings, redacted, source_paths
 from .run import schedule as base_schedule
 
@@ -34,9 +36,10 @@ POLICIES = {
 }
 DEFAULT_POLICY = "64k_4m"
 RANKING = "worst case Vortex/Parquet median; geometric mean wall seconds; total source bytes; config id"
+EXECUTION_MODES = ("fresh-process", "persistent-process")
 
 
-def load_selection(path, allow_dev=False):
+def load_selection(path, allow_dev=False, execution_mode=None):
     path = Path(path)
     selected = json.loads(path.read_text())
     if (
@@ -56,6 +59,13 @@ def load_selection(path, allow_dev=False):
     report = json.loads(report_path.read_text())
     try:
         settings, provenance = report["settings"], report["environment"]
+        recorded_mode = settings.get("execution_mode", "fresh-process")
+        if (
+            recorded_mode not in EXECUTION_MODES
+            or selected.get("execution_mode", "fresh-process") != recorded_mode
+            or (execution_mode is not None and recorded_mode != execution_mode)
+        ):
+            raise ValueError("Frozen selection execution mode differs from this comparison or its tuning report")
         if (
             report["experiment"] != "remote_read_policy"
             or settings["stage"] != "tune"
@@ -97,6 +107,7 @@ def load_selection(path, allow_dev=False):
             or isinstance(trial["wall_seconds"], bool)
             or not math.isfinite(trial["wall_seconds"])
             or trial["wall_seconds"] <= 0
+            or trial.get("execution_mode", "fresh-process") != recorded_mode
             for trial, job in zip(trials, jobs)
         ):
             raise ValueError("Tuning report has missing, failed or invalid seeded trials")
@@ -127,7 +138,9 @@ def load_selection(path, allow_dev=False):
     return selected
 
 
-def validate_selection_identity(selected, provenance, manifest_sha256, stage):
+def validate_selection_identity(selected, provenance, manifest_sha256, stage, execution_mode=None):
+    if execution_mode is not None and selected.get("execution_mode", "fresh-process") != execution_mode:
+        raise ValueError("Frozen selection execution mode differs from this comparison")
     if selected["source_revision"] != provenance.get("git_head") or selected[
         "native_binaries_sha256"
     ] != provenance.get("native_binaries_sha256"):
@@ -279,16 +292,24 @@ def query(spec, manifest):
     return frame.agg(*reductions)
 
 
-def worker(spec):
+def prepare_worker(allow_dev):
     import daft
-    from daft.context import get_context
 
     require_api()
     daft.set_runner_native()
-    if daft.daft.build_type() != "release" and not spec["allow_dev"]:
+    if daft.daft.build_type() != "release" and not allow_dev:
         raise ValueError("Comparisons require an attested release build")
-    manifest = json.loads(Path(spec["manifest"]).read_text())
     daft.from_pydict({"x": [1]}).agg(daft.col("x").sum()).collect()
+
+
+def worker(spec, *, prepared=False):
+    import daft
+    from daft.context import get_context
+
+    if not prepared:
+        prepare_worker(spec["allow_dev"])
+    manifest = json.loads(Path(spec["manifest"]).read_text())
+    execution_mode = spec.get("execution_mode", "fresh-process")
     diagnostic = spec.get("diagnostic", False)
     trace = None
     recorder = None
@@ -322,7 +343,10 @@ def worker(spec):
     for metric in metrics:
         metric["duration_seconds"] = metric.pop("duration").total_seconds()
     plan = io.StringIO()
-    query(spec, manifest).explain(show_all=True, file=plan)
+    # Do not issue untimed remote reads between persistent performance trials.
+    # Their plans are captured only in the later diagnostic queries.
+    if execution_mode == "fresh-process" or diagnostic:
+        query(spec, manifest).explain(show_all=True, file=plan)
     cfg = get_context().daft_execution_config
     result = {
         "status": "passed",
@@ -332,6 +356,8 @@ def worker(spec):
         "operator_metrics": metrics,
         "plan": redacted(plan.getvalue()),
         "diagnostic": diagnostic,
+        "execution_mode": execution_mode,
+        "worker_pid": os.getpid(),
         "read_requests": None,
         "read_requests_unavailable_reason": "Query SourceSnapshot does not export request counts; separate diagnostics are not performance trials",
         "effective_settings": {
@@ -346,6 +372,11 @@ def worker(spec):
             storage_root=spec.get("storage_root"),
         ),
     }
+    if not plan.getvalue():
+        result.pop("plan")
+        result["plan_unavailable_reason"] = (
+            "Plans are captured only after persistent performance trials, in diagnostics"
+        )
     if diagnostic:
         complete = all(
             type(value) is int and value == 0
@@ -369,10 +400,36 @@ def worker(spec):
         result.update(
             wall_seconds=wall / 1e9,
             cpu_seconds=cpu_elapsed / 1e9,
-            peak_rss_bytes=rss,
+            peak_rss_bytes=rss if execution_mode == "fresh-process" else None,
+            process_peak_rss_bytes=rss,
+            rss_scope="worker lifetime high-water; persistent workers share this value across trials",
             measurement_scope="fresh source/discovery/schema/planning through complete aggregate collection",
         )
     return result
+
+
+def worker_session():
+    """Read sequential requests while retaining process-level I/O clients."""
+    prepared = False
+    for line in sys.stdin:
+        request = json.loads(line)
+        result_path = Path(request["result"])
+        spec = json.loads(Path(request["spec"]).read_text())
+        try:
+            if not prepared:
+                prepare_worker(spec["allow_dev"])
+                prepared = True
+            result = worker(spec, prepared=True)
+        except Exception as error:
+            result = {"status": "failed", "error": redacted(str(error)), "worker_pid": os.getpid()}
+        # Drop collected results before the next fresh source/query is built.
+        gc.collect()
+        temporary = result_path.with_suffix(".pending")
+        temporary.write_text(redacted(json.dumps(result, indent=2, sort_keys=True, allow_nan=False)) + "\n")
+        temporary.replace(result_path)
+        if result["status"] != "passed":
+            return 1
+    return 0
 
 
 def summarize(trials, datasets, cases, configs, rounds):
@@ -506,6 +563,7 @@ def markdown(report):
         "",
         f"Status: {report['status']}; purpose: {report['purpose']}.",
         f"Performance gate: {report['performance_gate']['status']}.",
+        f"Execution mode: {report['settings'].get('execution_mode', 'fresh-process')}.",
         "",
         "| Dataset | Case | Configuration | Status | Median [min–max] seconds | Vortex / Parquet |",
         "| --- | --- | --- | --- | --- | ---: |",
@@ -525,13 +583,14 @@ def markdown(report):
         "Diagnostic captures are separate executed queries after performance trials, excluded from all timing summaries.",
         "Parquet diagnostics cover outer source creation/collection only; absent internal-phase/request events are unavailable, not zero cost.",
         "Caches are retained; fresh processes do not establish cold-cache conditions. Source bytes exclude discovery/planning and are not physical traffic.",
-        "CPU covers the client process; RSS is its lifetime high-water including setup. MinIO/VM resources are excluded.",
+        "CPU is a per-query client-process delta. RSS is a worker lifetime high-water; per-trial RSS is unavailable in persistent mode. MinIO/VM resources are excluded.",
+        "Persistent mode retains clients/connections across warmups and measured rounds, with fresh sources and queries. Source creation remains timed.",
         "",
     ]
     return "\n".join(lines)
 
 
-def execute_child(spec, index, output, child_env, timeout):
+def execute_child(spec, index, output, child_env, timeout, session=None):
     kind = "diagnostics" if spec.get("diagnostic") else "trials"
     stem = f"{index:05d}"
     spec_path, result_path = output / kind / f"{stem}-spec.json", output / kind / f"{stem}.json"
@@ -540,26 +599,31 @@ def execute_child(spec, index, output, child_env, timeout):
     began = time.perf_counter()
     code, stderr = None, ""
     try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "benchmarking.vortex.remote_eval",
-                "--worker-spec",
-                str(spec_path),
-                "--output",
-                str(result_path),
-            ],
-            capture_output=True,
-            text=True,
-            env=child_env,
-            timeout=timeout,
-            check=False,
-        )
-        code, stderr = completed.returncode, completed.stderr or ""
-        if code or not result_path.is_file():
-            raise RuntimeError(f"Trial exit={code}: {redacted(stderr[-6000:])}")
-        trial = {**spec, **json.loads(result_path.read_text())}
+        if session is not None:
+            result = session.execute(spec_path, result_path, timeout)
+            code = 0
+        else:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmarking.vortex.remote_eval",
+                    "--worker-spec",
+                    str(spec_path),
+                    "--output",
+                    str(result_path),
+                ],
+                capture_output=True,
+                text=True,
+                env=child_env,
+                timeout=timeout,
+                check=False,
+            )
+            code, stderr = completed.returncode, completed.stderr or ""
+            if code or not result_path.is_file():
+                raise RuntimeError(f"Trial exit={code}: {redacted(stderr[-6000:])}")
+            result = json.loads(result_path.read_text())
+        trial = {**spec, **result}
         if "plan" in trial:
             relative = f"plans/{kind}-{stem}.txt"
             (output / relative).write_text(redacted(trial.pop("plan")))
@@ -570,14 +634,25 @@ def execute_child(spec, index, output, child_env, timeout):
             stderr = captured.decode(errors="replace") if isinstance(captured, bytes) else captured
         trial = {**spec, "status": "failed", "error": redacted(str(error))}
     stderr_path = f"{kind}/{stem}-stderr.log"
-    (output / stderr_path).write_text(redacted(stderr))
-    trial.update(
-        subprocess_started_at_utc=started,
-        subprocess_completed_at_utc=datetime.now(timezone.utc).isoformat(),
-        subprocess_elapsed_seconds=time.perf_counter() - began,
-        subprocess_returncode=code,
-        worker_stderr=stderr_path,
-    )
+    completed_at = datetime.now(timezone.utc).isoformat()
+    elapsed = time.perf_counter() - began
+    if session is not None:
+        trial.update(
+            worker_request_started_at_utc=started,
+            worker_request_completed_at_utc=completed_at,
+            worker_request_elapsed_seconds=elapsed,
+            worker_pid=session.process.pid if session.process is not None else None,
+            worker_stderr="persistent-worker.log",
+        )
+    else:
+        (output / stderr_path).write_text(redacted(stderr))
+        trial.update(
+            subprocess_started_at_utc=started,
+            subprocess_completed_at_utc=completed_at,
+            subprocess_elapsed_seconds=elapsed,
+            subprocess_returncode=code,
+            worker_stderr=stderr_path,
+        )
     result_path.write_text(redacted(json.dumps(trial, indent=2, sort_keys=True, allow_nan=False)) + "\n")
     return trial
 
@@ -599,13 +674,16 @@ def run(
     storage_root=None,
     timeout=600,
     diagnostics=False,
+    execution_mode="fresh-process",
 ):
     os.environ["DAFT_ANALYTICS_ENABLED"] = "0"
     rounds = (50 if stage == "final" else 20) if rounds is None else rounds
     warmups = (3 if stage == "final" else 1) if warmups is None else warmups
+    if execution_mode not in EXECUTION_MODES:
+        raise ValueError("Choose a supported execution mode")
     selected = None
     if selection is not None:
-        selected = load_selection(selection, allow_dev)
+        selected = load_selection(selection, allow_dev, execution_mode=execution_mode)
         if stage not in {"final", "guard"}:
             raise ValueError("A frozen selection applies only to final/local-guard stages")
         candidate_policy = selected["policy"]
@@ -633,7 +711,7 @@ def run(
     ):
         raise ValueError("Performance requires an attested release build, native hash and clean tracked source")
     if selected is not None and not allow_dev:
-        validate_selection_identity(selected, provenance, file_hash(manifest_path), stage)
+        validate_selection_identity(selected, provenance, file_hash(manifest_path), stage, execution_mode)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise FileExistsError("Report directory must be absent or empty")
     output.mkdir(parents=True, exist_ok=True)
@@ -642,6 +720,7 @@ def run(
     configs = configurations(stage, candidate_policy)
     settings = {
         "stage": stage,
+        "execution_mode": execution_mode,
         "candidate_policy": candidate_policy,
         "configurations": configs,
         "cases": list(cases),
@@ -680,34 +759,51 @@ def run(
     child_env = {**os.environ, "DAFT_RUNNER": "native", "DAFT_PROGRESS_BAR": "0", "DAFT_ANALYTICS_ENABLED": "0"}
     jobs = base_schedule(cases, datasets, list(configs), warmups, rounds, seed)
     round_size = len(datasets) * len(cases) * len(configs)
-    for index, entry in enumerate(jobs):
-        spec = {
-            **entry,
-            "configuration": configs[entry["config"]],
-            "manifest": str(manifest_path),
-            "storage_root": storage_root,
-            "allow_dev": allow_dev,
-            "diagnostic": False,
-        }
-        trial = execute_child(spec, index, output, child_env, timeout)
-        report["trials"].append(trial)
-        if (index + 1) % round_size == 0:
-            report_path.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
-        print(
-            f"[{index + 1}/{len(jobs)}] {entry['dataset']} {entry['case']} {entry['config']}: {trial['status']}",
-            flush=True,
-        )
-    if diagnostics:
-        for index, entry in enumerate(base_schedule(cases, datasets, list(configs), 0, 1, seed)):
+    session_context = PersistentWorker(output, child_env) if execution_mode == "persistent-process" else nullcontext()
+    with session_context as session:
+        for index, entry in enumerate(jobs):
             spec = {
                 **entry,
                 "configuration": configs[entry["config"]],
                 "manifest": str(manifest_path),
                 "storage_root": storage_root,
                 "allow_dev": allow_dev,
-                "diagnostic": True,
+                "diagnostic": False,
+                "execution_mode": execution_mode,
             }
-            report["diagnostics"].append(execute_child(spec, index, output, child_env, timeout))
+            trial = execute_child(spec, index, output, child_env, timeout, session=session)
+            report["trials"].append(trial)
+            if (index + 1) % round_size == 0:
+                report_path.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
+            print(
+                f"[{index + 1}/{len(jobs)}] {entry['dataset']} {entry['case']} {entry['config']}: {trial['status']}",
+                flush=True,
+            )
+        if diagnostics:
+            for index, entry in enumerate(base_schedule(cases, datasets, list(configs), 0, 1, seed)):
+                spec = {
+                    **entry,
+                    "configuration": configs[entry["config"]],
+                    "manifest": str(manifest_path),
+                    "storage_root": storage_root,
+                    "allow_dev": allow_dev,
+                    "diagnostic": True,
+                    "execution_mode": execution_mode,
+                }
+                report["diagnostics"].append(execute_child(spec, index, output, child_env, timeout, session=session))
+    if session is not None:
+        report["worker_session"] = {
+            "pid": session.process.pid if session.process is not None else None,
+            "started_at_utc": session.started_at_utc,
+            "completed_at_utc": session.completed_at_utc,
+            "returncode": session.process.returncode if session.process is not None else None,
+            "failure": session.failure,
+            "process_peak_rss_bytes": max(
+                (t.get("process_peak_rss_bytes", 0) for t in report["trials"] if t["status"] == "passed"),
+                default=None,
+            ),
+            "rss_scope": "worker lifetime high-water through performance trials, including warmups; not per-query RSS",
+        }
     report["environment_after"] = environment()
     identity_keys = (
         "git_head",
@@ -720,7 +816,7 @@ def run(
     )
     report["provenance_unchanged"] = all(provenance.get(k) == report["environment_after"].get(k) for k in identity_keys)
     report["summary"] = summarize(report["trials"], datasets, cases, configs, rounds)
-    all_passed = all(t["status"] == "passed" for t in report["trials"])
+    all_passed = all(t["status"] == "passed" for t in report["trials"]) and (session is None or session.failure is None)
     diagnostic_passed = all(
         t["status"] == "passed" and t.get("diagnostics_complete") is True for t in report["diagnostics"]
     )
@@ -742,6 +838,7 @@ def run(
         if eligible:
             selection_data = {
                 "selection_version": 1,
+                "execution_mode": execution_mode,
                 "policy": eligible[0]["policy"],
                 "config": eligible[0]["config"],
                 "configuration": configs[eligible[0]["config"]],
@@ -763,7 +860,7 @@ def main(argv=None):
     os.environ["DAFT_ANALYTICS_ENABLED"] = "0"
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--stage", choices=("tune", "final", "guard"), default="tune")
     parser.add_argument("--candidate-policy", choices=POLICIES, default=DEFAULT_POLICY)
     parser.add_argument("--selection", type=Path)
@@ -776,10 +873,17 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--storage-root")
     parser.add_argument("--diagnostics", action="store_true")
+    parser.add_argument("--execution-mode", choices=EXECUTION_MODES, default="fresh-process")
     parser.add_argument("--allow-dev", action="store_true")
     parser.add_argument("--worker-spec", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-session", action="store_true", help=argparse.SUPPRESS)
     args = vars(parser.parse_args(argv))
     try:
+        session = args.pop("worker_session")
+        if session:
+            return worker_session()
+        if args["output"] is None:
+            parser.error("--output is required")
         spec_path = args.pop("worker_spec")
         if spec_path:
             result = worker(json.loads(spec_path.read_text()))

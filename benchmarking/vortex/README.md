@@ -88,11 +88,13 @@ shapes; date/decimal-dependent TPC-H queries require a separately declared chang
 
 ## Timing, resources, and interpretation
 
-Each trial runs in a fresh subprocess. It initializes Daft with an unrelated tiny
+By default each trial runs in a fresh subprocess. It initializes Daft with an unrelated tiny
 in-memory query, then times fresh source construction, discovery/schema/planning,
 execution, and collection of the complete aggregate output. Imports, fixture
 generation, correctness checks, and plan extraction are outside the timer. Plans
 are obtained **after** timing. Release telemetry is disabled in every child.
+Phase 6 also supports the persistent-process mode described below; Phase 4/5
+behavior and historical reports remain unchanged.
 
 Every warmup and measured round contains all selected combinations in randomized,
 seeded order. Release comparisons require at least one warmup and five measured
@@ -244,6 +246,21 @@ preserved as a failed performance acceptance and is not pooled with this run.
 Use the attested release build and `DAFT_VORTEX_BENCH_BUILD_COMMAND` described
 above; production comparisons require a clean tracked checkout.
 
+Use `--execution-mode persistent-process` for the amortized-cost experiment. One
+supervised worker executes all configurations and warmup/measured rounds in the
+seeded schedule, retaining existing clients and connection pools across queries.
+Every trial still builds a fresh source and DataFrame and times discovery,
+schema, planning, execution and collection. Collected results are never reused.
+This measures steady-state application use with retained OS/server caches, not
+verified cold data. A pooled connection may still be closed by the server or
+client. See the [execution contract](../../docs/contributing/vortex-phase6-amortized-design.md).
+
+`fresh-process` remains the default. Execution mode is recorded in reports and
+saved selections; tuning, final comparison and local guard must use matching
+modes. Historical selections without a mode are fresh-process selections. Never
+pool results across modes. The commands below explicitly select the persistent
+mode; no successful performance result is implied by these examples.
+
 For tuning alone, use authenticated local MinIO after all builds/tests stop.
 The one-command acceptance flow below also runs this tuning stage automatically.
 
@@ -252,7 +269,8 @@ The one-command acceptance flow below also runs this tuning stage automatically.
   --manifest examples/vortex_eval/artifacts/phase4/remote-fixtures/manifest.json \
   --output examples/vortex_eval/artifacts/phase6/tuning \
   --docker-image draft-vortex-minio:phase3 \
-  --stage tune --rounds 20 --warmups 1 --diagnostics
+  --stage tune --rounds 20 --warmups 1 --diagnostics \
+  --execution-mode persistent-process
 ```
 
 The fixed tuning grid includes Parquet and four coalescing policies at discovery
@@ -279,7 +297,8 @@ the existing one/eight-file, sorted/shuffled corpus:
   --manifest examples/vortex_eval/artifacts/phase4/fixtures-1g/manifest.json \
   --output examples/vortex_eval/artifacts/phase6/local-guard \
   --stage guard --orders sorted shuffled --layouts single multi \
-  --rounds 20 --warmups 1 --candidate-policy 64k_4m
+  --rounds 20 --warmups 1 --candidate-policy 64k_4m \
+  --execution-mode persistent-process
 ```
 
 The guard accepts local fixture paths only, requires at least 20 measured rounds
@@ -307,7 +326,7 @@ build and local checks are finished:
   --local-manifest examples/vortex_eval/artifacts/phase4/fixtures-1g/manifest.json \
   --output "examples/vortex_eval/artifacts/phase6/acceptance-$(date -u +%Y%m%dT%H%M%SZ)" \
   --docker-image draft-vortex-minio:phase3 \
-  --tune
+  --tune --execution-mode persistent-process
 ```
 
 This terminal helper does not rebuild/install the Python extension. It runs
@@ -332,7 +351,8 @@ It removes only its temporary buckets/container. To reuse a separately completed
 tuning run, replace `--tune` with `--selection PATH/selected-policy.json`; these
 options are mutually exclusive. For a final comparison without
 the additional acceptance tests, use `run_phase6_services --stage final` with
-the same selection. `--candidate-policy` instead freezes an explicit preset
+the same selection and `--execution-mode persistent-process` when that was used
+for tuning. `--candidate-policy` instead freezes an explicit preset
 before timing; its default is `64k_4m`.
 
 The direct harness is `python -m benchmarking.vortex.remote_eval`, with
@@ -342,7 +362,8 @@ permits correctness smoke only; such a run cannot satisfy the final gate or
 produce a selection accepted by a production final run.
 
 Each `--diagnostics` capture wraps one executed source-construction/collection
-query in its own child **after** the performance schedule. The recorder finishes
+query **after** the performance schedule, in the same warmed worker in persistent
+mode or a separate child in fresh-process mode. The recorder finishes
 before cached-output validation or the separate explain query. Native/Python
 events and logical I/O counters are saved separately, with explicit dropped or
 unfinished-event flags. Nested and concurrent durations overlap; summing them
@@ -352,8 +373,14 @@ counters are unavailable, not zero cost. Physical transport retries remain
 unavailable. Diagnostic measurements
 never enter the performance summaries.
 
-Fresh children, seeded interleaving, independent result oracles, plans,
-CPU/process-high-water RSS, returned source bytes, hashes, UTC timestamps and
-redacted stderr are retained for every trial. No trial is retried or omitted,
-and there is no inter-trial pacing. The local Docker service is not an AWS/WAN
-benchmark; caches are retained, and client RSS excludes MinIO/Docker resources.
+Both modes retain seeded interleaving, independent result oracles, plans,
+per-query CPU, returned source bytes, hashes, UTC timestamps and redacted stderr.
+Fresh-process mode retains process-high-water RSS per trial. Persistent-process
+mode reports lifetime peak RSS once per session, including warmups; it cannot
+attribute that high-water mark to an individual query. Plans and diagnostics run
+after the complete performance schedule, with no untimed explain query between
+its trials. A persistent worker timeout or unexpected exit fails the run and
+preserves completed samples; the worker is not restarted and trials are not
+retried. There is no inter-trial pacing. The local Docker service is not an
+AWS/WAN benchmark; caches are retained, and client RSS excludes MinIO/Docker
+resources.

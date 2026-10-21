@@ -191,8 +191,9 @@ def test_ranking_uses_worst_case_before_average_and_has_stable_ties():
 
 
 @pytest.mark.parametrize("diagnostic", [False, True])
+@pytest.mark.parametrize("execution_mode", evaluation.EXECUTION_MODES)
 @pytest.mark.parametrize("outcome", ["success", "wrong_oracle", "execution_error"])
-def test_worker_oracle_and_capture_scope(tmp_path, monkeypatch, diagnostic, outcome):
+def test_worker_oracle_and_capture_scope(tmp_path, monkeypatch, diagnostic, outcome, execution_mode):
     import daft
     from daft.io import _vortex_diagnostics
 
@@ -259,6 +260,7 @@ def test_worker_oracle_and_capture_scope(tmp_path, monkeypatch, diagnostic, outc
         "allow_dev": True,
         "configuration": evaluation.configurations("final", "64k_4m")["candidate"],
         "diagnostic": diagnostic,
+        "execution_mode": execution_mode,
     }
     if outcome == "wrong_oracle":
         with pytest.raises(AssertionError, match="Query output differs"):
@@ -272,6 +274,11 @@ def test_worker_oracle_and_capture_scope(tmp_path, monkeypatch, diagnostic, outc
         assert ("wall_seconds" in result) is not diagnostic
         if diagnostic and outcome == "success":
             assert result["diagnostics_complete"] is True
+        if not diagnostic:
+            assert (result["peak_rss_bytes"] is None) == (execution_mode == "persistent-process")
+            assert result["process_peak_rss_bytes"] > 0
+    if outcome == "success":
+        assert events.count("query") == (2 if diagnostic or execution_mode == "fresh-process" else 1)
     if diagnostic:
         assert events.index("warmup_runtime") < events.index("start") < events.index("query") < events.index("finish")
         assert events.index("source_creation_start") < events.index("query") < events.index("source_creation_end")
@@ -492,3 +499,46 @@ def test_development_selection_fails_before_production_output(tmp_path):
     with pytest.raises(ValueError, match="production tuning"):
         evaluation.run(tmp_path / "manifest.json", output, stage="final", selection=selected)
     assert not output.exists()
+
+
+def test_selection_cannot_mix_first_query_and_persistent_measurements(tmp_path):
+    report, selected, provenance, path, save = tuning_selection(tmp_path)
+    with pytest.raises(ValueError, match="execution mode"):
+        evaluation.load_selection(path, execution_mode="persistent-process")
+    with pytest.raises(ValueError, match="execution mode"):
+        evaluation.validate_selection_identity(selected, provenance, "remote-fixtures", "final", "persistent-process")
+    selected["execution_mode"] = "persistent-process"
+    report["settings"]["execution_mode"] = "persistent-process"
+    save()
+    with pytest.raises(ValueError, match="invalid seeded trials"):
+        evaluation.load_selection(path)
+    for trial in report["trials"]:
+        trial["execution_mode"] = "persistent-process"
+    save()
+    assert evaluation.load_selection(path, execution_mode="persistent-process") == selected
+    with pytest.raises(ValueError, match="execution mode"):
+        evaluation.load_selection(path, execution_mode="fresh-process")
+
+
+def test_persistent_session_prepares_once_and_builds_each_query(tmp_path, monkeypatch):
+    import io
+
+    events = []
+    requests = []
+    for index in range(3):
+        spec = tmp_path / f"{index}-spec.json"
+        spec.write_text(json.dumps({"allow_dev": True, "index": index}))
+        requests.append(json.dumps({"spec": str(spec), "result": str(tmp_path / f"{index}.json")}))
+    monkeypatch.setattr(evaluation.sys, "stdin", io.StringIO("\n".join(requests) + "\n"))
+    monkeypatch.setattr(evaluation, "prepare_worker", lambda _: events.append("prepare"))
+
+    def run(spec, *, prepared):
+        assert prepared
+        events.append(spec["index"])
+        return {"status": "passed", "worker_pid": 123}
+
+    monkeypatch.setattr(evaluation, "worker", run)
+    assert evaluation.worker_session() == 0
+    assert events == ["prepare", 0, 1, 2]
+    assert all(json.loads((tmp_path / f"{i}.json").read_text())["status"] == "passed" for i in range(3))
+    assert not list(tmp_path.glob("*.pending"))

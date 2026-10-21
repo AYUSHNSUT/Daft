@@ -1911,7 +1911,7 @@ impl S3MultipartWriter {
 mod tests {
     use std::{
         io::{Read, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -1964,6 +1964,38 @@ mod tests {
         )
     }
 
+    fn read_s3_test_request(socket: &mut TcpStream, deadline: Instant) -> String {
+        // Accepted sockets can inherit the listener's nonblocking mode on macOS.
+        // A read timeout alone does not make those sockets block.
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut header = Vec::new();
+        while Instant::now() < deadline {
+            let mut byte = [0];
+            match socket.read(&mut byte) {
+                Ok(0) => panic!("S3 test connection closed before request headers completed"),
+                Ok(_) => {
+                    header.push(byte[0]);
+                    assert!(header.len() <= 16 * 1024);
+                    if header.ends_with(b"\r\n\r\n") {
+                        return String::from_utf8(header).unwrap();
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("reading S3 test request: {error}"),
+            }
+        }
+        panic!("timed out waiting for complete S3 test request headers");
+    }
+
     /// Serve HEAD requests without closing their sockets, and count accepted TCP
     /// connections. Multiple pools can retain an idle connection simultaneously.
     fn spawn_s3_head_server(
@@ -1981,6 +2013,7 @@ mod tests {
             {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
+                        socket.set_nonblocking(false).unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_millis(50)))
                             .unwrap();
@@ -2082,17 +2115,7 @@ mod tests {
                         Err(error) => panic!("accepting conditional S3 request: {error}"),
                     }
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut header = Vec::new();
-                while !header.ends_with(b"\r\n\r\n") {
-                    let mut byte = [0];
-                    assert_eq!(socket.read(&mut byte).unwrap(), 1);
-                    header.push(byte[0]);
-                    assert!(header.len() <= 16 * 1024);
-                }
-                requests.push(String::from_utf8(header).unwrap());
+                requests.push(read_s3_test_request(&mut socket, deadline));
                 socket.write_all(response.as_bytes()).unwrap();
             }
             requests
@@ -2280,10 +2303,7 @@ mod tests {
                     Err(error) => panic!("accepting stalled test connection: {error}"),
                 }
             };
-            socket
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            assert!(socket.read(&mut [0; 4096]).unwrap() > 0);
+            read_s3_test_request(&mut socket, deadline);
             finished.recv_timeout(Duration::from_secs(10)).unwrap();
         });
         let calls = Arc::new(AtomicUsize::new(0));

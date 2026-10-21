@@ -72,3 +72,48 @@ Vortex filtering. Removing that work is not the first target for a remaining
 query-scoped footer reuse: preserve fresh metadata checks and conditional reads,
 reuse only bounded serialized metadata, and fall back when identity cannot be
 validated. Phase 6 stays open until a new build passes the original gates.
+
+## Metadata-reuse acceptance, 21 October 2026
+
+The separate report is
+`examples/vortex_eval/artifacts/phase6/metadata/acceptance-20261021T080808Z-13133/acceptance.json`.
+Source was `7102056f8795f8f6e77f673f7f66479e01d25f61`; the enabled release
+binary SHA256 was `860e543ced2ee4cab32fcdc599bd84797245fb7b5270fd485ff7fb8f252e8e63`.
+Source and binary provenance remained unchanged. This run retains the same
+fresh-process timing and fixture manifests; its samples are not pooled with
+the first acceptance.
+
+Tuning selected the 16 KiB gap / 1 MiB maximum range policy at discovery and
+metadata concurrency 8, with validated S3 opening-range reuse enabled. Final
+acceptance froze that policy for all five cases, using 50 measured rounds and
+three warmups.
+
+| Remote case | Parquet median | Vortex median | Vortex relative to Parquet |
+| --- | ---: | ---: | ---: |
+| Narrow scan | 128.91 ms | 121.88 ms | 5.45% less time |
+| 1% range | 111.25 ms | 111.92 ms | 0.61% more time |
+| 1% equality | 110.29 ms | 112.09 ms | 1.64% more time |
+| Join | 136.07 ms | 132.90 ms | 2.33% less time |
+| Full value reduction | 273.57 ms | 278.56 ms | 1.83% more time |
+
+The candidate beats the same-build Phase 5 equivalent by 2.78–7.75% across
+these cases, but beats Parquet in only two of five medians. All sample ranges
+overlap. All timed trials passed correctness and all diagnostic captures
+completed, but the unchanged all-five-query performance gate **failed**.
+The four-dataset local guard passed.
+
+Service acceptance passed all **32 HTTP/MinIO/Ray tests with zero skips**.
+The focused suite passed 605 tests; ORC/MCAP passed 112 with one optional S3 skip.
+The later S3 pooling and full Rust gates failed in scripted test servers:
+accepted TCP sockets inherited nonblocking mode, and test-side reads unwrapped
+`WouldBlock` errors, causing connection resets and downstream assertions. The
+compiler warnings printed above those failures did not cause them. Correcting
+the socket fixtures requires a new live-socket validation; the earlier seven-test
+preflight pass does not make these later failures disappear.
+
+The next [amortized-cost experiment](vortex-phase6-amortized-design.md) keeps a
+single supervised process for a complete seeded schedule. It continues timing
+fresh source creation and collection, while allowing existing remote clients
+and connection pools to survive across queries. Its tuning, final comparison and
+local guard must be new reports with a mode-matched selection. No result from
+that experiment is claimed here.

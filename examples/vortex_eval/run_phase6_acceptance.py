@@ -110,7 +110,9 @@ def run_gate(name, command, output, environment, *, junit=None, zero_skips=False
     return result
 
 
-def run_evaluation_gate(stage, manifest_path, output, environment, candidate_policy, selection=None):
+def run_evaluation_gate(
+    stage, manifest_path, output, environment, candidate_policy, selection=None, *, execution_mode="fresh-process"
+):
     name = {"tune": "tuning", "final": "remote", "guard": "local-guard"}[stage]
     report_directory = output / ("remote-report" if stage == "final" else name)
     command = [
@@ -130,6 +132,8 @@ def run_evaluation_gate(stage, manifest_path, output, environment, candidate_pol
         "--warmups",
         "3" if stage == "final" else "1",
         "--diagnostics",
+        "--execution-mode",
+        execution_mode,
     ]
     if stage == "guard":
         command += ["--orders", "sorted", "shuffled", "--layouts", "single", "multi"]
@@ -149,6 +153,9 @@ def run_evaluation_gate(stage, manifest_path, output, environment, candidate_pol
         )
         if not isinstance(report.get("performance_gate"), dict):
             raise ValueError("Benchmark report is missing its performance gate")
+        settings = report.get("settings")
+        if not isinstance(settings, dict) or settings.get("execution_mode") != execution_mode:
+            raise ValueError("Benchmark report execution mode differs from the requested comparison")
         if (
             report.get("status") != "passed"
             or report.get("correctness_status") != "passed"
@@ -171,6 +178,7 @@ def main(argv=None):
     parser.add_argument("--docker-image", default="draft-vortex-minio:phase3")
     parser.add_argument("--candidate-policy", choices=POLICIES, default=DEFAULT_POLICY)
     parser.add_argument("--selection", type=Path)
+    parser.add_argument("--execution-mode", choices=("fresh-process", "persistent-process"), default="fresh-process")
     parser.add_argument(
         "--tune", action="store_true", help="Run production tuning, then final acceptance with its frozen winner"
     )
@@ -206,8 +214,10 @@ def main(argv=None):
         parser.error("Native binary does not match --expected-native-sha")
     if args.selection:
         args.selection = args.selection.resolve()
-        selected = load_selection(args.selection)
-        validate_selection_identity(selected, provenance, file_hash(manifest_path), "final")
+        selected = load_selection(args.selection, execution_mode=args.execution_mode)
+        validate_selection_identity(
+            selected, provenance, file_hash(manifest_path), "final", execution_mode=args.execution_mode
+        )
         args.candidate_policy = selected["policy"]
     output.mkdir(parents=True, exist_ok=True)
     report = {
@@ -219,6 +229,7 @@ def main(argv=None):
         "local_manifest_sha256": file_hash(local_manifest) if local_manifest is not None else None,
         "gates": {},
         "tuning_requested": args.tune,
+        "execution_mode": args.execution_mode,
         "scope": "Optional tuning, final comparison and optional local guard run sequentially before all test processes; no overlapping builds/tests or retries",
     }
     (output / "source-revision.txt").write_text(provenance["git_head"] + "\n")
@@ -248,15 +259,17 @@ def main(argv=None):
         final_allowed = True
         if args.tune:
             report["gates"]["tuning"] = run_evaluation_gate(
-                "tune", manifest_path, output, child_env, args.candidate_policy
+                "tune", manifest_path, output, child_env, args.candidate_policy, execution_mode=args.execution_mode
             )
             save()
             try:
                 if report["gates"]["tuning"]["status"] != "passed":
                     raise ValueError("Tuning failed; no frozen selection was accepted")
                 args.selection = output / "tuning" / "selected-policy.json"
-                selected = load_selection(args.selection)
-                validate_selection_identity(selected, provenance, report["manifest_sha256"], "final")
+                selected = load_selection(args.selection, execution_mode=args.execution_mode)
+                validate_selection_identity(
+                    selected, provenance, report["manifest_sha256"], "final", execution_mode=args.execution_mode
+                )
                 between = benchmark_environment()
                 report["environment_between_benchmarks"] = between
                 if any(
@@ -270,13 +283,16 @@ def main(argv=None):
                     )
                 ):
                     raise ValueError("Source/native provenance changed between tuning and final acceptance")
-                validate_selection_identity(selected, between, report["manifest_sha256"], "final")
+                validate_selection_identity(
+                    selected, between, report["manifest_sha256"], "final", execution_mode=args.execution_mode
+                )
                 args.candidate_policy = selected["policy"]
                 report["frozen_selection"] = {
                     "path": "tuning/selected-policy.json",
                     "sha256": file_hash(args.selection),
                     "policy": selected["policy"],
                     "tuning_report_sha256": selected["tuning_report_sha256"],
+                    "execution_mode": args.execution_mode,
                 }
             except (OSError, ValueError) as error:
                 final_allowed = False
@@ -292,12 +308,26 @@ def main(argv=None):
                 save()
         if final_allowed:
             report["gates"]["remote"] = run_evaluation_gate(
-                "final", manifest_path, output, child_env, args.candidate_policy, args.selection
+                "final",
+                manifest_path,
+                output,
+                child_env,
+                args.candidate_policy,
+                args.selection,
+                execution_mode=args.execution_mode,
             )
         save()
         if local_manifest is not None:
             report["gates"]["local-guard"] = (
-                run_evaluation_gate("guard", local_manifest, output, child_env, args.candidate_policy, args.selection)
+                run_evaluation_gate(
+                    "guard",
+                    local_manifest,
+                    output,
+                    child_env,
+                    args.candidate_policy,
+                    args.selection,
+                    execution_mode=args.execution_mode,
+                )
                 if final_allowed
                 else dict(report["gates"]["remote"])
             )
@@ -319,6 +349,8 @@ def main(argv=None):
                     "tests/io/test_vortex_phase3.py",
                     "tests/io/test_vortex_lifecycle.py",
                     "benchmarking/vortex/test_remote_eval.py",
+                    "benchmarking/vortex/test_persistent.py",
+                    "benchmarking/vortex/test_persistent_schedule.py",
                     "examples/vortex_eval/test_phase6_services.py",
                 ],
                 True,

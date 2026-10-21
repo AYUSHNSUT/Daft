@@ -67,7 +67,10 @@ def lifecycle(monkeypatch, tmp_path):
             "status": "failed" if outcome["value"] == "gate_failure" else "passed",
             "experiment": "remote_read_policy",
             "performance_gate": {"status": "passed"},
+            "settings": {"execution_mode": command[command.index("--execution-mode") + 1]},
         }
+        if outcome["value"] == "mode_mismatch":
+            result["settings"]["execution_mode"] = "fresh-process"
         (output / "report.json").write_text(json.dumps(result))
         return subprocess.CompletedProcess(command, 1 if outcome["value"] == "gate_failure" else 0)
 
@@ -127,6 +130,36 @@ def test_external_endpoint_does_not_transfer_container_ownership(lifecycle, monk
     assert "delete" in lifecycle.events
 
 
+@pytest.mark.parametrize("execution_mode", ["fresh-process", "persistent-process"])
+def test_service_forwards_execution_mode(lifecycle, execution_mode):
+    assert services.main([*lifecycle.args, "--execution-mode", execution_mode]) == 0
+    command = next(command for command in lifecycle.commands if "benchmarking.vortex.remote_eval" in command)
+    assert command[command.index("--execution-mode") + 1] == execution_mode
+
+
+def test_service_rejects_selection_from_another_execution_mode_before_contact(lifecycle, tmp_path, monkeypatch):
+    selection = tmp_path / "selected-policy.json"
+    selection.write_text(json.dumps({"execution_mode": "fresh-process"}))
+
+    def load(path, allow_dev=False, *, execution_mode=None):
+        assert execution_mode == "persistent-process"
+        if json.loads(path.read_text())["execution_mode"] != execution_mode:
+            raise ValueError("Frozen selection execution mode differs")
+
+    monkeypatch.setattr(services, "load_selection", load)
+    with pytest.raises(ValueError, match="execution mode"):
+        services.main([*lifecycle.args, "--selection", str(selection), "--execution-mode", "persistent-process"])
+    assert lifecycle.events == []
+    assert not lifecycle.output.exists()
+
+
+def test_service_rejects_report_from_another_execution_mode_and_cleans_up(lifecycle):
+    lifecycle.outcome["value"] = "mode_mismatch"
+    with pytest.raises(RuntimeError, match="execution mode"):
+        services.main([*lifecycle.args, "--execution-mode", "persistent-process"])
+    assert lifecycle.events[-2:] == ["delete", "remove"]
+
+
 @pytest.mark.parametrize("extra", [["--rounds", "49"], ["--warmups", "1"], ["--cases", "join"]])
 def test_invalid_final_matrix_never_contacts_service(lifecycle, extra):
     with pytest.raises(SystemExit) as failure:
@@ -175,6 +208,78 @@ def test_acceptance_zero_skip_gate_uses_actual_junit(tmp_path, monkeypatch, skip
     assert "private-secret" not in (tmp_path / "service.log").read_text()
 
 
+@pytest.mark.parametrize("stage", ["tune", "final", "guard"])
+@pytest.mark.parametrize("execution_mode", ["fresh-process", "persistent-process"])
+def test_acceptance_rejects_mismatched_report_mode(tmp_path, monkeypatch, stage, execution_mode):
+    def gate(name, command, output, env, **kwargs):
+        assert command[command.index("--execution-mode") + 1] == execution_mode
+        directory = output / {"tuning": "tuning", "remote": "remote-report", "local-guard": "local-guard"}[name]
+        directory.mkdir()
+        (directory / "report.json").write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "correctness_status": "passed",
+                    "diagnostics_status": "passed",
+                    "performance_gate": {"status": "passed"},
+                    "settings": {
+                        "execution_mode": "persistent-process" if execution_mode == "fresh-process" else "fresh-process"
+                    },
+                }
+            )
+        )
+        return {"status": "passed", "returncode": 0}
+
+    monkeypatch.setattr(acceptance, "run_gate", gate)
+    result = acceptance.run_evaluation_gate(
+        stage, tmp_path / "manifest.json", tmp_path, {}, "off", execution_mode=execution_mode
+    )
+    assert result["status"] == "failed"
+    assert "execution mode" in result["validation_error"]
+
+
+def test_acceptance_rejects_selection_from_another_mode_before_service_contact(tmp_path, monkeypatch):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    selection = tmp_path / "selection.json"
+    selection.write_text(json.dumps({"execution_mode": "fresh-process"}))
+    output = tmp_path / "acceptance"
+    provenance = {
+        "git_head": "head",
+        "tracked_changes": False,
+        "build_type": "release",
+        "build_command": "build",
+        "native_binaries_sha256": {"native.so": "sha"},
+    }
+    events = []
+    monkeypatch.setattr(acceptance, "load_manifest", lambda _: {})
+    monkeypatch.setattr(acceptance, "require_api", lambda: None)
+    monkeypatch.setattr(acceptance, "_require_environment", lambda: None)
+    monkeypatch.setattr(acceptance, "benchmark_environment", lambda: provenance)
+    monkeypatch.setattr(acceptance, "_start_minio", lambda *_: events.append("start"))
+
+    def load(path, *, execution_mode=None):
+        assert execution_mode == "persistent-process"
+        if json.loads(path.read_text())["execution_mode"] != execution_mode:
+            raise ValueError("Frozen selection execution mode differs")
+
+    monkeypatch.setattr(acceptance, "load_selection", load)
+    with pytest.raises(ValueError, match="execution mode"):
+        acceptance.main(
+            [
+                "--manifest",
+                str(manifest),
+                "--output",
+                str(output),
+                "--selection",
+                str(selection),
+                "--execution-mode",
+                "persistent-process",
+            ]
+        )
+    assert events == [] and not output.exists()
+
+
 @pytest.mark.parametrize("report_state", ["performance_miss", "truncated", "missing", "wrong_type"])
 def test_acceptance_keeps_all_checks_after_performance_miss_and_runs_timing_first(tmp_path, monkeypatch, report_state):
     path = tmp_path / "manifest.json"
@@ -210,6 +315,7 @@ def test_acceptance_keeps_all_checks_after_performance_miss_and_runs_timing_firs
                         "correctness_status": "passed",
                         "performance_gate": {"status": "failed"},
                         "diagnostics_status": "passed",
+                        "settings": {"execution_mode": "fresh-process"},
                     }
                 )
             )
@@ -261,7 +367,10 @@ def test_acceptance_keeps_all_checks_after_performance_miss_and_runs_timing_firs
         "guard_malformed",
     ],
 )
-def test_acceptance_tunes_then_freezes_one_policy_or_blocks_final_and_continues(tmp_path, monkeypatch, scenario):
+@pytest.mark.parametrize("execution_mode", ["fresh-process", "persistent-process"])
+def test_acceptance_tunes_then_freezes_one_policy_or_blocks_final_and_continues(
+    tmp_path, monkeypatch, scenario, execution_mode
+):
     manifest = tmp_path / "manifest.json"
     manifest.write_text("{}")
     local_manifest = tmp_path / "local-manifest.json"
@@ -282,6 +391,7 @@ def test_acceptance_tunes_then_freezes_one_policy_or_blocks_final_and_continues(
         "native_binaries_sha256": {"native.so": "sha"},
         "manifest_sha256": acceptance.file_hash(manifest),
         "tuning_report_sha256": "tuning-report-hash",
+        "execution_mode": execution_mode,
     }
     commands, service_events, environment_calls = [], [], []
     monkeypatch.delenv("VORTEX_MINIO_ENDPOINT", raising=False)
@@ -294,9 +404,15 @@ def test_acceptance_tunes_then_freezes_one_policy_or_blocks_final_and_continues(
     )
     monkeypatch.setattr(acceptance, "require_api", lambda: None)
     monkeypatch.setattr(acceptance, "_require_environment", lambda: None)
+
     # Full selection validation is independently tested against the seeded grid.
     # Here the disk read preserves missing/malformed selection failure modes.
-    monkeypatch.setattr(acceptance, "load_selection", lambda path: json.loads(path.read_text()))
+    def load(path, *, execution_mode=None):
+        value = json.loads(path.read_text())
+        assert value["execution_mode"] == execution_mode
+        return value
+
+    monkeypatch.setattr(acceptance, "load_selection", load)
 
     def environment():
         current = dict(provenance)
@@ -333,6 +449,7 @@ def test_acceptance_tunes_then_freezes_one_policy_or_blocks_final_and_continues(
                         "correctness_status": "passed",
                         "diagnostics_status": "passed",
                         "performance_gate": {"status": "failed" if failed or guard_gate_failed else "passed"},
+                        "settings": {"execution_mode": execution_mode},
                     }
                 )
             )
@@ -358,6 +475,8 @@ def test_acceptance_tunes_then_freezes_one_policy_or_blocks_final_and_continues(
             "--output",
             str(output),
             "--tune",
+            "--execution-mode",
+            execution_mode,
             "--expected-source",
             "head",
             "--expected-native-sha",
@@ -379,8 +498,12 @@ def test_acceptance_tunes_then_freezes_one_policy_or_blocks_final_and_continues(
     assert tuning_command[tuning_command.index("--rounds") + 1] == "20"
     assert tuning_command[tuning_command.index("--warmups") + 1] == "1"
     assert "--diagnostics" in tuning_command
+    for name, command in commands:
+        if name in {"tuning", "remote", "local-guard"}:
+            assert command[command.index("--execution-mode") + 1] == execution_mode
     report = json.loads((output / "acceptance.json").read_text())
     assert report["tuning_requested"] is True and len(report["gates"]) == 8
+    assert report["execution_mode"] == execution_mode
     assert report["local_manifest_sha256"] == acceptance.file_hash(local_manifest)
     assert report["status"] == ("passed" if scenario == "passed" else "failed")
     if final_executed:
@@ -474,6 +597,7 @@ def test_local_guard_explicit_preset_does_not_require_tuning_selection(tmp_path,
                     "correctness_status": "passed",
                     "diagnostics_status": "passed",
                     "performance_gate": {"status": "passed"},
+                    "settings": {"execution_mode": "fresh-process"},
                 }
             )
         )
@@ -520,7 +644,8 @@ def test_unexpected_acceptance_failures_are_persisted_and_owned_cleanup_preserve
             raise original
         return "owned-container"
 
-    def evaluate(*args):
+    def evaluate(*args, **kwargs):
+        assert kwargs["execution_mode"] == "fresh-process"
         events.append("evaluate")
         if scenario in {"runtime", "runtime_and_cleanup"}:
             raise original
