@@ -128,7 +128,73 @@ Detailed timing tables, control comparisons, raw events and per-query timelines
 are in `examples/vortex_eval/artifacts/phase7/local-profile-revised/`:
 `overview.html`, `analysis.md`, `report.json` and `profiles/`.
 
-## Validation and remaining evidence
+## Remote measurement
+
+The terminal run on 2026-10-21 used source
+`52a954a7862c060a11686958806f129b079c3dfe` and the same release native binary as
+the revised local run. It used the eight-file sorted remote fixture through an
+owned authenticated MinIO container on localhost. This measures the local
+Docker/S3 path, not WAN or hosted object-storage performance.
+
+All 1,470 query executions passed (1,400 measured and 70 warmups), along with
+all 105 complete diagnostic captures and 35 paired comparisons. Source, binary,
+fixture and configuration identities remained unchanged. Every comparison has
+20 adjacent pairs, exactly ten in each order. There were no dropped, unfinished,
+failed or unexpectedly cancelled diagnostic events.
+
+The dedicated candidate/Parquet comparisons yielded:
+
+| Query | Parquet median ms | Vortex candidate median ms | Vortex / Parquet |
+| --- | ---: | ---: | ---: |
+| Narrow scan | 26.845 | 19.975 | 0.744 |
+| 1% range filter | 11.145 | 12.286 | 1.102 |
+| 1% equality filter | 11.091 | 13.128 | 1.184 |
+| Join | 33.073 | 31.432 | 0.950 |
+| Full reduction | 164.733 | 170.358 | 1.034 |
+
+Vortex wins two of five remote medians. The desired all-five remote win has
+not been achieved. The helper's passing status verifies correctness, profile
+completeness, provenance and tests; it does not grant performance acceptance.
+
+Lightweight planning versus its same-build Vortex baseline shows median changes
+of -3.58%, +5.70%, -14.24%, -0.42% and -1.29% in the same query order. Equality's
+identical-configuration control itself appears 11.18% faster by ratio of medians
+(11.38% by median paired ratio). The apparent equality improvement therefore
+does not establish a clean causal gain. Preserve all samples and do not subtract
+the control percentage as an assumed correction.
+
+Reducing the existing per-file request cap does not establish a uniformly
+better setting:
+
+| Query | Cap 1 / cap 8 | Cap 2 / cap 8 | Cap 4 / cap 8 |
+| --- | ---: | ---: | ---: |
+| Narrow scan | 1.015 | 1.015 | 0.980 |
+| 1% range filter | 1.064 | 0.979 | 1.018 |
+| 1% equality filter | 1.058 | 0.988 | 0.939 |
+| Join | 1.031 | 0.947 | 0.970 |
+| Full reduction | 1.047 | 0.996 | 1.011 |
+
+Ratios use medians from each comparison's own adjacent samples; below one favors
+the reduced cap. All cap experiments leave lightweight planning disabled. Cap 1
+loses every case; caps 2 and 4 trade small gains against regressions. No default
+is changed, and a combined lightweight-planning/reduced-cap candidate has not
+been tested.
+
+Diagnostic captures consistently show lower total session-initialization wall
+occupancy, from 2.418–2.849 ms under baseline to 1.267–1.462 ms with lightweight
+planning across the five cases. Candidate planning metadata still occupies
+3.839–5.878 ms. In full reduction, the 174.506 ms median diagnostic query includes
+158.117 ms stream/batch occupancy and 146.773 ms I/O-body occupancy. These
+overlap and include scheduling and consumer delay; they do not isolate physical
+network time or decoder CPU.
+
+Remote evidence is saved under
+`examples/vortex_eval/artifacts/phase7/terminal-20261021T120240Z-87606/remote/`,
+including `overview.html`, `analysis.md`, `report.json` and individual profiles.
+The raw report SHA256 is
+`dbda1fac19d400bcc25f7f1c18327b707baa2ffdf66369a8d4fe905cc25a38e6`.
+
+## Validation
 
 The rebuilt release extension passed 720 local Python query tests, 334 harness
 tests plus nine subtests, and 174 targeted Rust tests. Five Python cases were
@@ -137,17 +203,20 @@ Full-workspace/all-features/all-targets Clippy with warnings denied, formatting
 and changed-file pre-commit checks passed. The decoder regression verifies
 50,002 decode/skip calls, correct output and zero lost events.
 
-The remote request-concurrency sweep and live service checks are pending.
-Remote runs use an owned temporary MinIO
-container, with the same persistent-worker and fresh-source protocol. They
-compare request limits 1, 2, 4 and 8 per file independently of the planning
-candidate. Service, socket and compatibility checks must also pass before
-publishing this phase.
+The frozen terminal run additionally passed:
 
-The agent sandbox cannot bind localhost ports, access Docker's socket, read the
-CPU-cache sysctl used by PyArrow ORC, or resolve the external host used by one
-MCAP test. Those checks, plus the full Rust workspace suite, are grouped in one
-frozen terminal helper. Earlier environment-blocked logs remain preserved.
+- HTTP Range, authenticated MinIO and Ray: 37 tests, zero skips.
+- ORC/MCAP compatibility: 112 passed; one optional MCAP S3-environment skip.
+- S3 connection, timeout and validator handling: seven tests.
+- Full Rust workspace with no default features: 2,317 passed, 20 existing ignored
+  tests/doctests, zero failures across 157 reported targets.
+
+`terminal.json` records commands, counts, source/native identities and log hashes.
+All saved log hashes were verified during review. The terminal run completed the
+checks blocked by this agent sandbox's localhost, Docker, sysctl and network
+restrictions. Earlier environment-blocked logs remain preserved. The final
+combined performance acceptance remains unevaluated; the measured remote
+candidate already misses the all-five-wins requirement.
 
 ## Next targets supported by these profiles
 
