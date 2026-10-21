@@ -13,7 +13,9 @@ service and Rust checks passed in that run.
    optimizer/task creation, repeated opens, reading, conversion and reduction?
    Planning currently constructs complete schemas that Python discards. Add an
    opt-in `enable_row_count_planning` path returning only rows and optional
-   validated opening-range snapshots. Keep the old path as the same-build control.
+   validated opening-range snapshots, with shared reader initialization within
+   each metadata batch. Measure that bundle as `lightweight_planning`; keep the
+   old path as the same-build control. The option defaults to false.
 2. Does remote full-scan concurrency exceed what this local MinIO setup handles
    efficiently? The previous diagnostic recorded 112 data ranges and 64
    overlapping requests across eight files. Compare existing per-file limits
@@ -56,6 +58,12 @@ information, so ambiguous and uninstrumented intervals remain explicit.
 Logical optimization can materialize scan tasks and read planning metadata;
 those nested durations are not additional optimizer CPU time.
 
+Parquet selectors may perform hundreds of thousands of tiny decode/skip calls.
+Record one decoder-task envelope with bounded counters for all synchronous calls
+and their summed wall durations. The envelope includes consumption/backpressure
+gaps; the counters do not imply contiguous intervals, interval unions or CPU time.
+This preserves complete work accounting without exhausting the event budget.
+
 Async future polling measures synchronous **poll wall time**, including
 preemption; the remainder is suspension. This is not thread CPU time or pure
 codec time, and work spawned onto other tasks is not owned by the parent poll.
@@ -73,7 +81,12 @@ against the fixture oracle and retains the same worker's I/O client pools.
 
 ## Optimization safety
 
-Row-count planning still opens fresh metadata on every materialization. It does
+Lightweight planning combines row-count-only metadata conversion with shared
+reader initialization inside a bulk metadata call. Shared initialization is not
+a cross-query metadata cache. The comparison measures the combined change and
+does not attribute its result to either component alone.
+
+The path still opens fresh metadata on every materialization. It does
 not retain schema inference metadata for later use. S3 execution still performs
 fresh identity validation, conditionally fetches uncached ranges, and fails closed
 if object identity changes. Snapshot budgets and local/HTTP fallback remain as

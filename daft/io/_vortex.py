@@ -328,10 +328,12 @@ def read_vortex(
             64 MiB of encoded opening bytes across the materialization's tasks. Each executing reader validates
             fresh size, ETag and version metadata before reuse, and conditionally fetches uncached ranges.
             Changed objects fail explicitly. HTTP/local inputs and S3 objects without strong ETags use fresh reads.
-        enable_row_count_planning: Experimental footer row-count-only planning, default False.
-            Omits conversion of unused per-file planning schemas. Every executed file still receives full
-            schema validation before projection; unsupported schemas can therefore fail during execution
-            instead of planning. Row counts refresh on each materialization and retain join statistics.
+        enable_row_count_planning: Experimental lightweight footer planning, default False.
+            Omits conversion of unused per-file planning schemas and shares one Vortex session within
+            each bulk metadata call. Readers and metadata remain fresh per file and materialization.
+            Every executed file still receives full schema validation before projection; unsupported
+            schemas can therefore fail during execution instead of planning. Footer row counts retain
+            join statistics.
 
     Note:
         Requires a build with Rust features ``python,vortex``. The Python

@@ -613,6 +613,15 @@ fn _vortex_diagnostics_finish(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
         record.set_item("duration_ns", event.duration_ns)?;
         record.set_item("active_poll_ns", event.active_poll_ns)?;
         record.set_item("poll_count", event.poll_count)?;
+        let accumulated_work = PyList::empty(py);
+        for work in event.accumulated_work {
+            let item = PyDict::new(py);
+            item.set_item("operation", work.operation)?;
+            item.set_item("calls", work.calls)?;
+            item.set_item("wall_ns", work.wall_ns)?;
+            accumulated_work.append(item)?;
+        }
+        record.set_item("accumulated_work", accumulated_work)?;
         record.set_item("offset", event.offset)?;
         record.set_item("requested_bytes", event.requested_bytes)?;
         record.set_item("returned_bytes", event.returned_bytes)?;

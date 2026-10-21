@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use arrow_array::RecordBatch as ArrowRecordBatch;
@@ -115,12 +115,32 @@ fn input_uri(uri: &str) -> DaftResult<String> {
     local_path(uri).map(|path| path.to_string_lossy().into_owned())
 }
 
+fn session_for_open(
+    phase: Phase,
+    uri: &str,
+    shared_session: Option<&OnceLock<VortexSession>>,
+) -> VortexSession {
+    let create = |uri| {
+        let trace = diagnostics::begin(phase, "session_creation", uri);
+        let session = VortexSession::default().with_tokio();
+        diagnostics::complete(trace, false);
+        session
+    };
+    match shared_session {
+        // A row-count bulk call reuses session initialization. Its file opens
+        // keep independent readers, footers and snapshot state.
+        Some(shared) => shared.get_or_init(|| create(None)).clone(),
+        None => create(Some(uri)),
+    }
+}
+
 async fn open_file(
     uri: &str,
     io_client: Arc<IOClient>,
     io_stats: IOStatsRef,
     options: &VortexReadOptions,
     phase: Phase,
+    shared_session: Option<&OnceLock<VortexSession>>,
 ) -> DaftResult<(VortexSession, VortexFile)> {
     validate_options(options)?;
     let uri = input_uri(uri)?;
@@ -128,9 +148,7 @@ async fn open_file(
         .map_err(|error| read_error(&uri, "requires an active Tokio runtime", error))?;
     let trace = diagnostics::begin(phase, "open", Some(&uri));
     let result: DaftResult<_> = async {
-        let session_trace = diagnostics::begin(phase, "session_creation", Some(&uri));
-        let session = VortexSession::default().with_tokio();
-        diagnostics::complete(session_trace, false);
+        let session = session_for_open(phase, &uri, shared_session);
         let reader = Arc::new(
             DaftReadAt::new_with_phase(uri.clone(), io_client, io_stats, options, phase).await?,
         );
@@ -324,7 +342,7 @@ pub(crate) async fn read_metadata(
     phase: Phase,
 ) -> DaftResult<(SchemaRef, u64)> {
     let (schema, rows) =
-        read_metadata_inner(uri, io_client, io_stats, read_options, phase, true).await?;
+        read_metadata_inner(uri, io_client, io_stats, read_options, phase, true, None).await?;
     Ok((schema.expect("schema conversion was requested"), rows))
 }
 
@@ -335,8 +353,17 @@ async fn read_metadata_inner(
     read_options: VortexReadOptions,
     phase: Phase,
     convert_schema: bool,
+    shared_session: Option<&OnceLock<VortexSession>>,
 ) -> DaftResult<(Option<SchemaRef>, u64)> {
-    let (session, file) = open_file(uri, io_client, io_stats, &read_options, phase).await?;
+    let (session, file) = open_file(
+        uri,
+        io_client,
+        io_stats,
+        &read_options,
+        phase,
+        shared_session,
+    )
+    .await?;
     let schema = if convert_schema {
         let trace = diagnostics::begin(phase, "schema_conversion", Some(uri));
         let schema = schemas(&display_uri(uri), &session, file.dtype());
@@ -375,7 +402,8 @@ pub async fn read_vortex_metadata_bulk(
     .collect())
 }
 
-/// Planning needs fresh row counts; the execution reader validates every full schema.
+/// Refresh row counts with one session per bulk call and no unused schema conversion.
+/// Execution still validates every full schema using its own session and reader.
 #[cfg(any(feature = "python", test))]
 pub(crate) async fn read_vortex_row_counts_bulk(
     uris: &[String],
@@ -412,11 +440,15 @@ async fn read_metadata_bulk_inner(
             "Vortex max_concurrent_files must be between 1 and {MAX_CONCURRENT_METADATA_FILES}"
         )));
     }
+    // Keep the full-schema path as the baseline. Lazy initialization preserves
+    // per-file validation order and avoids runtime work for empty input.
+    let shared_session = (!convert_schema).then(OnceLock::new);
     futures::stream::iter(uris.iter().cloned())
         .map(|uri| {
             let io_client = io_client.clone();
             let io_stats = io_stats.clone();
             let read_options = read_options.clone();
+            let shared_session = shared_session.as_ref();
             async move {
                 read_metadata_inner(
                     &uri,
@@ -425,6 +457,7 @@ async fn read_metadata_bulk_inner(
                     read_options,
                     Phase::PlanningMetadata,
                     convert_schema,
+                    shared_session,
                 )
                 .await
             }
@@ -512,7 +545,9 @@ async fn read_metadata_bulk_cached_inner(
         ));
     }
     let budget = Arc::new(Budget::new(max_snapshot_bytes));
+    let shared_session = (!convert_schema).then(OnceLock::new);
     let reads = futures::stream::iter(uris.iter().cloned()).map(|uri| {
+        let shared_session = shared_session.as_ref();
         let (client, stats, options, budget) = (
             io_client.clone(),
             io_stats.clone(),
@@ -526,9 +561,7 @@ async fn read_metadata_bulk_cached_inner(
             let phase = Phase::PlanningMetadata;
             let trace = diagnostics::begin(phase, "open", Some(&uri));
             let result: DaftResult<_> = async {
-                let session_trace = diagnostics::begin(phase, "session_creation", Some(&uri));
-                let session = VortexSession::default().with_tokio();
-                diagnostics::complete(session_trace, false);
+                let session = session_for_open(phase, &uri, shared_session);
                 let reader = Arc::new(
                     DaftReadAt::new_for_snapshot(
                         uri.clone(),
@@ -618,6 +651,7 @@ pub async fn stream_vortex(
         io_stats,
         &read_options,
         Phase::ExecutionOpen,
+        None,
     )
     .await?;
     stream_opened_vortex(

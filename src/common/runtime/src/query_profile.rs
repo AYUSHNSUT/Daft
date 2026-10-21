@@ -15,6 +15,7 @@ use std::{
 use common_error::{DaftError, DaftResult};
 
 pub const MAX_EVENTS: usize = 50_000;
+const MAX_ACCUMULATED_OPERATIONS: usize = 8;
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -57,6 +58,15 @@ impl Phase {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct AccumulatedWork {
+    pub operation: &'static str,
+    pub calls: u64,
+    /// Sum of disjoint synchronous call durations, including thread preemption.
+    /// These durations have no exported interval locations and are not CPU time.
+    pub wall_ns: u64,
+}
+
 pub struct Record {
     pub span_id: u64,
     /// Numeric identity of the thread starting the span; async spans may migrate.
@@ -69,6 +79,8 @@ pub struct Record {
     /// Sum of time inside this future's poll calls, not total CPU across spawned tasks.
     pub active_poll_ns: Option<u64>,
     pub poll_count: Option<u64>,
+    /// Bounded repeated work inside this envelope; never treat sums as intervals.
+    pub accumulated_work: Vec<AccumulatedWork>,
     pub offset: Option<u64>,
     pub requested_bytes: Option<usize>,
     pub returned_bytes: Option<usize>,
@@ -204,6 +216,7 @@ pub fn begin(phase: Phase, operation: &'static str, uri: Option<&str>) -> Option
             duration_ns: 0,
             active_poll_ns: None,
             poll_count: None,
+            accumulated_work: Vec::new(),
             offset: None,
             requested_bytes: None,
             returned_bytes: None,
@@ -288,6 +301,69 @@ impl Drop for Span {
 pub fn complete(span: Option<Span>, error: bool) {
     if let Some(span) = span {
         span.finish(error);
+    }
+}
+
+/// Accumulate frequent synchronous calls without emitting an event per call.
+///
+/// The span is a real lifetime envelope, including gaps and awaited work. Its
+/// fixed counters contain only measured call durations and have no interval
+/// locations, so their sums must not be used to construct a wall-time union.
+pub struct AccumulatedSpan<const N: usize> {
+    span: Option<Span>,
+    work: [AccumulatedWork; N],
+}
+
+impl<const N: usize> AccumulatedSpan<N> {
+    pub fn new(
+        phase: Phase,
+        operation: &'static str,
+        uri: Option<&str>,
+        operations: [&'static str; N],
+    ) -> Self {
+        // Instrumentation labels are compile-time call-site constants; bound
+        // their storage independently of the number of measured calls.
+        const { assert!(N <= MAX_ACCUMULATED_OPERATIONS) };
+        Self {
+            span: begin(phase, operation, uri),
+            work: operations.map(|operation| AccumulatedWork {
+                operation,
+                calls: 0,
+                wall_ns: 0,
+            }),
+        }
+    }
+
+    /// Measure one synchronous call. Disabled captures do not read the clock.
+    /// Errors are returned unchanged and still count as attempted work.
+    pub fn measure<T>(&mut self, index: usize, f: impl FnOnce() -> T) -> T {
+        if self.span.is_none() {
+            return f();
+        }
+        let work = &mut self.work[index];
+        let started = Instant::now();
+        let result = f();
+        work.wall_ns = work.wall_ns.saturating_add(nanos(started.elapsed()));
+        work.calls = work.calls.saturating_add(1);
+        result
+    }
+
+    pub fn finish(mut self, error: bool) {
+        self.attach();
+        complete(self.span.take(), error);
+    }
+
+    fn attach(&mut self) {
+        if let Some(span) = &mut self.span {
+            span.record.as_mut().unwrap().accumulated_work = self.work.to_vec();
+        }
+    }
+}
+
+impl<const N: usize> Drop for AccumulatedSpan<N> {
+    fn drop(&mut self) {
+        // Preserve work already performed if the enclosing future is cancelled.
+        self.attach();
     }
 }
 
@@ -497,5 +573,44 @@ mod tests {
                 .unwrap()
                 .cancelled
         );
+
+        // Tiny repeated calls must not exhaust the event budget. Preserve both
+        // attempted error calls and work completed before task cancellation.
+        start().unwrap();
+        let mut accumulated =
+            AccumulatedSpan::new(Phase::Parquet, "repeated_fixture", None, ["decode", "skip"]);
+        for _ in 0..=MAX_EVENTS {
+            assert_eq!(accumulated.measure(0, || std::hint::black_box(7)), 7);
+        }
+        assert_eq!(accumulated.measure(1, || Err::<(), _>(9)), Err(9));
+        accumulated.finish(true);
+        let mut cancelled =
+            AccumulatedSpan::new(Phase::Parquet, "repeated_cancel", None, ["decode"]);
+        cancelled.measure(0, || std::hint::black_box(1));
+        drop(cancelled);
+        let snapshot = finish().unwrap();
+        assert_eq!(snapshot.dropped_events, 0);
+        assert_eq!(snapshot.unfinished_events, 0);
+        assert_eq!(snapshot.events.len(), 2);
+        let completed = &snapshot.events[0];
+        assert!(completed.error);
+        assert_eq!(completed.accumulated_work.len(), 2);
+        assert_eq!(completed.accumulated_work[0].calls, MAX_EVENTS as u64 + 1);
+        assert_eq!(completed.accumulated_work[1].calls, 1);
+        assert!(
+            completed
+                .accumulated_work
+                .iter()
+                .map(|work| work.wall_ns)
+                .sum::<u64>()
+                <= completed.duration_ns
+        );
+        assert!(snapshot.events[1].cancelled);
+        assert_eq!(snapshot.events[1].accumulated_work[0].calls, 1);
+        let mut disabled =
+            AccumulatedSpan::new(Phase::Parquet, "disabled_repeat", None, ["decode"]);
+        assert_eq!(disabled.measure(0, || 11), 11);
+        assert_eq!(disabled.work[0].calls, 0);
+        assert_eq!(disabled.work[0].wall_ns, 0);
     }
 }

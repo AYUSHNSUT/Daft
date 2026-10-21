@@ -39,6 +39,7 @@ def test_pairs_are_adjacent_balanced_and_seeded_across_cases_and_layouts():
 
 def test_identical_control_has_equal_payloads_and_optimization_isolated():
     configs = phase7.configurations()
+    assert phase7.comparisons(["row-count"]) == {"lightweight_planning": ("baseline", "row_count")}
     assert phase7.fingerprint(configs["baseline"]) == phase7.fingerprint(configs["baseline_copy"])
     assert configs["baseline"] is not configs["baseline_copy"]
     candidate = copy.deepcopy(configs["row_count"])

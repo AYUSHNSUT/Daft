@@ -409,8 +409,10 @@ Release diagnosis requires a clean tracked checkout and
 `DAFT_VORTEX_BENCH_BUILD_COMMAND` set to the actual release build command. Use a
 new output directory on each deliberate experiment. Defaults are 20 adjacent
 balanced measured pairs, one warmup and three later diagnostic repetitions.
-Comparisons isolate row-count-only planning and request caps (1/2/4 versus 8 per
-file); A/A uses identical configurations. All queries construct fresh sources in
+Comparisons measure lightweight planning (footer row counts plus shared reader
+initialization within each metadata batch) and separate request caps (1/2/4 versus
+8 per file); A/A uses identical configurations. The planning option
+`enable_row_count_planning` defaults to false. All queries construct fresh sources in
 one persistent process; source creation remains included.
 
 Each `profiles/NNNNN/` contains accounting JSON/Markdown/HTML and a Chrome trace.

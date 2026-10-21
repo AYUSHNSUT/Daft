@@ -65,7 +65,7 @@ def comparisons(experiments):
     if "aa" in experiments:
         result["identical_control"] = ("baseline", "baseline_copy")
     if "row-count" in experiments:
-        result["row_count_only_planning"] = ("baseline", "row_count")
+        result["lightweight_planning"] = ("baseline", "row_count")
     if "requests" in experiments:
         for cap in (1, 2, 4):
             result[f"requests_8_vs_{cap}"] = ("baseline", f"requests_{cap}")

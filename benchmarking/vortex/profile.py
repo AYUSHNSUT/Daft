@@ -111,7 +111,12 @@ def coverage(normalized):
             "range",
         },
         "outer retries and backoff": {"get_attempt_headers", "resume_headers", "retry_backoff", "body_retry_backoff"},
-        "decoding and asynchronous stream wait": {"batch_wait_decode", "column_decode", "column_consume"},
+        "decoding and asynchronous stream wait": {
+            "batch_wait_decode",
+            "column_decode",
+            "column_consume",
+            "column_decoder_work",
+        },
         "conversion and filtering": {"arrow_conversion", "predicate_filter", "residual_filter"},
         "reader schema conversion": {"schema_conversion"},
         "finalization": {"native_finalize", "worker_shutdown", "stats_finalize", "runner_finalize"},
@@ -184,6 +189,21 @@ def events(trace):
                     numeric[key] = value
             if numeric.get("active_poll_ns", 0) > duration:
                 raise ValueError("Diagnostic event active poll time exceeds its wall duration")
+            work = event.get("accumulated_work", [])
+            if not isinstance(work, list) or len(work) > 2:
+                raise ValueError("Diagnostic accumulated work must be a bounded list")
+            seen = set()
+            accumulated_work = []
+            for item in work:
+                if not isinstance(item, dict):
+                    raise ValueError("Diagnostic accumulated work must contain objects")  # noqa: TRY004
+                name = item.get("operation")
+                if not isinstance(name, str) or name not in {"column_decode", "column_skip"} or name in seen:
+                    raise ValueError("Diagnostic accumulated work operation is unknown or repeated")
+                if not _number(item.get("calls")) or not _number(item.get("wall_ns")):
+                    raise ValueError("Diagnostic accumulated work counters must be nonnegative integers")
+                seen.add(name)
+                accumulated_work.append({"operation": name, "calls": item["calls"], "wall_ns": item["wall_ns"]})
             start += offset if origin == "native" else 0
             normalized.append(
                 {
@@ -198,6 +218,7 @@ def events(trace):
                     "thread_id": event.get("thread_id"),
                     "error": event.get("error", False),
                     "cancelled": event.get("cancelled", False),
+                    "accumulated_work": accumulated_work,
                     **numeric,
                 }
             )
@@ -270,6 +291,24 @@ def summarize(trace):
         bool(event["cancelled"]) and event["operation"] != "first_batch" for event in normalized
     )
     complete = all(type(value) is int and value == 0 for value in loss.values())
+    accumulated = {}
+    for event in normalized:
+        for work in event["accumulated_work"]:
+            key = event["origin"], event["phase"], work["operation"]
+            row = accumulated.setdefault(
+                key,
+                {
+                    "origin": key[0],
+                    "phase": key[1],
+                    "operation": key[2],
+                    "envelopes": 0,
+                    "calls": 0,
+                    "summed_work_ns": 0,
+                },
+            )
+            row["envelopes"] += 1
+            row["calls"] += work["calls"]
+            row["summed_work_ns"] += work["wall_ns"]
     return {
         "schema_version": 1,
         "complete": complete,
@@ -285,6 +324,7 @@ def summarize(trace):
         "internal_overlap": concurrency(internal),
         "events_outside_query": sum(e["start"] < began or e["end"] > ended for e in normalized),
         "rows": rows,
+        "accumulated_work": [row for _, row in sorted(accumulated.items())],
         "notes": [
             "Separate instrumented query; these durations are excluded from performance trials.",
             "Capture completeness measures dropped or unfinished events. Closed operation errors or cancellations are reported separately; successful queries may recover from an attempt or prune an empty first batch.",
@@ -295,6 +335,7 @@ def summarize(trace):
             "batch_wait_decode includes asynchronous I/O and scheduling waits; it is not a pure CPU decoding measurement.",
             "response_body spans headers available through EOF, including consumer and scheduling delay; it is not pure network transfer time.",
             "Active-poll time is wall inside future poll calls, including nested work but excluding spawned work; suspended time includes scheduling waits. Neither is CPU time.",
+            "Accumulated decoder/skip work reports synchronous call counts and summed durations inside decoder envelopes. No individual intervals or interval unions are inferred from these counters; envelope gaps include consume/backpressure waits.",
             "Logical API events and returned bytes do not measure physical transport attempts or wire traffic.",
             "Operator metrics and process CPU are additional evidence; neither can be added to this wall-time accounting.",
             "Timeline lanes are logical display lanes, not OS threads. thread_id records the starting thread; asynchronous work may migrate.",
@@ -338,6 +379,7 @@ def chrome_trace(trace):
                         "byte_wait_ns",
                         "header_ns",
                         "body_ns",
+                        "accumulated_work",
                     )
                     if key in event
                 },
@@ -408,6 +450,22 @@ def markdown(summary):
             values = [f"{row[key] / 1e6:.3f}" if row[key] is not None else "unavailable" for key in checkpoints]
             returned = str(row["returned_bytes"]) if row["returned_bytes"] is not None else "unavailable"
             lines.append(f"| {row['phase']} / {row['operation']} | " + " | ".join([*values, returned]) + " |")
+    if summary["accumulated_work"]:
+        lines += [
+            "",
+            "## Accumulated decoder work",
+            "",
+            "Bounded counters preserve every synchronous decode/skip call without recording one timeline event per call. "
+            "Summed work can overlap across decoder tasks; it is neither query wall occupancy nor CPU time. "
+            "Only the encompassing decoder task has a timeline interval; its duration also includes consumption and backpressure gaps.",
+            "",
+            "| Phase / operation | Decoder envelopes | Calls | Summed synchronous work ms |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+        for row in summary["accumulated_work"]:
+            lines.append(
+                f"| {row['phase']} / {row['operation']} | {row['envelopes']} | {row['calls']} | {row['summed_work_ns'] / 1e6:.3f} |"
+            )
     lines += ["", "## Coverage", ""]
     for name, value in summary["coverage"].items():
         lines.append(f"- {name}: {value['status']}. " + value.get("reason", ""))

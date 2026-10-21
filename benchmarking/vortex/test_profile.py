@@ -221,3 +221,49 @@ def test_combined_source_discovery_and_schema_is_counted_as_child():
     source = next(row for row in result["envelopes"] if row["phase"] == "source_creation")
     assert source["child_union_ns"] == 15 and source["unattributed_ns"] == 5
     assert result["coverage"]["combined discovery and schema"]["status"] == "observed"
+
+
+def test_accumulated_decoder_work_does_not_invent_timeline_intervals(tmp_path):
+    trace = capture()
+    for index, event in enumerate(trace["native"]["events"][:2]):
+        event.update(
+            phase="parquet",
+            operation="column_decoder_work",
+            accumulated_work=[
+                {"operation": "column_decode", "calls": 10 + index, "wall_ns": 12 + index},
+                {"operation": "column_skip", "calls": 3 + index, "wall_ns": 2 + index},
+            ],
+        )
+    result = profile.export(trace, tmp_path / "capture")
+    work = {row["operation"]: row for row in result["accumulated_work"]}
+    assert work["column_decode"]["calls"] == 21 and work["column_decode"]["summed_work_ns"] == 25
+    assert work["column_skip"]["calls"] == 7 and work["column_skip"]["summed_work_ns"] == 5
+    assert work["column_decode"]["envelopes"] == 2
+    envelope = next(row for row in result["rows"] if row["operation"] == "column_decoder_work")
+    assert envelope["wall_union_ns"] == 50 and envelope["summed_event_ns"] == 70
+    assert not any(row["operation"] in {"column_decode", "column_skip"} for row in result["rows"])
+    timeline = profile.chrome_trace(trace)["traceEvents"]
+    assert len(timeline) == 6
+    assert any(event["args"].get("accumulated_work") for event in timeline)
+    assert "## Accumulated decoder work" in (tmp_path / "capture/accounting.md").read_text()
+
+
+@pytest.mark.parametrize(
+    "work",
+    [
+        None,
+        {},
+        [None],
+        [{"operation": []}],
+        [{"operation": "url-secret", "calls": 1, "wall_ns": 1}],
+        [{"operation": "column_decode", "calls": True, "wall_ns": 1}],
+        [{"operation": "column_decode", "calls": 1, "wall_ns": -1}],
+        [{"operation": "column_decode", "calls": 1, "wall_ns": 1}] * 2,
+        [{"operation": "column_decode", "calls": 1, "wall_ns": 1}] * 3,
+    ],
+)
+def test_accumulated_work_requires_bounded_allowlisted_numeric_counters(work):
+    trace = capture()
+    trace["native"]["events"][0]["accumulated_work"] = work
+    with pytest.raises(ValueError, match="Diagnostic accumulated"):
+        profile.summarize(trace)

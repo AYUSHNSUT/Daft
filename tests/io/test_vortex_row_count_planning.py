@@ -1,4 +1,4 @@
-"""Fresh footer counts can avoid unused planning schemas without weakening scans."""
+"""Lightweight planning shares session setup while keeping metadata and scans fresh."""
 
 from __future__ import annotations
 
@@ -96,26 +96,62 @@ def test_row_count_planning_keeps_full_execution_schema_validation(tmp_path, wri
         daft.read_vortex([str(first), str(second)], enable_row_count_planning=True).select("id").collect()
 
 
-def test_row_count_planning_exposes_omitted_conversion_in_profile(tmp_path: Path, writer):
-    path = tmp_path / "profile.vortex"
-    writer.io.write(pa.table({"id": [1, 2]}), str(path))
+def test_row_count_planning_profiles_bulk_session_reuse_and_fresh_materializations(tmp_path: Path, writer):
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"profile-{index}.vortex"
+        writer.io.write(pa.table({"id": [index * 2, index * 2 + 1]}), str(path))
+        paths.append(str(path))
     for enabled in (False, True):
+        source = _vortex.VortexSource(paths, None, 2, enable_row_count_planning=enabled)
+        for _ in range(2):
+            diagnostics.start()
+            try:
+                result = source.read().to_pydict()
+            finally:
+                capture = diagnostics.finish()
+            assert sorted(result["id"]) == list(range(6))
+            events = capture["native"]["events"]
+            converted = [
+                event
+                for event in events
+                if event["phase"] == "planning_metadata" and event["operation"] == "schema_conversion"
+            ]
+            assert len(converted) == (0 if enabled else 3)
+            planning_sessions = [
+                event
+                for event in events
+                if event["phase"] == "planning_metadata" and event["operation"] == "session_creation"
+            ]
+            assert len(planning_sessions) == (1 if enabled else 3)
+            assert all((event["file_id"] is None) is enabled for event in planning_sessions)
+            for operation in ("session_creation", "schema_validation"):
+                assert (
+                    sum(event["phase"] == "execution_open" and event["operation"] == operation for event in events) == 3
+                )
+            assert any(
+                event["phase"] == "execution" and event["operation"] == "batch_wait_decode" and event["poll_count"] > 0
+                for event in events
+            )
+            assert capture["native"]["unfinished_events"] == capture["native"]["dropped_events"] == 0
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_row_count_bulk_reinitializes_one_session_per_call_and_none_for_empty_input(tmp_path, writer, cached):
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"{index}.vortex"
+        writer.io.write(pa.table({"id": [index]}), str(path))
+        paths.append(str(path))
+    api = native._read_vortex_row_counts_bulk_cached if cached else native._read_vortex_row_counts_bulk
+    for requested in (paths, paths, []):
         diagnostics.start()
         try:
-            result = daft.read_vortex(path, enable_row_count_planning=enabled).to_pydict()
+            values, _ = api(requested)
         finally:
             capture = diagnostics.finish()
-        assert result == {"id": [1, 2]}
-        events = capture["native"]["events"]
-        converted = [
-            event
-            for event in events
-            if event["phase"] == "planning_metadata" and event["operation"] == "schema_conversion"
-        ]
-        assert bool(converted) is not enabled
-        assert any(event["phase"] == "execution_open" and event["operation"] == "schema_validation" for event in events)
-        assert any(
-            event["phase"] == "execution" and event["operation"] == "batch_wait_decode" and event["poll_count"] > 0
-            for event in events
-        )
+        assert len(values) == len(requested)
+        sessions = [event for event in capture["native"]["events"] if event["operation"] == "session_creation"]
+        assert len(sessions) == (1 if requested else 0)
+        assert all(event["phase"] == "planning_metadata" and event["file_id"] is None for event in sessions)
         assert capture["native"]["unfinished_events"] == capture["native"]["dropped_events"] == 0
