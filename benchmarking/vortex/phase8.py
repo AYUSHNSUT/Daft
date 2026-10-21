@@ -395,6 +395,7 @@ def main(argv=None):
     parser.add_argument("--report", type=Path)
     parser.add_argument("--config", default="combined")
     parser.add_argument("--datasets", nargs="+", default=["sorted/multi"])
+    parser.add_argument("--cases", nargs="+", choices=QUERY_CASES, default=list(QUERY_CASES))
     parser.add_argument("--experiments", choices=EXPERIMENTS, nargs="+", default=list(EXPERIMENTS))
     parser.add_argument("--sessions", type=int, default=3)
     parser.add_argument("--seed", type=int, default=811)

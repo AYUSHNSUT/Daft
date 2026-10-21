@@ -61,6 +61,49 @@ def test_independent_sessions_keep_seeds_options_and_trial_order(fake_run, monke
     assert all(report["order_diagnostics"] for report in reports)
 
 
+@pytest.mark.parametrize("cases", [["scan_narrow"], list(phase8.QUERY_CASES)])
+def test_cli_accepts_forwarded_remote_cases(fake_run, monkeypatch, cases):
+    monkeypatch.setattr(phase8, "require_api", lambda: None)
+    assert (
+        phase8.main(
+            [
+                "--manifest",
+                str(fake_run.manifest),
+                "--output",
+                str(fake_run.output),
+                "--storage-root",
+                "s3://local-test",
+                "--cases",
+                *cases,
+                "--datasets",
+                "sorted/multi",
+                "--experiments",
+                "aa",
+                "--sessions",
+                "1",
+                "--rounds",
+                "2",
+                "--warmups",
+                "0",
+                "--diagnostic-rounds",
+                "1",
+                "--allow-dev",
+            ]
+        )
+        == 0
+    )
+    report = json.loads((fake_run.output / "session-01/report.json").read_text())
+    assert report["settings"]["cases"] == cases
+    assert {trial["case"] for trial in report["trials"]} == set(cases)
+    assert len(report["trials"]) == len(cases) * 4
+
+
+def test_cli_rejects_unknown_case(tmp_path):
+    with pytest.raises(SystemExit) as error:
+        phase8.main(["--output", str(tmp_path / "report"), "--cases", "unknown"])
+    assert error.value.code == 2
+
+
 @pytest.mark.parametrize(
     "stage,ratio,expected",
     [
