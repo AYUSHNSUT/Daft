@@ -1,5 +1,9 @@
 # Native Vortex / Parquet evaluation
 
+The maintained [Parquet vs Vortex comparison](../../docs/contributing/parquet-vs-vortex.md)
+contains current timings, earlier workload coverage and measurement conditions.
+Update it after each completed performance evaluation using its update rules.
+
 Run from the repository root. This harness compares two reader paths in the same
 Daft build. It does not compare Daft with other engines or constitute canonical
 TPC-H. Vortex 0.88.0, PyArrow, and NumPy are required for fixture generation.
