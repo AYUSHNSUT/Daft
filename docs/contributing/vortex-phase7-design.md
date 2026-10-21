@@ -13,7 +13,7 @@ service and Rust checks passed in that run.
    optimizer/task creation, repeated opens, reading, conversion and reduction?
    Planning currently constructs complete schemas that Python discards. Add an
    opt-in `enable_row_count_planning` path returning only rows and optional
-   validated opening-range snapshots, with shared reader initialization within
+   validated opening-range snapshots, with shared session initialization within
    each metadata batch. Measure that bundle as `lightweight_planning`; keep the
    old path as the same-build control. The option defaults to false.
 2. Does remote full-scan concurrency exceed what this local MinIO setup handles

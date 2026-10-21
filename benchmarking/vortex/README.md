@@ -387,7 +387,8 @@ resources.
 
 ## Phase 7: paired diagnosis and full-layer traces
 
-See [the Phase 7 design](../../docs/contributing/vortex-phase7-design.md). The new
+See [the Phase 7 design](../../docs/contributing/vortex-phase7-design.md) and
+[measured local results](../../docs/contributing/vortex-phase7-results.md). The new
 release build exposes shared-clock Python/native diagnostic events for both
 formats. Run profiling separately from performance samples; do not run builds or
 tests concurrently with a comparison.
@@ -409,7 +410,7 @@ Release diagnosis requires a clean tracked checkout and
 `DAFT_VORTEX_BENCH_BUILD_COMMAND` set to the actual release build command. Use a
 new output directory on each deliberate experiment. Defaults are 20 adjacent
 balanced measured pairs, one warmup and three later diagnostic repetitions.
-Comparisons measure lightweight planning (footer row counts plus shared reader
+Comparisons measure lightweight planning (footer row counts plus shared session
 initialization within each metadata batch) and separate request caps (1/2/4 versus
 8 per file); A/A uses identical configurations. The planning option
 `enable_row_count_planning` defaults to false. All queries construct fresh sources in

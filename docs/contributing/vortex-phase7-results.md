@@ -55,14 +55,116 @@ Raw initial evidence is retained under
 `examples/vortex_eval/artifacts/phase7/local-profile-initial/`, including
 `report.json`, `analysis.md`, `overview.html` and individual profile timelines.
 
-## Remaining evidence
+## Revised local measurement
 
-The revised candidate requires a new complete local paired measurement and
-remote request-concurrency sweep. Remote runs use an owned temporary MinIO
+The revised run used source `345a7d460e0fbd837b5b870f102d9c197263694c` and native
+SHA256 `abdda9c07984620a2f0bc3cf0501a7c6d972889ab29e27e5352294c6d3af041f`.
+It passed all 3,360 query outputs, all 240 complete diagnostic captures and
+provenance checks. There were no dropped or unfinished profiling events. The
+schedule, fixtures and measurement protocol stayed the same; this is a new
+same-build comparison, not a before/after comparison of different runs.
+The largest capture contained 7,285 events. The busiest selective Parquet capture
+retained 316,184 decode/skip calls in 384 decoder envelopes and 3,573 total
+events, without exceeding the bounded collector.
+
+The clearest improvements are in eight-file queries:
+
+| Layout / query | Baseline median ms | Candidate median ms | Median paired change | Candidate faster pairs |
+| --- | ---: | ---: | ---: | ---: |
+| Sorted / narrow scan | 15.505 | 14.242 | -7.98% | 20/20 |
+| Sorted / 1% range filter | 6.474 | 5.008 | -22.35% | 20/20 |
+| Sorted / 1% equality filter | 6.336 | 5.007 | -21.79% | 20/20 |
+| Sorted / join | 60.568 | 59.620 | -2.15% | 15/20 |
+| Sorted / full reduction | 157.570 | 158.202 | +0.60% | 9/20 |
+| Shuffled / narrow scan | 18.776 | 17.445 | -7.18% | 19/20 |
+| Shuffled / 1% range filter | 13.242 | 11.809 | -11.32% | 20/20 |
+| Shuffled / 1% equality filter | 13.786 | 12.550 | -10.28% | 19/20 |
+
+The paired change is the median of the 20 individual B/A ratios, not the ratio
+of the two displayed medians. A/A paired median ratios across all 20 workloads
+ranged from 0.982 to 1.007. Small changes in joins, single-file queries and full
+reductions do not establish a consistent improvement. The largest candidate
+regression by ratio of medians was 1.31%; this exploratory result does not
+replace the separate final performance gate.
+
+The candidate beat Parquet's median in 18 of 20 local workloads. Parquet still
+won sorted/eight-file range filtering (3.900 ms versus Vortex 5.246 ms) and
+equality filtering (3.149 ms versus Vortex 5.093 ms). These use the dedicated
+Parquet/candidate comparison samples, so their Vortex medians differ from the
+baseline/candidate samples in the table above.
+
+## Where the time goes
+
+For sorted/eight-file range filtering, the medians of three separate captures
+show the intended reduction in repeated planning work:
+
+| Instrumented boundary | Baseline ms | Candidate ms |
+| --- | ---: | ---: |
+| Whole query | 6.673 | 5.291 |
+| Source creation, including discovery and schema inference | 1.390 | 1.195 |
+| Logical planning, including metadata materialization | 2.694 | 1.349 |
+| Planning metadata within logical planning | 2.083 | 0.796 |
+| Planning session initialization within metadata work | 1.288 | 0.177 |
+| Physical planning | 0.015 | 0.015 |
+| Execution event-loop wait | 2.340 | 2.402 |
+| Execution session initialization within execution | 0.958 | 0.976 |
+| Batch polling/decode, including I/O and scheduling wait | 0.813 | 0.870 |
+| Arrow conversion | 0.002 | 0.002 |
+| Time outside internal instrumented boundaries | 0.410 | 0.418 |
+
+Rows overlap and medians are not additive. Instrumentation overhead is included
+here; these values are not substituted for the uninstrumented performance
+medians. The source and execution-session differences are observations, not
+changes the candidate intentionally makes. The capture distinguishes eight
+baseline planning session creations from one candidate creation.
+
+The candidate's sorted/eight-file full reduction has a different profile:
+159.232 ms total, 0.806 ms planning metadata, 149.839 ms batch-poll occupancy,
+45.746 ms Arrow-conversion occupancy and 127.113 ms engine-task occupancy.
+These intervals overlap substantially. They identify execution and conversion
+as follow-up targets without attributing all elapsed time to decoder CPU.
+
+Detailed timing tables, control comparisons, raw events and per-query timelines
+are in `examples/vortex_eval/artifacts/phase7/local-profile-revised/`:
+`overview.html`, `analysis.md`, `report.json` and `profiles/`.
+
+## Validation and remaining evidence
+
+The rebuilt release extension passed 720 local Python query tests, 334 harness
+tests plus nine subtests, and 174 targeted Rust tests. Five Python cases were
+deselected by repository configuration and one existing Rust doctest was ignored.
+Full-workspace/all-features/all-targets Clippy with warnings denied, formatting
+and changed-file pre-commit checks passed. The decoder regression verifies
+50,002 decode/skip calls, correct output and zero lost events.
+
+The remote request-concurrency sweep and live service checks are pending.
+Remote runs use an owned temporary MinIO
 container, with the same persistent-worker and fresh-source protocol. They
 compare request limits 1, 2, 4 and 8 per file independently of the planning
 candidate. Service, socket and compatibility checks must also pass before
 publishing this phase.
+
+The agent sandbox cannot bind localhost ports, access Docker's socket, read the
+CPU-cache sysctl used by PyArrow ORC, or resolve the external host used by one
+MCAP test. Those checks, plus the full Rust workspace suite, are grouped in one
+frozen terminal helper. Earlier environment-blocked logs remain preserved.
+
+## Next targets supported by these profiles
+
+1. Test direct `LargeUtf8`/`LargeBinary` output from Vortex. The current
+   [Arrow schema request](../../src/daft-vortex/src/read.rs) uses `Utf8`/`Binary`,
+   which Daft subsequently widens to its large-offset representation. Arrow
+   shares payload/null buffers but allocates and widens offsets. Compare total
+   query time and both SDK/export and Daft-conversion time: moving the work
+   between layers alone is not an improvement. Validate Unicode, binary, nulls,
+   empty values, projection, filters and limits.
+2. Evaluate execution-session reuse within each fresh scan processor. This needs
+   execution-context plumbing; serialize configuration only and retain fresh
+   per-file readers, metadata and validators. The current optimization is
+   deliberately limited to planning batches.
+3. Profile common-engine reduction kernels independently. This benchmark's
+   string-length expression counts Unicode characters; substituting byte length
+   would change the query and invalidate the comparison.
 
 The profile exposes API, planning, reader, execution and I/O boundaries, plus
 uncovered time and accumulated decoder work. It does not independently measure
