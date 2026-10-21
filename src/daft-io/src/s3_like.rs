@@ -56,7 +56,7 @@ use crate::{
     Error::InvalidArgument,
     FileFormat, InvalidArgumentSnafu, InvalidRangeRequestSnafu, SourceType,
     multipart::MultipartWriter,
-    object_io::{FileMetadata, FileType, LSResult},
+    object_io::{FileMetadata, FileType, LSResult, ObjectReadMetadata, ObjectVersion},
     range::GetRange,
     retry::{ExponentialBackoff, RetryError},
     stats::IOStatsRef,
@@ -796,6 +796,42 @@ impl S3LikeSource {
         Ok(w_handle.get(region).unwrap().clone())
     }
 
+    async fn get_conditioned(
+        &self,
+        uri: &str,
+        range: Option<GetRange>,
+        io_stats: Option<IOStatsRef>,
+        version: Option<&ObjectVersion>,
+    ) -> super::Result<GetResult> {
+        let permit = self
+            .connection_pool_sema
+            .clone()
+            .acquire_owned()
+            .await
+            .context(UnableToGrabSemaphoreSnafu)?;
+        let get_result = self
+            .get_impl(permit, uri, range, &self.default_region, version)
+            .await?;
+
+        if io_stats.is_some() {
+            if let GetResult::Stream(stream, num_bytes, permit, retry_params) = get_result {
+                if let Some(is) = io_stats.as_ref() {
+                    is.mark_get_requests(1);
+                }
+                Ok(GetResult::Stream(
+                    io_stats_on_bytestream(stream, io_stats),
+                    num_bytes,
+                    permit,
+                    retry_params,
+                ))
+            } else {
+                panic!("This should always be a stream");
+            }
+        } else {
+            Ok(get_result)
+        }
+    }
+
     #[async_recursion]
     async fn get_impl(
         &self,
@@ -803,6 +839,7 @@ impl S3LikeSource {
         uri: &str,
         range: Option<GetRange>,
         region: &Region,
+        version: Option<&ObjectVersion>,
     ) -> super::Result<GetResult> {
         log::debug!("S3 get at {uri}, range: {range:?}, in region: {region}");
         let ObjectPath { bucket, key, .. } = parse_object_url(uri)?;
@@ -832,10 +869,27 @@ impl S3LikeSource {
                 }
             };
 
+            let request = if let Some(version) = version {
+                request
+                    .if_match(&version.e_tag)
+                    .set_version_id(version.version_id.clone())
+            } else {
+                request
+            };
+
             let response = request.send().await;
 
             match response {
                 Ok(v) => {
+                    if let Some(version) = version
+                        && (v.e_tag() != Some(version.e_tag.as_str())
+                            || version
+                                .version_id
+                                .as_deref()
+                                .is_some_and(|id| v.version_id() != Some(id)))
+                    {
+                        return Err(crate::Error::ObjectChanged { path: uri.into() });
+                    }
                     if let Some(range) = &range {
                         validate_s3_range_response(range, &v)?;
                     }
@@ -874,6 +928,9 @@ impl S3LikeSource {
                 Err(SdkError::ServiceError(err)) => {
                     let bad_response = err.raw();
                     match bad_response.status().as_u16() {
+                        412 if version.is_some() => {
+                            Err(crate::Error::ObjectChanged { path: uri.into() })
+                        }
                         // moved permanently
                         301 => {
                             let headers = bad_response.headers();
@@ -894,7 +951,8 @@ impl S3LikeSource {
                                 new_region,
                                 region
                             );
-                            self.get_impl(permit, uri, range, &new_region).await
+                            self.get_impl(permit, uri, range, &new_region, version)
+                                .await
                         }
                         _ => Err(UnableToOpenFileSnafu { path: uri }
                             .into_error(SdkError::ServiceError(err))
@@ -912,7 +970,7 @@ impl S3LikeSource {
         permit: SemaphorePermit<'async_recursion>,
         uri: &str,
         region: &Region,
-    ) -> super::Result<usize> {
+    ) -> super::Result<ObjectReadMetadata> {
         log::debug!("S3 head at {uri} in region: {region}");
         let ObjectPath {
             scheme: _scheme,
@@ -941,7 +999,20 @@ impl S3LikeSource {
 
             match response {
                 Ok(v) => match v.content_length() {
-                    Some(l) => Ok(l as usize),
+                    Some(l) => {
+                        let size =
+                            usize::try_from(l).map_err(|_| crate::Error::InvalidArgument {
+                                msg: "S3 HEAD returned an invalid object length".into(),
+                            })?;
+                        let version = v
+                            .e_tag()
+                            .map(|e_tag| ObjectVersion {
+                                e_tag: e_tag.to_string(),
+                                version_id: v.version_id().map(str::to_string),
+                            })
+                            .filter(ObjectVersion::is_usable);
+                        Ok(ObjectReadMetadata { size, version })
+                    }
                     None => Err(Error::HeadObjectOutputEmpty { path: uri.into() }.into()),
                 },
                 Err(SdkError::ServiceError(err)) => {
@@ -1346,33 +1417,23 @@ impl ObjectSource for S3LikeSource {
         range: Option<GetRange>,
         io_stats: Option<IOStatsRef>,
     ) -> super::Result<GetResult> {
-        let permit = self
-            .connection_pool_sema
-            .clone()
-            .acquire_owned()
-            .await
-            .context(UnableToGrabSemaphoreSnafu)?;
-        let get_result = self
-            .get_impl(permit, uri, range, &self.default_region)
-            .await?;
+        self.get_conditioned(uri, range, io_stats, None).await
+    }
 
-        if io_stats.is_some() {
-            if let GetResult::Stream(stream, num_bytes, permit, retry_params) = get_result {
-                if let Some(is) = io_stats.as_ref() {
-                    is.mark_get_requests(1);
-                }
-                Ok(GetResult::Stream(
-                    io_stats_on_bytestream(stream, io_stats),
-                    num_bytes,
-                    permit,
-                    retry_params,
-                ))
-            } else {
-                panic!("This should always be a stream");
-            }
-        } else {
-            Ok(get_result)
+    async fn get_if_match(
+        &self,
+        uri: &str,
+        range: Option<GetRange>,
+        version: &ObjectVersion,
+        io_stats: Option<IOStatsRef>,
+    ) -> super::Result<GetResult> {
+        if !version.is_usable() {
+            return Err(crate::Error::InvalidArgument {
+                msg: "Conditional reads require one quoted strong entity tag".into(),
+            });
         }
+        self.get_conditioned(uri, range, io_stats, Some(version))
+            .await
     }
 
     async fn put(
@@ -1400,6 +1461,14 @@ impl ObjectSource for S3LikeSource {
     }
 
     async fn get_size(&self, uri: &str, io_stats: Option<IOStatsRef>) -> super::Result<usize> {
+        Ok(self.get_read_metadata(uri, io_stats).await?.size)
+    }
+
+    async fn get_read_metadata(
+        &self,
+        uri: &str,
+        io_stats: Option<IOStatsRef>,
+    ) -> super::Result<ObjectReadMetadata> {
         let permit = self
             .connection_pool_sema
             .acquire()
@@ -1989,6 +2058,134 @@ mod tests {
             "sequential requests must reuse their TCP connection"
         );
         assert_eq!(requests.len(), 3);
+    }
+
+    fn version_test_source(
+        responses: Vec<String>,
+    ) -> (S3LikeSource, std::thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let (mut socket, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accepting conditional S3 request: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    assert_eq!(socket.read(&mut byte).unwrap(), 1);
+                    header.push(byte[0]);
+                    assert!(header.len() <= 16 * 1024);
+                }
+                requests.push(String::from_utf8(header).unwrap());
+                socket.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        let client = pooling_test_client(
+            &endpoint,
+            super::s3_http_client(ProxyConfig::disabled()),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let region = client.config().region().unwrap().clone();
+        let source = S3LikeSource {
+            region_to_client_map: tokio::sync::RwLock::new(
+                [(region.clone(), Arc::new(client))].into(),
+            ),
+            connection_pool_sema: Arc::new(tokio::sync::Semaphore::new(2)),
+            default_region: region,
+            s3_config: S3Config::default(),
+        };
+        (source, server)
+    }
+
+    #[tokio::test]
+    async fn test_s3_http_client_extracts_validators_and_sends_conditional_ranges() {
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nETag: \"stable\"\r\nx-amz-version-id: version-1\r\nConnection: close\r\n\r\n";
+        let get = "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 1-2/4\r\nETag: \"stable\"\r\nx-amz-version-id: version-1\r\nConnection: close\r\n\r\nbc";
+        let (source, server) = version_test_source(vec![head.into(), get.into()]);
+        let metadata = source
+            .get_read_metadata("s3://bucket/key", None)
+            .await
+            .unwrap();
+        assert_eq!(metadata.size, 4);
+        let version = metadata.version.unwrap();
+        assert_eq!(version.e_tag, "\"stable\"");
+        assert_eq!(version.version_id.as_deref(), Some("version-1"));
+        let bytes = source
+            .get_if_match(
+                "s3://bucket/key",
+                Some(crate::GetRange::Bounded(1..3)),
+                &version,
+                None,
+            )
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"bc");
+        let requests = server.join().unwrap();
+        let get = requests[1].to_ascii_lowercase();
+        assert!(get.contains("if-match: \"stable\"\r\n"));
+        assert!(get.contains("range: bytes=1-2\r\n"));
+        assert!(get.contains("versionid=version-1"));
+    }
+
+    #[tokio::test]
+    async fn test_s3_http_client_conditional_read_fails_closed_on_changes() {
+        let version = crate::ObjectVersion {
+            e_tag: "\"stable\"".into(),
+            version_id: Some("v1".into()),
+        };
+        for response in [
+            "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nETag: \"changed\"\r\nx-amz-version-id: v1\r\nConnection: close\r\n\r\nabcd",
+            "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nETag: \"stable\"\r\nx-amz-version-id: v2\r\nConnection: close\r\n\r\nabcd",
+        ] {
+            let (source, server) = version_test_source(vec![response.into()]);
+            let result = source
+                .get_if_match("s3://bucket/key", None, &version, None)
+                .await;
+            assert!(matches!(result, Err(crate::Error::ObjectChanged { .. })));
+            assert_eq!(
+                server.join().unwrap().len(),
+                1,
+                "never retry without a condition"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s3_http_client_missing_or_weak_validator_disables_reuse() {
+        for header in ["", "ETag: W/\"weak\"\r\n"] {
+            let (source, server) = version_test_source(vec![format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n{header}Connection: close\r\n\r\n"
+            )]);
+            let metadata = source
+                .get_read_metadata("s3://bucket/key", None)
+                .await
+                .unwrap();
+            assert_eq!(metadata.size, 4);
+            assert!(metadata.version.is_none());
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]

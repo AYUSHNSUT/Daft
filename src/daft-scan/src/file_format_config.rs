@@ -534,7 +534,6 @@ impl_bincode_py_state_serialization!(McapSourceConfig);
 
 /// Configuration for the experimental native Vortex data source.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
-#[cfg_attr(debug_assertions, derive(Debug))]
 #[cfg_attr(
     feature = "python",
     pyclass(module = "daft.daft", get_all, from_py_object)
@@ -548,6 +547,21 @@ pub struct VortexSourceConfig {
     pub enable_read_coalescing: bool,
     pub read_coalesce_gap_bytes: usize,
     pub read_coalesce_max_bytes: usize,
+    pub metadata_snapshot: Option<Vec<u8>>,
+}
+
+#[cfg(debug_assertions)]
+impl std::fmt::Debug for VortexSourceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VortexSourceConfig")
+            .field("options", &self.multiline_display())
+            .field(
+                "metadata_snapshot_bytes",
+                &self.metadata_snapshot.as_ref().map_or(0, Vec::len),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for VortexSourceConfig {
@@ -561,6 +575,7 @@ impl Default for VortexSourceConfig {
             enable_read_coalescing: true,
             read_coalesce_gap_bytes: 64 * 1024,
             read_coalesce_max_bytes: 4 * 1024 * 1024,
+            metadata_snapshot: None,
         }
     }
 }
@@ -568,7 +583,7 @@ impl Default for VortexSourceConfig {
 impl VortexSourceConfig {
     #[must_use]
     pub fn multiline_display(&self) -> Vec<String> {
-        vec![
+        let mut display = vec![
             format!("Batch size = {}", self.batch_size),
             format!(
                 "Enable projection pushdown = {}",
@@ -595,7 +610,11 @@ impl VortexSourceConfig {
                 "Maximum remote coalesced request bytes = {}",
                 self.read_coalesce_max_bytes
             ),
-        ]
+        ];
+        if let Some(snapshot) = &self.metadata_snapshot {
+            display.push(format!("Metadata snapshot bytes = {}", snapshot.len()));
+        }
+        display
     }
 }
 
@@ -657,6 +676,7 @@ impl VortexSourceConfig {
         enable_read_coalescing=true,
         read_coalesce_gap_bytes=65_536,
         read_coalesce_max_bytes=4_194_304,
+        metadata_snapshot=None,
     ))]
     fn new(
         batch_size: usize,
@@ -667,9 +687,18 @@ impl VortexSourceConfig {
         #[pyo3(from_py_with = strict_vortex_bool)] enable_read_coalescing: bool,
         #[pyo3(from_py_with = strict_vortex_coalesce_gap)] read_coalesce_gap_bytes: usize,
         #[pyo3(from_py_with = strict_vortex_budget)] read_coalesce_max_bytes: usize,
+        metadata_snapshot: Option<Vec<u8>>,
     ) -> PyResult<Self> {
         if batch_size == 0 {
             return Err(PyValueError::new_err("Vortex batch_size must be positive"));
+        }
+        if metadata_snapshot
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > 64 * 1024 * 1024)
+        {
+            return Err(PyValueError::new_err(
+                "Vortex metadata snapshot exceeds 64 MiB",
+            ));
         }
         if max_concurrent_requests > usize::MAX >> 3 {
             return Err(PyValueError::new_err(
@@ -695,6 +724,7 @@ impl VortexSourceConfig {
             enable_read_coalescing,
             read_coalesce_gap_bytes,
             read_coalesce_max_bytes,
+            metadata_snapshot,
         })
     }
 }

@@ -15,7 +15,7 @@ use vortex::{
     VortexSessionDefault,
     buffer::Alignment,
     file::{
-        SegmentSpec,
+        OpenOptionsSessionExt, SegmentSpec,
         segments::{FileSegmentSource, RequestMetrics},
     },
     io::{ReadAtRequest, VortexReadAt, session::RuntimeSessionExt},
@@ -72,6 +72,9 @@ fn range_adapter(
             max_requests: options.max_concurrent_requests,
             max_bytes: options.max_in_flight_bytes,
             coalescing: super::remote_coalescing(options, remote),
+            version: None,
+            capture: None,
+            cached_ranges: Arc::from([]),
             diagnostic_phase: std::sync::atomic::AtomicU8::new(
                 crate::diagnostics::Phase::Data as u8,
             ),
@@ -343,6 +346,9 @@ fn mock_reader(
             max_requests,
             max_bytes,
             coalescing: None,
+            version: None,
+            capture: None,
+            cached_ranges: Arc::from([]),
             diagnostic_phase: std::sync::atomic::AtomicU8::new(
                 crate::diagnostics::Phase::Data as u8,
             ),
@@ -494,6 +500,117 @@ async fn oversized_reads_fail_before_io_and_errors_release_budgets_without_secre
     assert!(!error.contains("hidden"));
     assert_eq!(reader.requests.available_permits(), 2);
     assert_eq!(reader.bytes.available_permits(), 8);
+}
+
+#[tokio::test]
+async fn validated_cached_ranges_preserve_alignment_budgets_and_avoid_backend_reads() {
+    let options = VortexReadOptions {
+        max_in_flight_bytes: 8,
+        ..Default::default()
+    };
+    let (mut reader, backend) = range_adapter(&options, true);
+    Arc::get_mut(&mut reader).unwrap().cached_ranges = Arc::from([crate::snapshot::OpeningRange {
+        offset: 3,
+        bytes: (3..15).collect(),
+    }]);
+    let result = reader
+        .read_at(4, 4, Alignment::new(64))
+        .await
+        .unwrap()
+        .unwrap_host();
+    assert_eq!(result.as_slice(), &[4, 5, 6, 7]);
+    assert!(Alignment::new(64).is_ptr_aligned(result.as_ptr()));
+    assert!(backend.calls.lock().unwrap().is_empty());
+    assert_eq!(reader.bytes.available_permits(), 8);
+    assert!(reader.read_at(3, 9, Alignment::none()).await.is_err());
+    assert!(backend.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        reader
+            .read_at(0, 2, Alignment::none())
+            .await
+            .unwrap()
+            .unwrap_host()
+            .as_slice(),
+        &[0, 1]
+    );
+    assert_eq!(*backend.calls.lock().unwrap(), vec![0..2]);
+}
+
+#[tokio::test]
+async fn regular_sdk_opener_reuses_serialized_opening_ranges_without_transport() {
+    use arrow_array::{Int64Array, RecordBatch};
+
+    use crate::snapshot::{Budget, Capture, MAX_SNAPSHOT_BYTES, Snapshot};
+
+    let batch = RecordBatch::try_from_iter([(
+        "id",
+        Arc::new(Int64Array::from(vec![1, 2, 3])) as arrow_array::ArrayRef,
+    )])
+    .unwrap();
+    let file = crate::tests::write_batch(batch).await;
+    let data = Bytes::from(std::fs::read(file.path()).unwrap());
+    let version = daft_io::ObjectVersion {
+        e_tag: "\"stable\"".into(),
+        version_id: None,
+    };
+    let options = VortexReadOptions::default();
+    let (mut reader, _) = range_adapter(&options, true);
+    let backend = Arc::new(RangeBytesReader {
+        data: data.clone(),
+        calls: Mutex::new(Vec::new()),
+    });
+    {
+        let reader = Arc::get_mut(&mut reader).unwrap();
+        reader.backend = backend.clone();
+        reader.diagnostic_uri = "s3://bucket/key".into();
+        reader.file_size = data.len() as u64;
+        reader.version = Some(version.clone());
+        reader.capture = Some(Arc::new(
+            Capture::new(Arc::new(Budget::new(MAX_SNAPSHOT_BYTES)), 512).unwrap(),
+        ));
+    }
+    let session = VortexSession::default().with_tokio();
+    let opened = session
+        .open_options()
+        .with_initial_read_size(65535)
+        .open(reader.clone())
+        .await
+        .unwrap();
+    assert_eq!(opened.row_count(), 3);
+    assert!(!backend.calls.lock().unwrap().is_empty());
+    let bytes = reader.take_snapshot(MAX_SNAPSHOT_BYTES).unwrap().unwrap();
+    let snapshot = Snapshot::decode(&bytes, "s3://bucket/key").unwrap();
+    snapshot
+        .validate(&daft_io::ObjectReadMetadata {
+            size: data.len(),
+            version: Some(version),
+        })
+        .unwrap();
+    // Reconstruct the worker's byte-only state with a fresh SDK session.
+    let (mut restored, _) = range_adapter(&options, true);
+    let transport = Arc::new(RangeBytesReader {
+        data: data.clone(),
+        calls: Mutex::new(Vec::new()),
+    });
+    {
+        let reader = Arc::get_mut(&mut restored).unwrap();
+        reader.backend = transport.clone();
+        reader.file_size = data.len() as u64;
+        reader.cached_ranges = snapshot.into_ranges().into();
+    }
+    let fresh_session = VortexSession::default().with_tokio();
+    let reopened = fresh_session
+        .open_options()
+        .with_initial_read_size(65535)
+        .open(restored)
+        .await
+        .unwrap();
+    assert_eq!(reopened.row_count(), 3);
+    assert_eq!(reopened.dtype(), opened.dtype());
+    assert!(
+        transport.calls.lock().unwrap().is_empty(),
+        "SDK open must use the saved byte ranges"
+    );
 }
 
 #[tokio::test]

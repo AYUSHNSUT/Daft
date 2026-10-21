@@ -99,6 +99,8 @@ def test_no_per_query_configuration_selection_and_seeded_complete_rounds():
     assert list(final) == ["parquet", "phase5", "candidate"]
     assert final["phase5"]["options"]["enable_read_coalescing"] is False
     assert final["phase5"]["options"]["discovery_concurrency"] == 1
+    assert final["phase5"]["options"]["enable_metadata_reuse"] is False
+    assert final["candidate"]["options"]["enable_metadata_reuse"] is True
     assert final["candidate"]["options"]["discovery_concurrency"] == 8
     assert len(schedule(evaluation.QUERY_CASES, ["sorted/multi"], list(final), 3, 50, 42)) == 795
 

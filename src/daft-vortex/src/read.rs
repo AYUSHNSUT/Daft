@@ -27,6 +27,7 @@ use crate::{
     diagnostics::{self, Phase},
     io::{DaftReadAt, display_uri, validate_options},
     plan::plan_scan,
+    snapshot::{Budget, MAX_SNAPSHOT_BYTES},
 };
 
 // Daft Field has no nullability member, and its equality ignores metadata. Keep
@@ -353,6 +354,85 @@ pub async fn read_vortex_metadata_bulk(
         .buffered(max_concurrent_files)
         .try_collect()
         .await
+}
+
+/// Fresh metadata plus bounded opening ranges for S3 objects with strong validators.
+/// Snapshots are query-scoped and contain no live reader/session handles.
+pub type VortexMetadataWithSnapshot = (SchemaRef, u64, Option<Vec<u8>>);
+
+pub async fn read_vortex_metadata_bulk_cached(
+    uris: &[String],
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+    max_concurrent_files: usize,
+    max_snapshot_bytes: usize,
+) -> DaftResult<Vec<VortexMetadataWithSnapshot>> {
+    validate_options(&read_options)?;
+    if !(1..=MAX_CONCURRENT_METADATA_FILES).contains(&max_concurrent_files)
+        || max_snapshot_bytes > MAX_SNAPSHOT_BYTES
+    {
+        return Err(DaftError::ValueError(
+            "Vortex cached metadata requires concurrency 1..=64 and a budget of at most 64 MiB"
+                .into(),
+        ));
+    }
+    let budget = Arc::new(Budget::new(max_snapshot_bytes));
+    let reads = futures::stream::iter(uris.iter().cloned()).map(|uri| {
+        let (client, stats, options, budget) = (
+            io_client.clone(),
+            io_stats.clone(),
+            read_options.clone(),
+            budget.clone(),
+        );
+        async move {
+            let uri = input_uri(&uri)?;
+            tokio::runtime::Handle::try_current()
+                .map_err(|error| read_error(&uri, "requires an active Tokio runtime", error))?;
+            let phase = Phase::PlanningMetadata;
+            let trace = diagnostics::begin(phase, "open", Some(&uri));
+            let result: DaftResult<_> = async {
+                let session = VortexSession::default().with_tokio();
+                let reader = Arc::new(
+                    DaftReadAt::new_for_snapshot(
+                        uri.clone(),
+                        client,
+                        stats,
+                        &options,
+                        phase,
+                        budget,
+                    )
+                    .await?,
+                );
+                let file = session
+                    .open_options()
+                    .with_initial_read_size(options.max_in_flight_bytes.min(65535))
+                    .open(reader.clone())
+                    .await
+                    .map_err(|error| read_error(&uri, "open", error))?;
+                let schema = schemas(&uri, &session, file.dtype())?.1;
+                let snapshot = reader.take_snapshot(max_snapshot_bytes)?;
+                Ok((schema, file.row_count(), snapshot))
+            }
+            .await;
+            diagnostics::complete(trace, result.is_err());
+            result
+        }
+    });
+    let mut reads = reads.buffered(max_concurrent_files);
+    let mut remaining = max_snapshot_bytes;
+    let mut results = Vec::with_capacity(uris.len());
+    while let Some((schema, rows, mut snapshot)) = reads.try_next().await? {
+        if let Some(bytes) = &snapshot {
+            if bytes.len() <= remaining {
+                remaining -= bytes.len();
+            } else {
+                snapshot = None;
+            }
+        }
+        results.push((schema, rows, snapshot));
+    }
+    Ok(results)
 }
 
 struct ScanState {

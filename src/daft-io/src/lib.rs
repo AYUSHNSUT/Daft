@@ -49,7 +49,9 @@ pub use common_io_config::{
 };
 use futures::{FutureExt, stream::BoxStream};
 use object_io::StreamingRetryParams;
-pub use object_io::{FileMetadata, FileType, GetResult, ObjectSource};
+pub use object_io::{
+    FileMetadata, FileType, GetResult, ObjectReadMetadata, ObjectSource, ObjectVersion,
+};
 #[cfg(feature = "python")]
 pub use python::register_modules;
 pub use s3_like::{S3LikeSource, S3MultipartWriter, s3_config_from_env};
@@ -70,6 +72,9 @@ pub enum Error {
 
     #[snafu(display("Invalid Argument: {:?}", msg))]
     InvalidArgument { msg: String },
+
+    #[snafu(display("Object changed since metadata was read: {}", path))]
+    ObjectChanged { path: String },
 
     /// A ranged HTTP GET received 200 OK instead of a partial response.
     /// Callers that support whole-file buffering may explicitly retry without Range.
@@ -399,6 +404,33 @@ impl IOClient {
         range: Option<GetRange>,
         io_stats: Option<IOStatsRef>,
     ) -> Result<GetResult> {
+        self.single_url_get_with_version(input, range, io_stats, None)
+            .await
+    }
+
+    pub async fn single_url_get_if_match(
+        &self,
+        input: String,
+        range: Option<GetRange>,
+        io_stats: Option<IOStatsRef>,
+        version: ObjectVersion,
+    ) -> Result<GetResult> {
+        if !version.is_usable() {
+            return Err(Error::InvalidArgument {
+                msg: "Conditional reads require one quoted strong entity tag".into(),
+            });
+        }
+        self.single_url_get_with_version(input, range, io_stats, Some(version))
+            .await
+    }
+
+    async fn single_url_get_with_version(
+        &self,
+        input: String,
+        range: Option<GetRange>,
+        io_stats: Option<IOStatsRef>,
+        version: Option<ObjectVersion>,
+    ) -> Result<GetResult> {
         let resolved = resolve_url_alias(&input, &self.config);
         let (_, path) = parse_url(&resolved)?;
         let source = self.get_source(&resolved).await?;
@@ -418,23 +450,29 @@ impl IOClient {
                 let path = path.clone();
                 let range = range.clone();
                 let io_stats = io_stats.clone();
+                let version = version.clone();
                 async move {
-                    source
-                        .get(&path, range, io_stats)
-                        .await
-                        .map_err(|e| match &e {
-                            Error::MiscTransient { .. }
-                            | Error::SocketError { .. }
-                            | Error::ConnectTimeout { .. } => {
-                                log::warn!("Transient error during GET, will retry: {}", e);
-                                crate::retry::RetryError::Transient(e)
-                            }
-                            _ => crate::retry::RetryError::Permanent(e),
-                        })
+                    let result = match version {
+                        Some(version) => {
+                            source.get_if_match(&path, range, &version, io_stats).await
+                        }
+                        None => source.get(&path, range, io_stats).await,
+                    };
+                    result.map_err(|e| match &e {
+                        Error::MiscTransient { .. }
+                        | Error::SocketError { .. }
+                        | Error::ConnectTimeout { .. } => {
+                            log::warn!("Transient error during GET, will retry: {}", e);
+                            crate::retry::RetryError::Transient(e)
+                        }
+                        _ => crate::retry::RetryError::Permanent(e),
+                    })
                 }
             })
             .await?;
-        Ok(get_result.with_retry(StreamingRetryParams::new(source, input, range, io_stats)))
+        Ok(get_result.with_retry(
+            StreamingRetryParams::new(source, input, range, io_stats).with_version(version),
+        ))
     }
 
     pub async fn single_url_put(
@@ -458,6 +496,19 @@ impl IOClient {
         let (_, path) = parse_url(&resolved)?;
         let source = self.get_source(&resolved).await?;
         source.get_size(path.as_ref(), io_stats).await
+    }
+
+    pub async fn single_url_get_read_metadata(
+        &self,
+        input: String,
+        io_stats: Option<IOStatsRef>,
+    ) -> Result<ObjectReadMetadata> {
+        let resolved = resolve_url_alias(&input, &self.config);
+        let (_, path) = parse_url(&resolved)?;
+        self.get_source(&resolved)
+            .await?
+            .get_read_metadata(path.as_ref(), io_stats)
+            .await
     }
 
     pub async fn single_url_download(

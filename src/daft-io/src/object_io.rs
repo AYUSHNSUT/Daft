@@ -7,6 +7,7 @@ use futures::{
     StreamExt,
     stream::{BoxStream, Stream},
 };
+use serde::{Deserialize, Serialize};
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{
@@ -20,6 +21,34 @@ pub struct StreamingRetryParams {
     input: String,
     range: Option<GetRange>,
     io_stats: Option<IOStatsRef>,
+    version: Option<ObjectVersion>,
+}
+
+/// A strong S3 response validator, including an optional immutable version ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectVersion {
+    pub e_tag: String,
+    pub version_id: Option<String>,
+}
+
+impl ObjectVersion {
+    /// Require one quoted strong entity tag, never a wildcard or tag list.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.e_tag.len() >= 3
+            && self.e_tag.starts_with('"')
+            && self.e_tag.ends_with('"')
+            && self.e_tag.as_bytes()[1..self.e_tag.len() - 1]
+                .iter()
+                .all(|byte| byte.is_ascii_graphic() && *byte != b'"')
+    }
+}
+
+/// Fresh metadata. Sources without conditional reads leave `version` empty.
+#[derive(Clone, Debug)]
+pub struct ObjectReadMetadata {
+    pub size: usize,
+    pub version: Option<ObjectVersion>,
 }
 
 impl StreamingRetryParams {
@@ -34,6 +63,27 @@ impl StreamingRetryParams {
             input,
             range,
             io_stats,
+            version: None,
+        }
+    }
+
+    pub(crate) fn with_version(mut self, version: Option<ObjectVersion>) -> Self {
+        self.version = version;
+        self
+    }
+
+    async fn get(&self, range: Option<GetRange>) -> super::Result<GetResult> {
+        match &self.version {
+            Some(version) => {
+                self.source
+                    .get_if_match(&self.input, range, version, self.io_stats.clone())
+                    .await
+            }
+            None => {
+                self.source
+                    .get(&self.input, range, self.io_stats.clone())
+                    .await
+            }
         }
     }
 }
@@ -106,14 +156,7 @@ impl GetResult {
                             );
                             tokio::time::sleep(Duration::from_millis(jitter)).await;
 
-                            get_result = rp
-                                .source
-                                .get(
-                                    &rp.input,
-                                    rp.range.clone().map(GetRange::from),
-                                    rp.io_stats.clone(),
-                                )
-                                .await?;
+                            get_result = rp.get(rp.range.clone()).await?;
                             if let Stream(stream, size, permit, _) = get_result {
                                 result = collect_bytes(stream, size, permit).await;
                             } else {
@@ -223,7 +266,7 @@ impl ResumableByteStream {
                                 log::warn!("Received Socket Error when streaming bytes! Attempt {} out of {} tries. Trying again in {}ms with range {:?}",
                                 self.attempt, MAX_NUM_TRIES, backoff_ms, range);
 
-                                match self.retry.source.get(&self.retry.input, range, self.retry.io_stats.clone()).await {
+                                match self.retry.get(range).await {
                                     Ok(GetResult::Stream(s2, _size2, permit2, _)) => {
                                         // ObjectSource::get counts its own body
                                         // stream. Wrapping it again double-counts
@@ -337,6 +380,30 @@ pub trait ObjectSource: Sync + Send {
     ) -> super::Result<()>;
 
     async fn get_size(&self, uri: &str, io_stats: Option<IOStatsRef>) -> super::Result<usize>;
+
+    async fn get_read_metadata(
+        &self,
+        uri: &str,
+        io_stats: Option<IOStatsRef>,
+    ) -> super::Result<ObjectReadMetadata> {
+        Ok(ObjectReadMetadata {
+            size: self.get_size(uri, io_stats).await?,
+            version: None,
+        })
+    }
+
+    /// Read exactly the recorded object. Unsupported sources must fail closed.
+    async fn get_if_match(
+        &self,
+        _uri: &str,
+        _range: Option<GetRange>,
+        _version: &ObjectVersion,
+        _io_stats: Option<IOStatsRef>,
+    ) -> super::Result<GetResult> {
+        Err(super::Error::NotImplementedMethod {
+            method: "Conditional reads are not supported by this source".to_string(),
+        })
+    }
 
     async fn glob(
         self: Arc<Self>,

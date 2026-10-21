@@ -168,6 +168,7 @@ jobs:
         enabled = os.environ["VORTEX_EXPECT_ENABLED"] == "enabled"
         assert hasattr(native, "read_vortex_schema") == enabled
         assert hasattr(native, "read_vortex_metadata_bulk") == enabled
+        assert hasattr(native, "_read_vortex_metadata_bulk_cached") == enabled
         assert hasattr(native, "_vortex_diagnostics_start") == enabled
         assert callable(native._io_glob_bulk)
         assert callable(daft.read_vortex)
@@ -191,6 +192,7 @@ jobs:
           tests/io/test_vortex_lifecycle.py \
           tests/io/test_vortex_pushdowns.py \
           tests/io/test_vortex_statistics.py \
+          tests/io/test_vortex_metadata_reuse.py \
           tests/io/test_vortex_diagnostic_capture.py \
           tests/io/test_vortex_discovery.py \
           tests/io/test_vortex_phase3.py 2>&1 | \

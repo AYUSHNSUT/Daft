@@ -136,10 +136,11 @@ def validate_selection_identity(selected, provenance, manifest_sha256, stage):
         raise ValueError("Frozen selection remote fixture manifest differs from final comparison")
 
 
-def policy_options(policy: str, discovery: int) -> dict[str, Any]:
+def policy_options(policy: str, discovery: int, *, reuse: bool = True) -> dict[str, Any]:
     enabled, gap, maximum = POLICIES[policy]
     return {
         "metadata_concurrency": 8,
+        "enable_metadata_reuse": reuse,
         "discovery_concurrency": discovery,
         "enable_read_coalescing": enabled,
         "read_coalesce_gap_bytes": gap,
@@ -169,7 +170,7 @@ def configurations(stage: str, candidate_policy: str) -> dict[str, dict[str, Any
     else:
         result.update(
             {
-                "phase5": {"reader": "vortex", "policy": "off", "options": policy_options("off", 1)},
+                "phase5": {"reader": "vortex", "policy": "off", "options": policy_options("off", 1, reuse=False)},
                 "candidate": {
                     "reader": "vortex",
                     "policy": candidate_policy,
@@ -213,10 +214,17 @@ def require_api():
         "read_coalesce_max_bytes",
         "discovery_concurrency",
         "metadata_concurrency",
+        "enable_metadata_reuse",
     }
-    bindings = ("read_vortex_metadata_bulk", "_io_glob_bulk", "_vortex_diagnostics_start", "_vortex_diagnostics_finish")
+    bindings = (
+        "_read_vortex_metadata_bulk_cached",
+        "read_vortex_metadata_bulk",
+        "_io_glob_bulk",
+        "_vortex_diagnostics_start",
+        "_vortex_diagnostics_finish",
+    )
     if not required <= names or not all(hasattr(daft.daft, name) for name in bindings):
-        raise RuntimeError("Requires a Phase 6 native Vortex build with coalescing, discovery and diagnostics")
+        raise RuntimeError("Requires a Phase 6 native Vortex build with validated metadata reuse and diagnostics")
     try:
         config = daft.daft.VortexSourceConfig(
             enable_read_coalescing=True, read_coalesce_gap_bytes=65536, read_coalesce_max_bytes=4194304

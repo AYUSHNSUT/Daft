@@ -15,7 +15,7 @@ use std::{
 };
 
 use common_error::{DaftError, DaftResult};
-use daft_io::{GetRange, GetResult, IOClient, IOStatsRef};
+use daft_io::{GetRange, GetResult, IOClient, IOStatsRef, ObjectReadMetadata, ObjectVersion};
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use tokio::sync::Semaphore;
 use vortex::{
@@ -28,6 +28,7 @@ use vortex::{
 use crate::{
     VortexReadOptions,
     diagnostics::{self, Phase},
+    snapshot::{self, Budget, Capture, OpeningRange, Snapshot},
 };
 
 /// Never put URL credentials or signed query parameters into reader diagnostics.
@@ -82,6 +83,15 @@ pub(crate) fn validate_options(options: &VortexReadOptions) -> DaftResult<()> {
     {
         return Err(DaftError::ValueError(
             "Vortex read_coalesce_gap_bytes must be in 0..=isize::MAX and read_coalesce_max_bytes in 1..=isize::MAX".into(),
+        ));
+    }
+    if options
+        .metadata_snapshot
+        .as_ref()
+        .is_some_and(|bytes| bytes.len() > snapshot::MAX_SNAPSHOT_BYTES)
+    {
+        return Err(DaftError::ValueError(
+            "Vortex metadata snapshot exceeds its 64 MiB limit".into(),
         ));
     }
     Ok(())
@@ -146,6 +156,7 @@ fn io_error(uri: &str, error: &daft_io::Error) -> VortexError {
     use daft_io::Error;
     let category = match error {
         Error::NotFound { .. } => "object not found",
+        Error::ObjectChanged { .. } => "object changed since query planning",
         Error::Unauthorized { .. } => "unauthorized; check I/O credentials",
         Error::ConnectTimeout { .. } => "connection timed out",
         Error::ReadTimeout { .. } => "read timed out",
@@ -174,6 +185,7 @@ struct ClientReader {
     client: Arc<IOClient>,
     uri: Arc<str>,
     stats: IOStatsRef,
+    version: Option<ObjectVersion>,
 }
 
 impl RangeReader for ClientReader {
@@ -181,10 +193,29 @@ impl RangeReader for ClientReader {
         let client = self.client.clone();
         let uri = self.uri.clone();
         let stats = self.stats.clone();
+        let version = self.version.clone();
         async move {
-            client
-                .single_url_get(uri.to_string(), Some(GetRange::Bounded(range)), Some(stats))
-                .await
+            match version {
+                Some(version) => {
+                    client
+                        .single_url_get_if_match(
+                            uri.to_string(),
+                            Some(GetRange::Bounded(range)),
+                            Some(stats),
+                            version,
+                        )
+                        .await
+                }
+                None => {
+                    client
+                        .single_url_get(
+                            uri.to_string(),
+                            Some(GetRange::Bounded(range)),
+                            Some(stats),
+                        )
+                        .await
+                }
+            }
         }
         .boxed()
     }
@@ -202,6 +233,9 @@ pub(crate) struct DaftReadAt {
     max_bytes: usize,
     coalescing: Option<CoalesceConfig>,
     diagnostic_phase: AtomicU8,
+    version: Option<ObjectVersion>,
+    capture: Option<Arc<Capture>>,
+    cached_ranges: Arc<[OpeningRange]>,
 }
 
 impl DaftReadAt {
@@ -222,20 +256,81 @@ impl DaftReadAt {
         options: &VortexReadOptions,
         phase: Phase,
     ) -> DaftResult<Self> {
+        let snapshot = if matches!(phase, Phase::ExecutionOpen) {
+            options
+                .metadata_snapshot
+                .as_ref()
+                .map(|bytes| Snapshot::decode(bytes, &uri))
+                .transpose()?
+        } else {
+            None
+        };
+        Self::new_internal(uri, client, stats, options, phase, None, snapshot).await
+    }
+
+    pub(crate) async fn new_for_snapshot(
+        uri: String,
+        client: Arc<IOClient>,
+        stats: IOStatsRef,
+        options: &VortexReadOptions,
+        phase: Phase,
+        budget: Arc<Budget>,
+    ) -> DaftResult<Self> {
+        let budget = snapshot::eligible(&uri).then_some(budget);
+        Self::new_internal(uri, client, stats, options, phase, budget, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn new_internal(
+        uri: String,
+        client: Arc<IOClient>,
+        stats: IOStatsRef,
+        options: &VortexReadOptions,
+        phase: Phase,
+        capture_budget: Option<Arc<Budget>>,
+        snapshot: Option<Snapshot>,
+    ) -> DaftResult<Self> {
         validate_options(options)?;
         let redacted = display_uri(&uri);
         let remote = !Path::new(&uri).is_absolute()
             && url::Url::parse(&uri)
                 .is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "s3"));
-        // Each open gets fresh metadata. There is no cross-file/footer cache.
+        // Every open checks fresh metadata; saved opening bytes belong only to this task.
         let trace = diagnostics::begin(phase, "head", Some(&uri));
-        let size = client
-            .single_url_get_size(uri.clone(), Some(stats.clone()))
-            .await;
-        diagnostics::complete(trace, size.is_err());
-        let file_size = size
-            .map_err(|error| DaftError::ComputeError(io_error(&redacted, &error).to_string()))?
-            as u64;
+        let metadata = if capture_budget.is_some() || snapshot.is_some() {
+            client
+                .single_url_get_read_metadata(uri.clone(), Some(stats.clone()))
+                .await
+        } else {
+            client
+                .single_url_get_size(uri.clone(), Some(stats.clone()))
+                .await
+                .map(|size| ObjectReadMetadata {
+                    size,
+                    version: None,
+                })
+        };
+        diagnostics::complete(trace, metadata.is_err());
+        let metadata = metadata
+            .map_err(|error| DaftError::ComputeError(io_error(&redacted, &error).to_string()))?;
+        if let Some(snapshot) = &snapshot {
+            snapshot.validate(&metadata)?;
+        }
+        let file_size = metadata.size as u64;
+        let capture = capture_budget.and_then(|budget| {
+            metadata.version.as_ref().and_then(|version| {
+                let overhead = uri
+                    .len()
+                    .saturating_add(version.e_tag.len())
+                    .saturating_add(version.version_id.as_ref().map_or(0, String::len))
+                    .saturating_add(512);
+                Capture::new(budget, overhead).map(Arc::new)
+            })
+        });
+        let cached_ranges = snapshot
+            .map(Snapshot::into_ranges)
+            .unwrap_or_default()
+            .into();
         // The transport and diagnostics share this URI allocation; disabled
         // diagnostics do not allocate an additional URL copy.
         let diagnostic_uri: Arc<str> = Arc::from(uri);
@@ -244,6 +339,7 @@ impl DaftReadAt {
                 client,
                 uri: diagnostic_uri.clone(),
                 stats: stats.clone(),
+                version: metadata.version.clone(),
             }),
             uri: redacted.into(),
             diagnostic_uri,
@@ -255,7 +351,20 @@ impl DaftReadAt {
             max_bytes: options.max_in_flight_bytes,
             coalescing: remote_coalescing(options, remote),
             diagnostic_phase: AtomicU8::new(phase as u8),
+            version: metadata.version,
+            capture,
+            cached_ranges,
         })
+    }
+
+    pub(crate) fn take_snapshot(&self, limit: usize) -> DaftResult<Option<Vec<u8>>> {
+        let Some(version) = self.version.clone() else {
+            return Ok(None);
+        };
+        let Some(ranges) = self.capture.as_ref().and_then(|capture| capture.take()) else {
+            return Ok(None);
+        };
+        Snapshot::encode(&self.diagnostic_uri, self.file_size, version, ranges, limit)
     }
 
     pub(crate) fn mark_data_phase(&self) {
@@ -297,9 +406,16 @@ impl VortexReadAt for DaftReadAt {
         let bytes = self.bytes.clone();
         let file_size = self.file_size;
         let max_bytes = self.max_bytes;
+        let cached_ranges = self.cached_ranges.clone();
+        let capture = self.capture.clone();
         let phase = Phase::from_u8(self.diagnostic_phase.load(Ordering::Relaxed));
         async move {
-            let mut trace = diagnostics::begin(phase, "range", Some(&diagnostic_uri));
+            let cached = cached_ranges.iter().find_map(|range| {
+                let start = usize::try_from(offset.checked_sub(range.offset)?).ok()?;
+                range.bytes.get(start..start.checked_add(length)?)
+            });
+            let operation = if cached.is_some() { "cached_range" } else { "range" };
+            let mut trace = diagnostics::begin(phase, operation, Some(&diagnostic_uri));
             if let Some(trace) = &mut trace { trace.range(offset, length); }
             let result = async {
             let end = offset
@@ -319,6 +435,10 @@ impl VortexReadAt for DaftReadAt {
                 if let Some(trace) = &mut trace { trace.returned(0); }
                 return Ok(BufferHandle::new_host(ByteBuffer::empty_aligned(alignment)));
             }
+            if let Some(cached) = cached {
+                if let Some(trace) = &mut trace { trace.returned(length); }
+                return Ok(BufferHandle::new_host(ByteBuffer::from(cached.to_vec()).aligned(alignment)));
+            }
             let _request = requests.acquire_owned().await
                 .map_err(|_| vortex_err!("Vortex request budget closed"))?;
             if let Some(trace) = &mut trace { trace.request_wait(); }
@@ -331,6 +451,7 @@ impl VortexReadAt for DaftReadAt {
             let collected = collect_exact(result, length, alignment, &stats, &uri).await;
             if let Some(trace) = &mut trace { trace.body(); }
             let buffer = collected?;
+            if let Some(capture) = &capture { capture.record(offset, buffer.as_slice()); }
             if let Some(trace) = &mut trace { trace.returned(length); }
             Ok(BufferHandle::new_host(buffer))
             }.await;

@@ -361,6 +361,7 @@ class VortexSourceConfig:
     enable_read_coalescing: bool
     read_coalesce_gap_bytes: int
     read_coalesce_max_bytes: int
+    metadata_snapshot: bytes | None
 
     def __init__(
         self,
@@ -373,6 +374,7 @@ class VortexSourceConfig:
         enable_read_coalescing: bool = True,
         read_coalesce_gap_bytes: int = 65536,
         read_coalesce_max_bytes: int = 4194304,
+        metadata_snapshot: bytes | None = None,
     ) -> None: ...
 
 class DatabaseSourceConfig:
@@ -1397,6 +1399,20 @@ def read_vortex_metadata_bulk(
     read_coalesce_gap_bytes: int = 65536,
     read_coalesce_max_bytes: int = 4194304,
 ) -> tuple[list[tuple[PySchema, int]], dict[str, int | float]]:
+    """Read ordered fresh footers with bounded concurrency and metadata-only I/O diagnostics."""
+
+def _read_vortex_metadata_bulk_cached(
+    uris: list[str],
+    io_config: IOConfig | None = None,
+    *,
+    max_concurrent_files: int = 8,
+    max_snapshot_bytes: int = 67108864,
+    max_concurrent_requests: int = 8,
+    max_in_flight_bytes: int = 67108864,
+    enable_read_coalescing: bool = True,
+    read_coalesce_gap_bytes: int = 65536,
+    read_coalesce_max_bytes: int = 4194304,
+) -> tuple[list[tuple[PySchema, int, bytes | None]], dict[str, int | float]]:
     """Read ordered fresh footers with bounded concurrency and metadata-only I/O diagnostics."""
 
 def _vortex_scan_diagnostics(

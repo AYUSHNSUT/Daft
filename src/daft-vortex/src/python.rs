@@ -6,7 +6,7 @@ use daft_dsl::python::PyExpr;
 use pyo3::{
     exceptions::{PyTypeError, PyValueError},
     prelude::*,
-    types::{PyBool, PyBoolMethods, PyDict, PyInt, PyList},
+    types::{PyBool, PyBoolMethods, PyBytes, PyDict, PyInt, PyList},
     wrap_pyfunction,
 };
 use vortex::{VortexSessionDefault, arrow::ArrowSessionExt, session::VortexSession};
@@ -19,6 +19,25 @@ use crate::{
 };
 
 type PyMetadataBatch<'py> = (Vec<(PySchema, u64)>, Bound<'py, PyDict>);
+type PyCachedMetadataBatch<'py> = (
+    Vec<(PySchema, u64, Option<Py<PyBytes>>)>,
+    Bound<'py, PyDict>,
+);
+
+fn strict_snapshot_budget(value: &Bound<'_, PyAny>) -> PyResult<usize> {
+    if value.is_instance_of::<PyBool>() {
+        return Err(PyTypeError::new_err(
+            "Vortex snapshot budget must be an integer, not bool",
+        ));
+    }
+    let budget = value.cast::<PyInt>()?.extract::<usize>()?;
+    if budget > crate::snapshot::MAX_SNAPSHOT_BYTES {
+        return Err(PyValueError::new_err(
+            "Vortex snapshot budget must not exceed 64 MiB",
+        ));
+    }
+    Ok(budget)
+}
 
 fn strict_vortex_bool(value: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(value.cast::<PyBool>()?.is_true())
@@ -214,6 +233,83 @@ fn read_vortex_metadata_bulk(
     Ok((metadata, metrics))
 }
 
+/// Read fresh metadata with bounded file concurrency and report this pass's I/O.
+/// Counters come from IOStatsContext, not wire requests or unique file bytes.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction(signature = (
+    uris,
+    io_config=None,
+    *,
+    max_concurrent_files=8,
+    max_snapshot_bytes=67_108_864,
+    max_concurrent_requests=8,
+    max_in_flight_bytes=67108864,
+    enable_read_coalescing=true,
+    read_coalesce_gap_bytes=65536,
+    read_coalesce_max_bytes=4194304,
+))]
+fn _read_vortex_metadata_bulk_cached(
+    py: Python<'_>,
+    uris: Vec<String>,
+    io_config: Option<IOConfig>,
+    #[pyo3(from_py_with = strict_metadata_concurrency)] max_concurrent_files: usize,
+    #[pyo3(from_py_with = strict_snapshot_budget)] max_snapshot_bytes: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_concurrent_requests: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_in_flight_bytes: usize,
+    #[pyo3(from_py_with = strict_vortex_bool)] enable_read_coalescing: bool,
+    #[pyo3(from_py_with = strict_coalesce_gap)] read_coalesce_gap_bytes: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] read_coalesce_max_bytes: usize,
+) -> PyResult<PyCachedMetadataBatch<'_>> {
+    let num_files = uris.len();
+    let (metadata, stats, elapsed_seconds) = py.detach(move || -> PyResult<_> {
+        let started = Instant::now();
+        let options = VortexReadOptions {
+            max_concurrent_requests,
+            max_in_flight_bytes,
+            enable_read_coalescing,
+            read_coalesce_gap_bytes,
+            read_coalesce_max_bytes,
+            ..Default::default()
+        };
+        crate::io::validate_options(&options)?;
+        let client = daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())?;
+        let stats = daft_io::IOStatsContext::new("Vortex bulk metadata inference");
+        let bulk_stats = stats.clone();
+        let runtime = common_runtime::get_io_runtime(true);
+        let metadata = runtime.block_within_async_context(async move {
+            crate::read_vortex_metadata_bulk_cached(
+                &uris,
+                client,
+                bulk_stats,
+                options,
+                max_concurrent_files,
+                max_snapshot_bytes,
+            )
+            .await
+        })??;
+        Ok((metadata, stats, started.elapsed().as_secs_f64()))
+    })?;
+    let metrics = PyDict::new(py);
+    metrics.set_item("num_files", num_files)?;
+    metrics.set_item("max_concurrent_files", max_concurrent_files)?;
+    metrics.set_item("elapsed_seconds", elapsed_seconds)?;
+    metrics.set_item("head_requests", stats.load_head_requests())?;
+    metrics.set_item("get_requests", stats.load_get_requests())?;
+    metrics.set_item("list_requests", stats.load_list_requests())?;
+    metrics.set_item("bytes_read", stats.load_bytes_read())?;
+    let metadata = metadata
+        .into_iter()
+        .map(|(schema, num_rows, snapshot)| {
+            (
+                schema.into(),
+                num_rows,
+                snapshot.map(|bytes| PyBytes::new(py, &bytes).unbind()),
+            )
+        })
+        .collect();
+    Ok((metadata, metrics))
+}
+
 /// Inspect the same scan plan used for execution, without opening a file.
 /// The caller supplies the complete native schema, including source nullability.
 #[pyfunction(signature = (
@@ -340,6 +436,7 @@ pub fn register_python(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(read_vortex_schema, parent)?)?;
     parent.add_function(wrap_pyfunction!(read_vortex_metadata, parent)?)?;
     parent.add_function(wrap_pyfunction!(read_vortex_metadata_bulk, parent)?)?;
+    parent.add_function(wrap_pyfunction!(_read_vortex_metadata_bulk_cached, parent)?)?;
     parent.add_function(wrap_pyfunction!(_vortex_scan_diagnostics, parent)?)?;
     parent.add_function(wrap_pyfunction!(_vortex_diagnostics_start, parent)?)?;
     parent.add_function(wrap_pyfunction!(_vortex_diagnostics_finish, parent)?)?;

@@ -1,6 +1,7 @@
 [dependencies]
 arrow-array = {workspace = true}
 arrow-schema = {workspace = true}
+bincode = {workspace = true}
 common-error = {path = "../common/error", default-features = false}
 common-io-config = {path = "../common/io-config", default-features = false, optional = true}
 common-runtime = {path = "../common/runtime", default-features = false, optional = true}
@@ -10,6 +11,7 @@ daft-io = {path = "../daft-io", default-features = false}
 daft-recordbatch = {path = "../daft-recordbatch", default-features = false}
 futures = {workspace = true}
 pyo3 = {workspace = true, optional = true}
+serde = {workspace = true}
 tokio = {workspace = true}
 url = {workspace = true}
 vortex = {workspace = true}

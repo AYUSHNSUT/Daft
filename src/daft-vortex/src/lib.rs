@@ -13,9 +13,11 @@ mod diagnostics;
 mod io;
 mod plan;
 mod read;
+mod snapshot;
 
 pub use read::{
-    read_vortex_metadata, read_vortex_metadata_bulk, read_vortex_schema, stream_vortex,
+    read_vortex_metadata, read_vortex_metadata_bulk, read_vortex_metadata_bulk_cached,
+    read_vortex_schema, stream_vortex,
 };
 
 #[cfg(feature = "python")]
@@ -23,7 +25,7 @@ mod python;
 #[cfg(feature = "python")]
 pub use python::register_python;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct VortexReadOptions {
     /// Maximum rows per decoded batch; this is not a byte-memory bound.
     pub batch_size: usize,
@@ -44,6 +46,34 @@ pub struct VortexReadOptions {
     pub read_coalesce_gap_bytes: usize,
     /// Maximum actual merged request size, also capped by the request byte budget.
     pub read_coalesce_max_bytes: usize,
+    /// Private query-scoped opening bytes, validated against fresh S3 identity.
+    pub metadata_snapshot: Option<std::sync::Arc<[u8]>>,
+}
+
+impl std::fmt::Debug for VortexReadOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VortexReadOptions")
+            .field("batch_size", &self.batch_size)
+            .field(
+                "enable_projection_pushdown",
+                &self.enable_projection_pushdown,
+            )
+            .field("enable_filter_pushdown", &self.enable_filter_pushdown)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("max_in_flight_bytes", &self.max_in_flight_bytes)
+            .field("enable_read_coalescing", &self.enable_read_coalescing)
+            .field("read_coalesce_gap_bytes", &self.read_coalesce_gap_bytes)
+            .field("read_coalesce_max_bytes", &self.read_coalesce_max_bytes)
+            .field(
+                "metadata_snapshot_bytes",
+                &self
+                    .metadata_snapshot
+                    .as_ref()
+                    .map_or(0, |bytes| bytes.len()),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for VortexReadOptions {
@@ -57,6 +87,7 @@ impl Default for VortexReadOptions {
             enable_read_coalescing: true,
             read_coalesce_gap_bytes: 64 * 1024,
             read_coalesce_max_bytes: 4 * 1024 * 1024,
+            metadata_snapshot: None,
         }
     }
 }

@@ -1060,6 +1060,7 @@ mod test {
                     enable_read_coalescing: enable_projection_pushdown,
                     read_coalesce_gap_bytes: 17,
                     read_coalesce_max_bytes: 524_288,
+                    metadata_snapshot: Some(b"sentinel-snapshot-secret".to_vec()),
                 };
                 let encoded =
                     bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
@@ -1176,6 +1177,7 @@ mod test {
                     enable_read_coalescing: false,
                     read_coalesce_gap_bytes: 0,
                     read_coalesce_max_bytes: 131_072,
+                    metadata_snapshot: Some(b"sentinel-task-snapshot".to_vec()),
                 },
             ))),
             schema,
@@ -1249,6 +1251,7 @@ mod test {
                 enable_read_coalescing: false,
                 read_coalesce_gap_bytes: 0,
                 read_coalesce_max_bytes: 131_072,
+                metadata_snapshot: Some(_),
             }))
         ));
         assert_eq!(decoded.storage_config, task.storage_config);

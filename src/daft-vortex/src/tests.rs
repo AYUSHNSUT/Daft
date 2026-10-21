@@ -195,7 +195,7 @@ fn primitive_batch(value_nullable: bool) -> ArrowRecordBatch {
     .unwrap()
 }
 
-async fn write_batch(batch: ArrowRecordBatch) -> NamedTempFile {
+pub(crate) async fn write_batch(batch: ArrowRecordBatch) -> NamedTempFile {
     let file = NamedTempFile::new().unwrap();
     let session = VortexSession::default().with_tokio();
     let array = session

@@ -77,6 +77,16 @@ refreshed for each materialization rather than cached permanently in reused or
 serialized sources. File discovery and the first-file schema remain fixed; this
 does not provide snapshot isolation.
 
+The metadata follow-up branch adds `enable_metadata_reuse=True` as an opt-in S3
+experiment. Planning records bounded encoded opening ranges in each file task,
+with a 64 MiB limit across the materialization. Execution checks a fresh size,
+strong ETag and optional version ID before using those bytes. Uncached range
+requests retain the same identity conditions, including retries. Changed objects
+fail explicitly. Sources without usable validators, and HTTP/local sources,
+continue to use fresh reads. Each materialization refreshes its metadata; there
+is no permanent footer cache. This remains subject to the same immutable-input
+requirement and does not provide cross-file snapshot isolation.
+
 Footer refresh adds metadata I/O before data execution, using the same `IOConfig`
 and request budgets as other Vortex reads. This cost is included in end-to-end
 planning time, but not in execution-source byte counters. Counts describe file

@@ -163,7 +163,8 @@ try:
     def worker_pid(value: int) -> int:
         return os.getpid()
 
-    frame = daft.read_vortex(settings["path"], io_config=config, batch_size=3, max_concurrent_requests=2)
+    frame = daft.read_vortex(settings["path"], io_config=config, batch_size=3, max_concurrent_requests=2,
+                             **settings.get("reader_options", {}))
     result = frame.where(daft.col("value") >= 4).select("id", worker_pid(daft.col("id")).alias("worker_pid")).sort("id").to_pydict()
     assert result["id"] == settings["expected"], result
     assert result["worker_pid"] and all(pid != os.getpid() for pid in result["worker_pid"]), result
@@ -173,12 +174,13 @@ finally:
 """
 
 
-def _ray_query(path, table, backend=None, config=None):
+def _ray_query(path, table, backend=None, config=None, *, reader_options=None):
     pytest.importorskip("ray", reason="Ray executes the worker acceptance query")
     settings = {
         "path": str(path),
         "backend": backend,
         "config": config,
+        "reader_options": reader_options or {},
         "expected": sorted(row["id"] for row in table.to_pylist() if row["value"] >= 4),
     }
     environment = {**os.environ, "DAFT_RUNNER": "ray", "DAFT_PROGRESS_BAR": "0"}
@@ -208,7 +210,8 @@ def test_vortex_ray_http_reopens_with_explicit_io_config(vortex_http, vortex_htt
     _ray_query(url, table, "http", {"bearer_token": vortex_http_token, "num_tries": 1})
 
 
-def test_vortex_ray_minio_reopens_with_explicit_io_config(vortex_minio) -> None:
+@pytest.mark.parametrize("reuse", [False, True])
+def test_vortex_ray_minio_reopens_with_explicit_io_config(vortex_minio, reuse: bool) -> None:
     base, config, table = vortex_minio
     s3 = config.s3
     _ray_query(
@@ -224,4 +227,5 @@ def test_vortex_ray_minio_reopens_with_explicit_io_config(vortex_minio) -> None:
             "force_virtual_addressing": False,
             "num_tries": 1,
         },
+        reader_options={"enable_metadata_reuse": reuse},
     )

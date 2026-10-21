@@ -13,7 +13,8 @@ mod tests {
     use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 
     use crate::{
-        Error, FileMetadata, FileType, GetRange, GetResult, IOStatsRef, ObjectSource, Result,
+        Error, FileMetadata, FileType, GetRange, GetResult, IOStatsRef, ObjectSource,
+        ObjectVersion, Result,
         object_io::{LSResult, StreamingRetryParams},
     };
 
@@ -43,6 +44,8 @@ mod tests {
         // The continuation token supplied to each ls() request.
         ls_requests: Arc<Mutex<Vec<Option<String>>>>,
         connection_pool: Option<Arc<tokio::sync::Semaphore>>,
+        versions: Mutex<Vec<ObjectVersion>>,
+        fail_conditional_after: Option<usize>,
     }
 
     impl MockSource {
@@ -57,6 +60,8 @@ mod tests {
                 ls_pages: Mutex::new(VecDeque::new()),
                 ls_requests: Arc::new(Mutex::new(Vec::new())),
                 connection_pool: None,
+                versions: Mutex::new(Vec::new()),
+                fail_conditional_after: None,
             }
         }
 
@@ -167,6 +172,26 @@ mod tests {
                 permit,
                 None,
             ))
+        }
+
+        async fn get_if_match(
+            &self,
+            uri: &str,
+            range: Option<GetRange>,
+            version: &ObjectVersion,
+            io_stats: Option<IOStatsRef>,
+        ) -> Result<GetResult> {
+            {
+                let mut versions = self.versions.lock().unwrap();
+                versions.push(version.clone());
+                if self
+                    .fail_conditional_after
+                    .is_some_and(|limit| versions.len() > limit)
+                {
+                    return Err(Error::ObjectChanged { path: uri.into() });
+                }
+            }
+            self.get(uri, range, io_stats).await
         }
 
         async fn put(&self, _uri: &str, _data: Bytes, _io_stats: Option<IOStatsRef>) -> Result<()> {
@@ -304,6 +329,65 @@ mod tests {
             *source.ls_requests.lock().unwrap(),
             vec![None, Some("page-2".to_string())]
         );
+    }
+
+    #[test]
+    fn test_conditional_read_rejects_weak_wildcard_and_multiple_validators() {
+        for tag in ["*", "W/\"tag\"", "\"\"", "tag", "\"a\",\"b\"", "\"a\r\nb\""] {
+            assert!(
+                !ObjectVersion {
+                    e_tag: tag.into(),
+                    version_id: None
+                }
+                .is_usable()
+            );
+        }
+        assert!(
+            ObjectVersion {
+                e_tag: "\"opaque-2\"".into(),
+                version_id: Some("version-1".into())
+            }
+            .is_usable()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conditional_resumed_body_keeps_etag_and_version_and_never_falls_back() {
+        for changed in [false, true] {
+            let mut source = MockSource::new(b"abcd".to_vec(), 2, Some(1));
+            source.fail_conditional_after = changed.then_some(1);
+            let source = Arc::new(source);
+            let version = ObjectVersion {
+                e_tag: "\"stable\"".into(),
+                version_id: Some("v1".into()),
+            };
+            let range = Some(GetRange::Bounded(0..4));
+            let initial = source
+                .get_if_match("mock://path", range.clone(), &version, None)
+                .await
+                .unwrap();
+            let result = initial
+                .with_retry(
+                    StreamingRetryParams::new(source.clone(), "mock://path".into(), range, None)
+                        .with_version(Some(version.clone())),
+                )
+                .bytes()
+                .await;
+            if changed {
+                assert!(matches!(result, Err(Error::ObjectChanged { .. })));
+                assert_eq!(source.requests.lock().unwrap().len(), 1);
+            } else {
+                assert_eq!(result.unwrap().as_ref(), b"abcd");
+                assert_eq!(
+                    source.requests.lock().unwrap().as_slice(),
+                    &[Some(GetRange::Bounded(0..4)), Some(GetRange::Bounded(2..4))]
+                );
+            }
+            assert_eq!(
+                source.versions.lock().unwrap().as_slice(),
+                &[version.clone(), version]
+            );
+        }
     }
 
     #[tokio::test]

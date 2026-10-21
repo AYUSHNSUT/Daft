@@ -234,6 +234,13 @@ runs remain available.
 normal Parquet reader with explicit Vortex discovery/coalescing controls in the
 same enabled release build. All configurations retain metadata concurrency 8,
 both pushdowns, batches of 131,072 rows, and the existing request/byte budgets.
+On `poc/vortex-phase6-metadata`, tuning and candidate configurations also enable
+validated S3 opening-range reuse. The Phase 5-equivalent baseline disables it.
+The public reader switch remains opt-in. Local inputs take the ordinary fresh
+path, so the local guard also checks the fallback. See the
+[follow-up design](../../docs/contributing/vortex-phase6-metadata-design.md).
+Build changes require fresh tuning and final reports; the first Phase 6 run is
+preserved as a failed performance acceptance and is not pooled with this run.
 Use the attested release build and `DAFT_VORTEX_BENCH_BUILD_COMMAND` described
 above; production comparisons require a clean tracked checkout.
 
@@ -283,7 +290,8 @@ tuned policy instead of the explicit preset. The final remote performance gate
 below retains its stricter candidate-below-Parquet criterion.
 
 Final acceptance freezes Parquet, the Phase 5 equivalent (coalescing off,
-discovery 1), and one candidate policy at discovery 8. It requires exactly
+discovery 1, metadata reuse off), and one candidate policy at discovery 8 with
+metadata reuse on. It requires exactly
 50 measured rounds and 3 warmups: 795 performance trials plus 15 separate
 diagnostic queries for one dataset. Every candidate median must be strictly
 below the contemporary Parquet median. A tie, regression, trial error, changed

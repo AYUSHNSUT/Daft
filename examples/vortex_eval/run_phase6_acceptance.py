@@ -315,6 +315,7 @@ def main(argv=None):
                     "tests/io/test_vortex_native_tasks.py",
                     "tests/io/test_vortex_pushdowns.py",
                     "tests/io/test_vortex_statistics.py",
+                    "tests/io/test_vortex_metadata_reuse.py",
                     "tests/io/test_vortex_phase3.py",
                     "tests/io/test_vortex_lifecycle.py",
                     "benchmarking/vortex/test_remote_eval.py",

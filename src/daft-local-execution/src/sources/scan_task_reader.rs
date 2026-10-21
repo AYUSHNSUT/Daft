@@ -378,6 +378,10 @@ async fn read_vortex(
         enable_read_coalescing: cfg.enable_read_coalescing,
         read_coalesce_gap_bytes: cfg.read_coalesce_gap_bytes,
         read_coalesce_max_bytes: cfg.read_coalesce_max_bytes,
+        metadata_snapshot: cfg
+            .metadata_snapshot
+            .as_ref()
+            .map(|bytes| Arc::from(bytes.as_slice())),
     };
     let convert_options = daft_vortex::VortexConvertOptions {
         schema: scan_task.schema.clone(),
