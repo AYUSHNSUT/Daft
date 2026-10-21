@@ -13,11 +13,12 @@ mod diagnostics;
 mod io;
 mod plan;
 mod read;
+mod runtime;
 mod snapshot;
 
 pub use read::{
-    read_vortex_metadata, read_vortex_metadata_bulk, read_vortex_metadata_bulk_cached,
-    read_vortex_schema, stream_vortex,
+    VortexExecutionContext, read_vortex_metadata, read_vortex_metadata_bulk,
+    read_vortex_metadata_bulk_cached, read_vortex_schema, stream_vortex,
 };
 
 #[cfg(feature = "python")]
@@ -29,6 +30,14 @@ pub use python::register_python;
 pub struct VortexReadOptions {
     /// Maximum rows per decoded batch; this is not a byte-memory bound.
     pub batch_size: usize,
+    /// Export byte arrays with Daft-compatible large offsets.
+    pub enable_large_offsets: bool,
+    /// Reject proven no-match files after complete schema validation.
+    pub enable_file_pruning: bool,
+    /// Align splits to layouts while retaining the batch row bound.
+    pub enable_layout_splitting: bool,
+    /// Immutable session initialization shared only within a fresh scan processor.
+    pub execution_context: Option<std::sync::Arc<VortexExecutionContext>>,
     /// Read only output columns and complete residual dependencies.
     pub enable_projection_pushdown: bool,
     /// Evaluate safe conjuncts in Vortex, then reevaluate the complete Daft filter.
@@ -80,6 +89,10 @@ impl Default for VortexReadOptions {
     fn default() -> Self {
         Self {
             batch_size: 128 * 1024,
+            enable_large_offsets: false,
+            enable_file_pruning: false,
+            enable_layout_splitting: false,
+            execution_context: None,
             enable_projection_pushdown: true,
             enable_filter_pushdown: true,
             max_concurrent_requests: 8,

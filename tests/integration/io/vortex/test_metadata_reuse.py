@@ -34,6 +34,74 @@ def _client(config):
     )
 
 
+def _assert_successful_read_capture(capture):
+    native = capture["native"]
+    events = native["events"]
+    errors = [event for event in events if event["error"]]
+    assert not errors, errors
+    # The SDK aborts its background segment driver when its source is dropped,
+    # including after a complete read. Its queue/driver lifetime is not an I/O
+    # request. Every actual request and all other operations must still finish.
+    unexpected_cancellations = [
+        event
+        for event in events
+        if event["cancelled"]
+        and not (
+            event["phase"] == "execution"
+            and event["operation"] in {"sdk_task_queue", "sdk_task"}
+            and event["file_id"] is None
+            and event["requested_bytes"] is None
+            and event["returned_bytes"] is None
+        )
+    ]
+    assert not unexpected_cancellations, unexpected_cancellations
+    assert native["unfinished_events"] == native["dropped_events"] == 0
+    assert capture["python"]["dropped_events"] == 0
+    assert not any(event["error"] for event in capture["python"]["events"])
+
+
+def test_complete_local_read_capture(vortex_service_file):
+    path, table = vortex_service_file
+    diagnostics.start()
+    try:
+        result = daft.read_vortex(str(path), batch_size=3).where(daft.col("value") >= 4).select("id").to_pydict()
+    finally:
+        capture = diagnostics.finish()
+    assert result == {"id": [row["id"] for row in table.to_pylist() if row["value"] >= 4]}
+    _assert_successful_read_capture(capture)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"phase": "data", "operation": "range", "cancelled": True},
+        {"phase": "data", "operation": "adapter_poll_queue", "cancelled": True},
+        {"phase": "execution_open", "operation": "head", "error": True},
+        {"operation": "sdk_io_task", "cancelled": True},
+        {"operation": "sdk_task", "error": True},
+        {"operation": "sdk_task", "cancelled": True, "file_id": 1},
+        {"operation": "sdk_task_queue", "cancelled": True, "requested_bytes": 1},
+    ],
+)
+def test_successful_read_capture_rejects_request_failures(failure):
+    event = {
+        "phase": "execution",
+        "operation": "sdk_task",
+        "file_id": None,
+        "requested_bytes": None,
+        "returned_bytes": None,
+        "error": False,
+        "cancelled": False,
+        **failure,
+    }
+    capture = {
+        "native": {"events": [event], "unfinished_events": 0, "dropped_events": 0},
+        "python": {"events": [], "dropped_events": 0},
+    }
+    with pytest.raises(AssertionError):
+        _assert_successful_read_capture(capture)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("row_count_planning", [False, True])
 def test_minio_reuses_only_validated_opening_ranges(vortex_minio, enabled, row_count_planning):
@@ -63,8 +131,7 @@ def test_minio_reuses_only_validated_opening_ranges(vortex_minio, enabled, row_c
     if enabled:
         assert not any(event["operation"] == "range" for event in opening), "do not refetch opening bytes"
         assert all(event["requested_bytes"] == event["returned_bytes"] > 0 for event in hits)
-    assert not any(event["error"] or event["cancelled"] for event in events)
-    assert capture["native"]["unfinished_events"] == capture["native"]["dropped_events"] == 0
+    _assert_successful_read_capture(capture)
 
 
 @pytest.mark.parametrize("row_count_planning", [False, True])

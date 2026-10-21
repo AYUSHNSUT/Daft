@@ -14,78 +14,192 @@ half the time. Ratios are calculated before rounding the displayed times.
 
 ## Current measured results
 
-- **Local files:** Vortex wins 18 of 20 workload/layout medians. Narrow scans are
-  **1.92–2.71×**, joins **1.30–1.71×**, and full reductions **1.34–1.43×** as fast.
-  Shuffled 1% filters reach **2.59–8.06×**. Sorted eight-file filters still lose.
-- **S3-compatible storage on local MinIO:** Vortex wins two of five medians:
-  **1.34×** for narrow scans and **1.05×** for joins. Selective filters and the
-  full reduction remain slower than Parquet.
-- **File size:** Vortex files are **1.27–3.43% larger** on these fixtures.
+- **Local files, with execution-session reuse:** Vortex wins **18 of 20
+  medians** in the independent confirmation. Narrow scans are **1.99–2.99×**,
+  joins **1.28–1.65×**, and full reductions **1.30–1.37×** as fast as Parquet.
+  Shuffled 1% filters reach **2.83–8.29×**. Sorted eight-file filters still lose.
+- **S3-compatible storage on local MinIO, with the same option:** Vortex wins
+  **two of five medians**: **1.397×** for narrow scans and **1.145×** for joins.
+  Range, equality and full reductions take **4.63%, 2.64% and 2.27% more time**
+  than Parquet. The target of winning every remote workload **failed**.
+- **File size:** Vortex files remain **1.27–3.43% larger** on these fixtures.
 - **Earlier group-by coverage:** Vortex was **1.48–2.08×** as fast locally.
   Group-by has not been rerun with the current configuration.
 
-These headline results use one explicit experimental Vortex configuration:
-projection/filter pushdown, validated metadata reuse and lightweight row-count
-planning enabled; read coalescing disabled. Metadata reuse and lightweight
-planning are opt-in, not public API defaults. Parquet uses its native defaults.
-Neither reader wins every workload. The all-five-remote-workloads target remains
-unmet; correctness success is separate from performance acceptance.
+The baseline explicitly enables projection/filter pushdown, validated metadata
+reuse and lightweight row-count planning, and disables read coalescing. Metadata
+reuse and lightweight planning are opt-in, not public API defaults. The four
+additional reader controls described below are disabled for the baseline.
+The confirmed candidate additionally enables execution-session reuse alone.
+Parquet uses its native defaults. All four new controls remain opt-in; no
+performance default has been promoted.
 
-### Local files
+### Independent confirmation with execution-session reuse
+
+The configuration was selected before these runs and frozen with its complete
+options and source/native identities. Each query creates a fresh source and
+includes source creation in the timer; clients and connections persist. These
+are dedicated Parquet/candidate pairs, not ratios inferred from an optimization
+against the previous Vortex reader. Earlier independent baseline sessions follow
+separately and are not pooled with this confirmation.
+
+Local confirmation uses the same 7,895,160-row corpus per layout, 20 measured
+pairs (ten AB, ten BA) and one warmup. Evidence: L4.
+
+| Layout | Query | Parquet median ms | Vortex median ms | P/V |
+| --- | --- | ---: | ---: | ---: |
+| Sorted / single | Narrow scan | 33.300 | 11.138 | 2.990× |
+| Sorted / single | Range 1% | 4.255 | 3.445 | 1.235× |
+| Sorted / single | Equality 1% | 3.926 | 3.469 | 1.132× |
+| Sorted / single | Join | 97.172 | 59.014 | 1.647× |
+| Sorted / single | Full reduction | 229.930 | 169.317 | 1.358× |
+| Sorted / multi | Narrow scan | 32.732 | 13.654 | 2.397× |
+| Sorted / multi | Range 1% | 3.565 | 4.155 | 0.858× |
+| Sorted / multi | Equality 1% | 3.015 | 4.165 | 0.724× |
+| Sorted / multi | Join | 81.123 | 62.152 | 1.305× |
+| Sorted / multi | Full reduction | 229.936 | 168.240 | 1.367× |
+| Shuffled / single | Narrow scan | 33.641 | 13.981 | 2.406× |
+| Shuffled / single | Range 1% | 95.696 | 11.540 | 8.292× |
+| Shuffled / single | Equality 1% | 50.632 | 12.803 | 3.955× |
+| Shuffled / single | Join | 100.560 | 62.513 | 1.609× |
+| Shuffled / single | Full reduction | 232.490 | 178.607 | 1.302× |
+| Shuffled / multi | Narrow scan | 33.426 | 16.796 | 1.990× |
+| Shuffled / multi | Range 1% | 30.880 | 10.905 | 2.832× |
+| Shuffled / multi | Equality 1% | 31.996 | 11.296 | 2.832× |
+| Shuffled / multi | Join | 82.952 | 64.878 | 1.279× |
+| Shuffled / multi | Full reduction | 232.017 | 172.152 | 1.348× |
+
+Sorted/multi range and equality remain **16.57% and 38.13% slower** than Parquet.
+The separate candidate/previous-Vortex pairs pass all 20 local regression
+checks: median changes range from 13.69% less time to 1.56% more time, within
+the predeclared 5% limit. Those percentages compare Vortex configurations;
+they are not Parquet/Vortex speed ratios.
+
+Remote confirmation uses 986,895 sorted rows in eight files on authenticated
+local Docker MinIO, 50 measured pairs (25 AB, 25 BA) and three warmups.
+Evidence: R4. The local and remote corpora differ in size; this is not a
+measurement of WAN or hosted AWS S3 performance.
+
+| Query | Parquet median ms | Vortex median ms | P/V |
+| --- | ---: | ---: | ---: |
+| Narrow scan | 27.158 | 19.434 | 1.397× |
+| Range 1% | 11.962 | 12.516 | 0.956× |
+| Equality 1% | 11.795 | 12.107 | 0.974× |
+| Join | 32.953 | 28.775 | 1.145× |
+| Full reduction | 164.291 | 168.014 | 0.978× |
+
+All query outputs and profiles passed validation. The report retains a failed
+performance status because three of five medians miss the strict target. Small
+differences remain descriptive: the preceding qualification's identical-control
+medians varied from about 5.3% less time to 1.6% more time. No control correction,
+statistical-significance claim, candidate replacement or timing retry was used.
+
+### Repeated baseline comparisons
+
+With execution-session reuse disabled, the baseline wins 18/20 local and 2/5
+remote medians in each of three independent sessions. The following tables retain
+all those results and their session variability.
+
+#### Local files
 
 Each layout contains **7,895,160 rows**, approximately **1.066 GB of logical
-Arrow data**. Single means one file; multi means eight files. Each row below
-uses 20 measured paired trials and one excluded warmup, with persistent clients
-and a fresh source/query each time. Source creation is included. Evidence: L.
+Arrow data**. Single means one file; multi means eight files. Each independent
+session uses 20 measured adjacent pairs and one excluded warmup, with persistent
+clients and a fresh source/query each time. Source creation is included.
 
-| Layout | Query | Parquet median ms | Vortex median ms | Speed ratio P/V |
-| --- | --- | ---: | ---: | ---: |
-| Sorted / single | Narrow scan | 32.600 | 12.051 | 2.705× |
-| Sorted / single | Range 1% | 4.507 | 3.757 | 1.200× |
-| Sorted / single | Equality 1% | 4.074 | 3.590 | 1.135× |
-| Sorted / single | Join | 97.837 | 57.222 | 1.710× |
-| Sorted / single | Full reduction | 232.133 | 163.269 | 1.422× |
-| Sorted / multi | Narrow scan | 32.397 | 14.546 | 2.227× |
-| Sorted / multi | Range 1% | 3.900 | 5.246 | 0.743× |
-| Sorted / multi | Equality 1% | 3.149 | 5.093 | 0.618× |
-| Sorted / multi | Join | 80.586 | 59.689 | 1.350× |
-| Sorted / multi | Full reduction | 225.877 | 158.379 | 1.426× |
-| Shuffled / single | Narrow scan | 33.439 | 15.504 | 2.157× |
-| Shuffled / single | Range 1% | 98.668 | 12.240 | 8.061× |
-| Shuffled / single | Equality 1% | 51.370 | 13.818 | 3.718× |
-| Shuffled / single | Join | 100.439 | 61.144 | 1.643× |
-| Shuffled / single | Full reduction | 232.489 | 173.612 | 1.339× |
-| Shuffled / multi | Narrow scan | 33.327 | 17.402 | 1.915× |
-| Shuffled / multi | Range 1% | 32.074 | 11.656 | 2.752× |
-| Shuffled / multi | Equality 1% | 32.804 | 12.655 | 2.592× |
-| Shuffled / multi | Join | 82.044 | 63.337 | 1.295× |
-| Shuffled / multi | Full reduction | 229.517 | 165.252 | 1.389× |
+Ranges span the **three session medians**, not individual samples or confidence
+intervals. S1/S2/S3 retain each session's own P/V ratio; samples and range endpoints
+are not pooled to calculate a ratio. Evidence: L1–L3.
 
-Each of the 18 winning rows was faster in all 20 adjacent pairs. Each losing
-row was slower in all 20 pairs. The sorted/multi range and equality cases take
-**34.5% and 61.7% more time** through Vortex, respectively. These counts describe
-this experiment; they are not confidence intervals or universal guarantees.
+| Layout | Query | Parquet median ms range | Vortex median ms range | P/V: S1 / S2 / S3 |
+| --- | --- | ---: | ---: | --- |
+| Sorted / single | Narrow scan | 32.609–35.123 | 11.799–12.426 | 2.881× / 2.750× / 2.764× |
+| Sorted / single | Range 1% | 4.421–4.605 | 3.635–3.767 | 1.222× / 1.228× / 1.216× |
+| Sorted / single | Equality 1% | 4.026–4.076 | 3.637–3.737 | 1.089× / 1.077× / 1.121× |
+| Sorted / single | Join | 97.033–101.476 | 57.953–61.490 | 1.650× / 1.642× / 1.674× |
+| Sorted / single | Full reduction | 241.298–269.165 | 172.259–178.761 | 1.515× / 1.388× / 1.401× |
+| Sorted / multi | Narrow scan | 32.471–34.609 | 14.365–15.323 | 2.259× / 2.310× / 2.260× |
+| Sorted / multi | Range 1% | 3.809–3.873 | 5.058–5.217 | 0.743× / 0.755× / 0.753× |
+| Sorted / multi | Equality 1% | 3.115–3.177 | 5.041–5.054 | 0.616× / 0.629× / 0.619× |
+| Sorted / multi | Join | 80.967–85.292 | 61.835–64.983 | 1.313× / 1.307× / 1.309× |
+| Sorted / multi | Full reduction | 233.455–249.936 | 169.597–178.379 | 1.401× / 1.380× / 1.377× |
+| Shuffled / single | Narrow scan | 33.176–35.470 | 14.736–15.186 | 2.336× / 2.285× / 2.251× |
+| Shuffled / single | Range 1% | 95.675–97.156 | 12.106–12.571 | 7.985× / 7.650× / 7.903× |
+| Shuffled / single | Equality 1% | 50.722–52.144 | 13.634–14.070 | 3.706× / 3.798× / 3.720× |
+| Shuffled / single | Join | 101.289–106.899 | 59.941–66.584 | 1.605× / 1.602× / 1.690× |
+| Shuffled / single | Full reduction | 243.338–264.757 | 176.078–189.752 | 1.395× / 1.400× / 1.382× |
+| Shuffled / multi | Narrow scan | 32.398–35.134 | 17.221–18.204 | 1.933× / 1.898× / 1.881× |
+| Shuffled / multi | Range 1% | 30.349–31.774 | 11.292–12.010 | 2.657× / 2.601× / 2.688× |
+| Shuffled / multi | Equality 1% | 31.796–33.364 | 12.235–12.817 | 2.603× / 2.609× / 2.599× |
+| Shuffled / multi | Join | 80.993–85.545 | 64.731–69.127 | 1.238× / 1.243× / 1.251× |
+| Shuffled / multi | Full reduction | 237.628–254.119 | 173.135–184.187 | 1.380× / 1.351× / 1.373× |
 
-### S3-compatible storage
+The sorted/multi range and equality cases take **32.4–34.7%** and **59.0–62.2%**
+more time through Vortex across these sessions. These losses remain visible
+alongside the winning rows.
+
+One original local session overlapped user-requested disk cleanup. Its complete
+report is preserved and excluded from performance conclusions. A replacement
+using the same seed was declared before that session completed; L3 is the clean
+replacement. The [replacement record](../../examples/vortex_eval/artifacts/phase8/local-replacement-plan.json)
+links the original data and cleanup evidence.
+
+#### S3-compatible storage
 
 The remote fixture has **986,895 sorted rows across eight files**, approximately
 **133.257 MB logical data**. An authenticated MinIO container runs on the same
-Mac through Docker. This measures an S3 client/server path, not WAN or hosted
-AWS S3 performance. The corpus is smaller than the local one, so the two tables
-do not measure a remote-versus-local slowdown. Evidence: R.
+Mac through Docker. This measures an S3 client/server path, not WAN or hosted AWS
+S3 performance. The smaller corpus prevents interpreting this table as a
+remote-versus-local slowdown. Ranges and S1/S2/S3 have the same meaning as above.
+Evidence: R1–R3.
 
-| Query | Parquet median ms | Vortex median ms | Speed ratio P/V | Vortex faster pairs |
+| Query | Parquet median ms range | Vortex median ms range | P/V: S1 / S2 / S3 |
+| --- | ---: | ---: | --- |
+| Narrow scan | 27.355–29.784 | 20.458–23.458 | 1.398× / 1.337× / 1.270× |
+| Range 1% | 12.116–12.696 | 13.390–13.938 | 0.880× / 0.948× / 0.877× |
+| Equality 1% | 12.048–13.084 | 13.365–13.968 | 0.863× / 0.958× / 0.955× |
+| Join | 33.340–38.322 | 31.457–31.958 | 1.133× / 1.051× / 1.199× |
+| Full reduction | 174.884–181.486 | 178.908–187.456 | 0.956× / 0.984× / 0.968× |
+
+Identical-configuration controls moved from approximately **5.3% less time to
+9.4% more time** across query/session medians. Small changes need caution; no
+control subtraction or statistical-significance claim is made.
+
+### Additional opt-in reader controls
+
+The combined configuration enables direct large-offset Arrow export, per-scan
+execution-session reuse, whole-file statistics pruning and layout sub-splitting.
+All four controls default to false. The following dedicated Parquet/Vortex pairs
+measure that complete configuration in the same binary as the baseline. They
+are not derived by multiplying Vortex-versus-Vortex ratios.
+
+Combined local P/V ranges span the three independent session medians. This
+configuration also wins 18 of 20 local medians per session; sorted/multi filters
+remain slower than Parquet.
+
+| Query | Sorted / single | Sorted / multi | Shuffled / single | Shuffled / multi |
 | --- | ---: | ---: | ---: | ---: |
-| Narrow scan | 26.845 | 19.975 | 1.344× | 20/20 |
-| Range 1% | 11.145 | 12.286 | 0.907× | 6/20 |
-| Equality 1% | 11.091 | 13.128 | 0.845× | 6/20 |
-| Join | 33.073 | 31.432 | 1.052× | 15/20 |
-| Full reduction | 164.733 | 170.358 | 0.967× | 7/20 |
+| Narrow scan | 2.808–2.849× | 2.287–2.328× | 2.240–2.318× | 1.931–1.998× |
+| Range 1% | 1.182–1.211× | 0.839–0.856× | 7.924–8.141× | 2.757–2.832× |
+| Equality 1% | 1.089–1.121× | 0.711–0.723× | 3.637–3.803× | 2.649–2.750× |
+| Join | 1.618–1.681× | 1.296–1.347× | 1.594–1.641× | 1.241–1.259× |
+| Full reduction | 1.264–1.374× | 1.159–1.195× | 1.254–1.305× | 1.134–1.199× |
 
-Vortex takes 25.6% less time for narrow scans and 5.0% less for joins. It takes
-10.2%, 18.4% and 3.4% more time for range, equality and full reduction. Small
-differences need caution: the same run's identical-configuration Vortex equality
-control moved approximately 11%. No statistical significance is claimed.
+Combined MinIO results:
+
+| Query | Parquet median ms range | Vortex median ms range | P/V: S1 / S2 / S3 |
+| --- | ---: | ---: | --- |
+| Narrow scan | 28.113–29.491 | 20.405–21.651 | 1.356× / 1.378× / 1.405× |
+| Range 1% | 12.392–12.622 | 12.440–13.459 | 0.921× / 1.015× / 0.946× |
+| Equality 1% | 11.989–12.982 | 12.271–12.923 | 1.006× / 0.928× / 1.056× |
+| Join | 32.623–35.874 | 29.845–31.882 | 1.191× / 1.093× / 1.079× |
+| Full reduction | 171.863–184.453 | 174.231–181.331 | 1.017× / 0.986× / 0.960× |
+
+Combined wins four of five remote medians in S1 and three of five in S2/S3.
+Only narrow scans and joins beat Parquet in every session. The remaining wins
+change by session, and no session wins every workload. These results do not
+justify enabling the bundle by default. Individual-control diagnostics and
+candidate selection are recorded in the [reader evaluation](vortex-phase8-design.md).
 
 ## Earlier measured coverage
 
@@ -229,13 +343,21 @@ latencies, not isolated codec throughput or a canonical TPC-H suite.
   collection. Imports, dataset creation/upload, output validation and plan
   extraction are outside it. Clients/connections persist in the current runs;
   sources and results are not reused.
-- **Sampling:** current comparisons use 20 adjacent pairs, ten in each order,
-  after one warmup. Separate instrumented queries never enter timing medians.
-  Caches are retained; these are not verified cold-cache measurements.
-- **Correctness:** the current complete experiment schedules passed 4,830 query
-  executions and 345 separate diagnostic captures with unchanged recorded
-  provenance. This includes control/configuration experiments beyond the 25
-  Parquet/Vortex rows shown here. No failed timing samples are retried or removed.
+- **Baseline sampling:** three independent sessions per storage type, each with 20
+  adjacent pairs, ten in each order, after one warmup. Separate instrumented
+  queries never enter timing medians. Caches are retained; these are not verified
+  cold-cache measurements.
+- **Correctness:** the six retained complete experiment schedules passed
+  **25,200 query executions** (24,000 measured plus 1,200 warmups) and **1,800
+  separate diagnostic captures**, with unchanged provenance within each session
+  and zero dropped/unfinished diagnostic events. Counts include control and
+  configuration experiments. The interrupted local session remains separate;
+  no individual timing failures are retried or removed within a session.
+- **Candidate confirmation:** a fresh qualification, one remote final session
+  and one local guard add **3,160 query executions** (3,000 measured and 160
+  warmups) and **270 complete diagnostic captures**. Every output matches its
+  fixture oracle, with zero dropped/unfinished events. Seeds are 3149, 4159 and
+  5167 respectively. The remote performance gate fails despite correct results.
 
 Observed speed ratios apply to this corpus, reader configuration and machine.
 They do not rank Daft against DataFusion/Velox. Vortex-versus-Vortex pushdown or
@@ -250,8 +372,17 @@ record. Directory names below preserve their original locations.
 
 | ID | Raw report | Measured source |
 | --- | --- | --- |
-| L | [Current local](../../examples/vortex_eval/artifacts/phase7/local-profile-revised/report.json) | `345a7d460e0fbd837b5b870f102d9c197263694c` |
-| R | [Current MinIO](../../examples/vortex_eval/artifacts/phase7/terminal-20261021T120240Z-87606/remote/report.json) | `52a954a7862c060a11686958806f129b079c3dfe` |
+| L4 | [Session-reuse local confirmation](../../examples/vortex_eval/artifacts/phase8/acceptance-20261021T164449Z-51632/local-guard/session-01/report.json) | `b36572cc6ac5d0ff275e33ae8af2e961e0f02ab7` |
+| R4 | [Session-reuse remote confirmation](../../examples/vortex_eval/artifacts/phase8/acceptance-20261021T164449Z-51632/remote-final/session-01/report.json) | Same as L4 |
+| Q1 | [Candidate qualification](../../examples/vortex_eval/artifacts/phase8/acceptance-20261021T164449Z-51632/qualification/session-01/report.json) | Same as L4 |
+| L1 | [Local session 1](../../examples/vortex_eval/artifacts/phase8/local-profile/session-01/report.json) | `ec0eb98216c7319cdaea09b12220b0cf44c134f6` |
+| L2 | [Local session 2](../../examples/vortex_eval/artifacts/phase8/local-profile/session-02/report.json) | `ec0eb98216c7319cdaea09b12220b0cf44c134f6` |
+| L3 | [Local session 3](../../examples/vortex_eval/artifacts/phase8/local-profile-clean/session-01/report.json) | `ec0eb98216c7319cdaea09b12220b0cf44c134f6` |
+| R1 | [Remote session 1](../../examples/vortex_eval/artifacts/phase8/remote-terminal-20261021T161012Z-44223/remote/session-01/report.json) | `d02e23aa53d180d0e85561ea822e10119b266e2d` |
+| R2 | [Remote session 2](../../examples/vortex_eval/artifacts/phase8/remote-terminal-20261021T161012Z-44223/remote/session-02/report.json) | `d02e23aa53d180d0e85561ea822e10119b266e2d` |
+| R3 | [Remote session 3](../../examples/vortex_eval/artifacts/phase8/remote-terminal-20261021T161012Z-44223/remote/session-03/report.json) | `d02e23aa53d180d0e85561ea822e10119b266e2d` |
+| H5 | [Prior persistent local](../../examples/vortex_eval/artifacts/phase7/local-profile-revised/report.json) | `345a7d460e0fbd837b5b870f102d9c197263694c` |
+| H6 | [Prior persistent MinIO](../../examples/vortex_eval/artifacts/phase7/terminal-20261021T120240Z-87606/remote/report.json) | `52a954a7862c060a11686958806f129b079c3dfe` |
 | H1 | [Earlier broad local matrix](../../examples/vortex_eval/artifacts/phase4/join-stats-fix/local-report/report.json) | `df7acfed1e52fcd4af194ed48b1382b178aa3b7d` |
 | H2 | [Earlier 20-sample local matrix](../../examples/vortex_eval/artifacts/phase5/local-report/report.json) | `68fc70a7957f63c22f6beb1c319001f1f52ce778` |
 | H3 | [Restricted concurrency](../../examples/vortex_eval/artifacts/phase4/join-stats-fix/restricted-report/report.json) | Same as H1 |
@@ -260,15 +391,30 @@ record. Directory names below preserve their original locations.
 SHA-256 report identities:
 
 ```text
-L   f103275c30e986b1c1f177d405f5133b04606d46cfd9c97114f47934794cdb8b
-R   dbda1fac19d400bcc25f7f1c18327b707baa2ffdf66369a8d4fe905cc25a38e6
+L4  0cf1efed5cbd1c9e580719c89510045c102220a2df36e9e6c7ec09c9e185f94a
+R4  d1ea231faed6fe656e1613d6531f2ae8c18bd72e304c48a76bc0e64cf6d4f2b2
+Q1  e24c91ff0eae141dad27761a1626f100e392de5a631cf6e9b1e12c3eb7463068
+L1  b44087e9b69e867d0fbdbc9f78355398960db7c799d9c3d67361b513f825f9e9
+L2  a36ff4093bb67e2cde14beed20bdee6d0a4ba4f0ebeb565872b9153004d8709b
+L3  f3f0299f3e55b92e9db3dd354137f70b65816b9e9783972bf6d9be4fc57cce0f
+R1  385a06d737ee0bd1da4b3ce3c858c3165aebcc0a8adf5d9a716cd984f2c6ede3
+R2  117e54a967b4e6aa21234fdde23c257be7bed58e167730c84632743f6b0a255c
+R3  5259f669e79d761a5594a80aac5042e59eb008a9eef9607ed1e75443b0e23c68
+H5  f103275c30e986b1c1f177d405f5133b04606d46cfd9c97114f47934794cdb8b
+H6  dbda1fac19d400bcc25f7f1c18327b707baa2ffdf66369a8d4fe905cc25a38e6
 H1  68566db52b2ed394ba7e1afc771a154df28388ad2f3f1caf36f793a4bc7d3171
 H2  698070770c612e76f26c73a77063023e01b9dae28fdc4527e46cec53fa83cfc3
 H3  9683b4cd19eab580ed8cdff6c22d3f78bdcc8509e00d5e90942a72f9d8f3c612
 H4  9a1424c62fd53994b6ff8c76b288111b9804101d7915434e6070de5b51240c98
 ```
 
-L and R use the same native binary:
+L1–L4, R1–R4 and Q1 use the same native binary:
+`307b4452a633d577787e47e4162246660ec7495db56d885adf416aa6da42a568`.
+The local source is `ec0eb9821`; the remote source is `d02e23aa5`, which adds
+only the tested Python CLI case-selection fix. Confirmation source `b36572cc6`
+adds the sorted-JSON schedule-validation fix and documentation without changing
+the native reader. Subsequent test-only and documentation fixes do not replace
+the measured source identity. H5 and H6 use the earlier binary:
 `abdda9c07984620a2f0bc3cf0501a7c6d972889ab29e27e5352294c6d3af041f`.
 The local and remote fixture manifests respectively hash to
 `0f27c0d14df2cdf9e9cf4ac593a59fb1d2a637a85624634591abae56b8b9fd80`

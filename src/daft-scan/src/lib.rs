@@ -1061,6 +1061,10 @@ mod test {
                     read_coalesce_gap_bytes: 17,
                     read_coalesce_max_bytes: 524_288,
                     metadata_snapshot: Some(b"sentinel-snapshot-secret".to_vec()),
+                    enable_large_offsets: enable_projection_pushdown,
+                    enable_execution_session_reuse: enable_filter_pushdown,
+                    enable_file_pruning: enable_projection_pushdown,
+                    enable_layout_splitting: enable_filter_pushdown,
                 };
                 let encoded =
                     bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
@@ -1178,6 +1182,10 @@ mod test {
                     read_coalesce_gap_bytes: 0,
                     read_coalesce_max_bytes: 131_072,
                     metadata_snapshot: Some(b"sentinel-task-snapshot".to_vec()),
+                    enable_large_offsets: true,
+                    enable_execution_session_reuse: true,
+                    enable_file_pruning: true,
+                    enable_layout_splitting: true,
                 },
             ))),
             schema,
@@ -1252,6 +1260,10 @@ mod test {
                 read_coalesce_gap_bytes: 0,
                 read_coalesce_max_bytes: 131_072,
                 metadata_snapshot: Some(_),
+                enable_large_offsets: true,
+                enable_execution_session_reuse: true,
+                enable_file_pruning: true,
+                enable_layout_splitting: true,
             }))
         ));
         assert_eq!(decoded.storage_config, task.storage_config);

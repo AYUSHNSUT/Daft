@@ -97,6 +97,7 @@ impl ScanTaskSource {
         };
 
         io_runtime.spawn(async move {
+            let execution_context = Arc::new(scan_task_reader::ScanExecutionContext::default());
             let mut task_set = JoinSet::new();
             // Store pending tasks: (scan_task, delete_map, input_id)
             let mut pending_tasks = VecDeque::new();
@@ -126,6 +127,7 @@ impl ScanTaskSource {
                         sender,
                         input_id,
                         skipped_corrupt_files.clone(),
+                        execution_context.clone(),
                     ));
                 }
 
@@ -504,6 +506,7 @@ async fn forward_scan_task_stream(
     sender: ScanTaskOutputSender,
     input_id: InputId,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
+    execution_context: Arc<scan_task_reader::ScanExecutionContext>,
 ) -> DaftResult<InputId> {
     let schema = scan_task.materialized_schema();
     let mut stream = stream_scan_task(
@@ -513,6 +516,7 @@ async fn forward_scan_task_stream(
         maintain_order,
         chunk_size,
         skipped_corrupt_files,
+        execution_context,
     )
     .await?;
     let mut has_data = false;
@@ -574,6 +578,7 @@ async fn stream_scan_task(
     maintain_order: bool,
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
+    execution_context: Arc<scan_task_reader::ScanExecutionContext>,
 ) -> DaftResult<impl Stream<Item = DaftResult<MicroPartition>> + Send> {
     let pushdown_columns = scan_task
         .pushdowns
@@ -630,6 +635,7 @@ async fn stream_scan_task(
         maintain_order,
         chunk_size,
         skipped_corrupt_files,
+        execution_context,
     )
     .await?;
 

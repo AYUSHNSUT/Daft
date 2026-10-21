@@ -22,7 +22,7 @@ use crate::{VortexConvertOptions, VortexReadOptions, read::NULLABILITY_METADATA_
 #[path = "semantics_tests.rs"]
 mod semantics_tests;
 
-async fn read_vortex_schema(uri: &str) -> DaftResult<SchemaRef> {
+pub(crate) async fn read_vortex_schema(uri: &str) -> DaftResult<SchemaRef> {
     crate::read_vortex_schema(
         uri,
         Arc::new(daft_io::IOClient::new(Default::default())?),
@@ -32,7 +32,7 @@ async fn read_vortex_schema(uri: &str) -> DaftResult<SchemaRef> {
     .await
 }
 
-async fn stream_vortex(
+pub(crate) async fn stream_vortex(
     uri: &str,
     read: VortexReadOptions,
     convert: VortexConvertOptions,
@@ -47,7 +47,7 @@ async fn stream_vortex(
     .await
 }
 
-fn primitive_batch(value_nullable: bool) -> ArrowRecordBatch {
+pub(crate) fn primitive_batch(value_nullable: bool) -> ArrowRecordBatch {
     let value = if value_nullable {
         vec![
             None,
@@ -212,7 +212,7 @@ pub(crate) async fn write_batch(batch: ArrowRecordBatch) -> NamedTempFile {
     file
 }
 
-fn options(schema: SchemaRef) -> VortexConvertOptions {
+pub(crate) fn options(schema: SchemaRef) -> VortexConvertOptions {
     VortexConvertOptions {
         schema,
         predicate: None,

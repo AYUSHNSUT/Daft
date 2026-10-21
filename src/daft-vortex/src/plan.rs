@@ -26,6 +26,7 @@ pub(crate) struct ScanPlan {
     pub physical_indices: Vec<usize>,
     pub projection: BoundExpression,
     pub pushed_filter: Option<BoundExpression>,
+    pub pruning_filter: Option<Expression>,
     pub residual: Option<BoundExpr>,
     pub output_indices: Vec<usize>,
     #[cfg_attr(not(feature = "python"), allow(dead_code))]
@@ -270,11 +271,15 @@ pub(crate) fn plan_scan(
         .map(|predicate| BoundExpr::try_new(predicate.clone(), &physical_schema))
         .transpose()?;
     let mut filter_fallbacks = Vec::new();
+    let mut pruning_filter = None;
     let pushed_filter = if let Some(predicate) = &normalized {
         if read_options.enable_filter_pushdown {
             translate_filter(predicate, schema, &mut filter_fallbacks).and_then(|expression| {
                 match expression.bind(dtype) {
-                    Ok(bound) => Some(bound),
+                    Ok(bound) => {
+                        pruning_filter = Some(expression);
+                        Some(bound)
+                    }
                     Err(error) => {
                         filter_fallbacks.push(format!(
                             "Vortex predicate binding rejected the translated expression: {error}"
@@ -296,6 +301,7 @@ pub(crate) fn plan_scan(
         physical_indices,
         projection,
         pushed_filter,
+        pruning_filter,
         residual,
         output_indices,
         filter_fallbacks,

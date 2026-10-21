@@ -19,6 +19,13 @@ use futures::stream::BoxStream;
 
 type SkippedCorruptFilesCollector = Option<Arc<std::sync::Mutex<Vec<(String, String, bool)>>>>;
 
+/// State owned by one scan processor, with independent state for other queries.
+#[derive(Default)]
+pub(crate) struct ScanExecutionContext {
+    #[cfg(feature = "vortex")]
+    vortex: Arc<daft_vortex::VortexExecutionContext>,
+}
+
 /// Dispatches a ScanTask to the appropriate reader based on its SourceConfig,
 /// returning a stream of RecordBatches.
 ///
@@ -34,7 +41,10 @@ pub(crate) async fn read_scan_task(
     maintain_order: bool,
     chunk_size: usize,
     skipped_corrupt_files: SkippedCorruptFilesCollector,
+    execution_context: Arc<ScanExecutionContext>,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
+    #[cfg(not(feature = "vortex"))]
+    let _ = execution_context;
     match scan_task.source_config.as_ref() {
         SourceConfig::File(ffc) => match ffc {
             FileFormatConfig::Parquet(cfg) => {
@@ -87,7 +97,7 @@ pub(crate) async fn read_scan_task(
             }
             #[cfg(feature = "vortex")]
             FileFormatConfig::Vortex(cfg) => {
-                read_vortex(scan_task, cfg, url, file_column_names, io_client, io_stats).await
+                read_vortex(scan_task, cfg, url, file_column_names, io_client, io_stats, execution_context).await
             }
             #[cfg(not(feature = "vortex"))]
             FileFormatConfig::Vortex(_) => Err(common_error::DaftError::NotImplemented(
@@ -356,6 +366,7 @@ async fn read_mcap(
 }
 
 #[cfg(feature = "vortex")]
+#[allow(clippy::too_many_arguments)]
 async fn read_vortex(
     scan_task: &ScanTask,
     cfg: &VortexSourceConfig,
@@ -363,6 +374,7 @@ async fn read_vortex(
     file_column_names: Option<Vec<String>>,
     io_client: Arc<daft_io::IOClient>,
     io_stats: IOStatsRef,
+    execution_context: Arc<ScanExecutionContext>,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
     if scan_task.pushdowns.aggregation.is_some() {
         return Err(common_error::DaftError::NotImplemented(
@@ -371,6 +383,12 @@ async fn read_vortex(
     }
     let read_options = daft_vortex::VortexReadOptions {
         batch_size: cfg.batch_size,
+        enable_large_offsets: cfg.enable_large_offsets,
+        enable_file_pruning: cfg.enable_file_pruning,
+        enable_layout_splitting: cfg.enable_layout_splitting,
+        execution_context: cfg
+            .enable_execution_session_reuse
+            .then(|| execution_context.vortex.clone()),
         enable_projection_pushdown: cfg.enable_projection_pushdown,
         enable_filter_pushdown: cfg.enable_filter_pushdown,
         max_concurrent_requests: cfg.max_concurrent_requests,

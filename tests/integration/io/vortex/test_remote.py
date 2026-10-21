@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 
+import pyarrow as pa
 import pytest
 
 import daft
@@ -20,6 +21,65 @@ from daft.io import _vortex
 from daft.pickle import cloudpickle
 
 pytestmark = pytest.mark.integration
+
+_READER_CONTROLS = (
+    "enable_large_offsets",
+    "enable_execution_session_reuse",
+    "enable_file_pruning",
+    "enable_layout_splitting",
+)
+
+
+@pytest.mark.parametrize("control", [*_READER_CONTROLS, "combined"])
+def test_vortex_reader_controls_http_and_minio(vortex_http, vortex_minio, control):
+    options = dict.fromkeys(_READER_CONTROLS if control == "combined" else [control], True)
+    url, http_config, _, http_table = vortex_http
+    base, s3_config, s3_table = vortex_minio
+    for path, config, table in [(url, http_config, http_table), (base + "/prefix/explicit.bin", s3_config, s3_table)]:
+        source = _vortex.VortexSource(
+            [path], config, 3, enable_row_count_planning=True, enable_metadata_reuse=True, **options
+        )
+        for _ in range(2):
+            restored = cloudpickle.loads(cloudpickle.dumps(source))
+            result = restored.read().where(daft.col("value") >= 4).sort("id").to_pydict()
+            expected = table.filter(pa.compute.greater_equal(table["value"], 4)).to_pydict()
+            assert result == expected
+
+
+@pytest.mark.parametrize("backend", ["local", "http", "s3"])
+def test_vortex_ray_combined_reader_controls(
+    vortex_service_file, vortex_http, vortex_http_token, vortex_minio, backend
+):
+    if backend == "local":
+        path, table = vortex_service_file
+        config = None
+    elif backend == "http":
+        path, _, _, table = vortex_http
+        config = {"bearer_token": vortex_http_token, "num_tries": 1}
+    else:
+        base, io_config, table = vortex_minio
+        path = base + "/prefix/explicit.bin"
+        s3 = io_config.s3
+        config = {
+            "endpoint_url": s3.endpoint_url,
+            "region_name": s3.region_name,
+            "key_id": s3.key_id,
+            "access_key": s3.access_key,
+            "use_ssl": s3.use_ssl,
+            "force_virtual_addressing": False,
+            "num_tries": 1,
+        }
+    _ray_query(
+        path,
+        table,
+        backend,
+        config,
+        reader_options={
+            **dict.fromkeys(_READER_CONTROLS, True),
+            "enable_row_count_planning": True,
+            "enable_metadata_reuse": True,
+        },
+    )
 
 
 @pytest.mark.parametrize("projection,filtering", [(False, False), (True, True)])

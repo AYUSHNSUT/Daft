@@ -1,8 +1,39 @@
 # Vortex performance improvements and investigation worklist
 
-Updated **21 October 2026** against source `42c380f60`. This is a proposed worklist,
-not a record of implemented optimizations or new benchmark runs. The maintained
-[Parquet/Vortex comparison](parquet-vs-vortex.md) remains the results reference.
+Updated **21 October 2026** after confirmation on source `b36572cc6`. The
+maintained [Parquet/Vortex comparison](parquet-vs-vortex.md) remains the results
+reference. This worklist retains the original investigation IDs; the progress
+record below distinguishes completed experiments from outstanding work.
+
+## Progress and next investigations
+
+- M1 now freezes complete candidate configurations and identities. M2 adds
+  independent seeded sessions and order/time-block diagnostics; uncertainty
+  estimation and broader host telemetry remain open.
+- M3 now records SDK task lifetimes and has six successful local all-thread stack
+  captures. Exclusive on-CPU, allocator and physical transport attribution remain
+  open. Next capture both formats and bracket query-active intervals; current
+  snapshots include idle workers and inter-query work outside query timers.
+- D1, S1, S4 and D3 are implemented as opt-in experiments. S1 (session reuse)
+  passes the local regression guard but fails the all-query remote speed target.
+  D1 removes visible offset casting but copying/materialization remain. S4 shows
+  no repeatable gain here. D3 increases full-scan batch/task counts and regresses
+  latency. None is promoted to a default.
+- Prioritize selective-query setup across schema, planning and execution (S2/S3/
+  S5), supported by session-registry stack observations. Keep identity and full
+  schema checks intact. Shared execution sessions alone leave two local and
+  three remote losses.
+- Investigate string decoding/materialization and read-buffer copies with M4,
+  I3/I4 and Q3 before more split tuning. FSST, VarBinBuilder and copying remain visible
+  with direct large offsets. The shared Daft string-length reduction also needs
+  attribution; optimizing it could benefit both readers.
+- Pair remote transport/server evidence with the request audit (M5/I1 onward).
+  Local stacks cannot establish the cause of the remaining remote gap.
+
+The [reader evaluation](vortex-phase8-design.md) records controls, acceptance,
+stack evidence and limitations. The detailed task descriptions below preserve
+their original scope; completion of one experiment does not imply that every
+measurement or broader workload in its row is covered.
 
 The immediate objective is to close the five measured losses while preserving
 the existing local wins. Broader coverage must establish where those conclusions
@@ -11,19 +42,23 @@ that its entire duration can be removed.
 
 ## The gaps to close
 
-These are arithmetic differences between the dedicated comparison medians.
+These are arithmetic differences from the dedicated session-reuse confirmation
+medians (L4/R4 in the maintained comparison).
 The percentage denominator is **current Vortex time**, so these percentages
 differ from how much slower Vortex is relative to Parquet. A tie is not a win.
 
 | Workload | Time Vortex must save to tie Parquet | Share of Vortex latency |
 | --- | ---: | ---: |
-| Local sorted/eight-file range, 1% | 1.346 ms | 25.65% |
-| Local sorted/eight-file equality, 1% | 1.944 ms | 38.17% |
-| MinIO range, 1% | 1.141 ms | 9.28% |
-| MinIO equality, 1% | 2.037 ms | 15.52% |
-| MinIO full reduction | 5.625 ms | 3.30% |
+| Local sorted/eight-file range, 1% | 0.590 ms | 14.21% |
+| Local sorted/eight-file equality, 1% | 1.150 ms | 27.61% |
+| MinIO range, 1% | 0.554 ms | 4.43% |
+| MinIO equality, 1% | 0.312 ms | 2.58% |
+| MinIO full reduction | 3.723 ms | 2.22% |
 
-The strongest clues from existing evidence are:
+The original profile clues below use the earlier evidence reviewed at source
+`42c380f60`; their timing values must not be subtracted from the new confirmation
+medians. The new stacks and session-creation measurements are in the reader
+evaluation linked above.
 
 - **Selective scans have substantial setup overhead.** Separate local range
   captures show source creation of about 0.536 ms for Parquet versus 1.195 ms
@@ -89,7 +124,7 @@ These are relative effort estimates, not delivery or speedup promises.
 
 | ID | Priority / effort | Work and concrete deliverable |
 | --- | --- | --- |
-| M1 | P0 / M | **Freeze the actual candidate in final acceptance.** Extend the selection schema to record every reader option, including row-count planning, metadata reuse, batch size, request limits and future split/runtime options. The current final helper only selects older coalescing/discovery policies and omits row-count planning. Test configuration roundtrips, exact executed options, unknown/missing option rejection and source/native/fixture identity; preserve the existing thresholds. |
+| M1 | P0 / M | **Freeze the actual candidate in final acceptance.** Extend the selection schema to record every reader option, including row-count planning, metadata reuse, batch size, request limits and future split/runtime options. The older policy-only helper selected coalescing/discovery policies and omitted row-count planning. Test configuration roundtrips, exact executed options, unknown/missing option rejection and source/native/fixture identity; preserve the existing thresholds. |
 | M2 | P0 / S–M | **Measure run variability and drift.** Keep the existing balanced adjacent pairs; add a predeclared number of independent persistent sessions and schedule seeds, order/time-block diagnostics, and host/Docker activity records. Investigate the approximately 11% identical-control equality difference. Use uncertainty estimates that respect paired observations and session dependence; never subtract the control percentage from candidate results. |
 | M3 | P0 / M | **Profile spawned CPU work and scheduler delay.** Sample every Daft/Vortex/Tokio worker thread and add bounded task enqueue/start/end, prepare/decode/filter/export counters with query/file/task correlation. Consumer `try_next()` polling does not include CPU work in spawned tasks. Keep synchronous work, CPU samples, queue delay and wall intervals distinct; retain errors/cancellation and measure profiler overhead separately. |
 | M4 | P0 / M | **Measure allocation, copy volume and live memory.** Attribute allocation counts/bytes, offset widening, snapshots, aligned I/O buffers and retained Arrow/Daft buffers. Distinguish allocator live bytes, sampled RSS, process lifetime high-water and encoded snapshot budgets. Shared buffers must not be counted twice. Include a slow consumer and cancellation to expose retention. |
@@ -103,7 +138,7 @@ These are relative effort estimates, not delivery or speedup promises.
 | S1 | P1 / M | **Share execution-session initialization within a fresh scan processor.** Extend the existing planning-only reuse through an execution context. Keep separate per-file readers, footers, validators and scan state; serialize configuration, not live sessions. Measure creation counts and CPU for 1/8/many files. Test concurrent queries, repeated collection, empty input, mixed schemas, cancellation and Ray serialization. |
 | S2 | P1 / M–L | **Fuse discovery with native opening where freshness permits.** Discovery currently discards size information when it returns path strings; native opening asks again. Investigate a bounded object descriptor with strong identity and provenance, not just a cached size. Compare exact paths/lists with directory/glob discovery. Mutation, delayed/repeated collection, missing files and deterministic error ordering must retain their contracts. |
 | S3 | P1 / M–L | **Reuse the first schema open for planning.** Schema inference discards row count/opening bytes, then planning fetches the first footer again. Evaluate a materialization-scoped validated descriptor/snapshot, or an explicit-schema API for callers that can supply the complete source schema. Preserve source nullability, validation after object replacement, delayed collection and worker boundaries. Measure actual eliminated calls; do not turn source construction into a long-lived metadata cache. |
-| S4 | P1 / M | **Prune a whole file before constructing its SDK scan.** The pinned SDK exposes `VortexFile::can_prune`; our reader does not call it. Test it after full schema validation using a safely translated predicate. The SDK already prunes data later, so the incremental benefit may be only layout/scan preparation. Missing/inexact stats, nulls and unsupported predicates must fall back; projected-away schema mismatches must still fail. |
+| S4 | P1 / M | **Prune a whole file before constructing its SDK scan.** The pinned SDK exposes `VortexFile::can_prune`; the baseline reader does not call it. Test it after full schema validation using a safely translated predicate. The SDK already prunes data later, so the incremental benefit may be only layout/scan preparation. Missing/inexact stats, nulls and unsupported predicates must fall back; projected-away schema mismatches must still fail. |
 | S5 | P2 / L | **Move proven no-match decisions into planning.** Planning already reads all footers. Investigate passing conservative statistics or a no-match proof to a validation-only execution task, avoiding full session/layout setup for irrelevant files. Preserve fresh identity checks and full schema-error behavior. This is separate from S4 and cannot simply delete the seven execution HEADs for filtered-out files. |
 | S6 | P2 / L | **Make cardinality work demand-driven and improve useful statistics.** Determine which simple queries require all-file exact counts before execution. Explore deferred counts or reused fresh planning metadata, while retaining exact/approximate/unknown distinctions and reliable join sizing. Vortex tasks currently reject column statistics. Never restore unknown-as-zero estimates or drop footer counts globally: that caused the original poor join build-side choice. Test filtered/skewed joins and task memory estimates. |
 | S7 | P2 / M | **Pipeline metadata beyond fixed windows.** Current Python batches and native ordered buffering can hold later work behind a slow file. Compare bounded continuous admission with 8/64/512 files and injected metadata skew. Preserve total concurrency, input order, first-error rules, cancellation and snapshot capacity. There is no demonstrated benefit for today's eight-file fixture. |
