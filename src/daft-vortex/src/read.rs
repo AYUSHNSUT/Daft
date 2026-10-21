@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use arrow_array::RecordBatch as ArrowRecordBatch;
@@ -115,12 +115,32 @@ fn input_uri(uri: &str) -> DaftResult<String> {
     local_path(uri).map(|path| path.to_string_lossy().into_owned())
 }
 
+fn session_for_open(
+    phase: Phase,
+    uri: &str,
+    shared_session: Option<&OnceLock<VortexSession>>,
+) -> VortexSession {
+    let create = |uri| {
+        let trace = diagnostics::begin(phase, "session_creation", uri);
+        let session = VortexSession::default().with_tokio();
+        diagnostics::complete(trace, false);
+        session
+    };
+    match shared_session {
+        // A row-count bulk call reuses session initialization. Its file opens
+        // keep independent readers, footers and snapshot state.
+        Some(shared) => shared.get_or_init(|| create(None)).clone(),
+        None => create(Some(uri)),
+    }
+}
+
 async fn open_file(
     uri: &str,
     io_client: Arc<IOClient>,
     io_stats: IOStatsRef,
     options: &VortexReadOptions,
     phase: Phase,
+    shared_session: Option<&OnceLock<VortexSession>>,
 ) -> DaftResult<(VortexSession, VortexFile)> {
     validate_options(options)?;
     let uri = input_uri(uri)?;
@@ -128,16 +148,19 @@ async fn open_file(
         .map_err(|error| read_error(&uri, "requires an active Tokio runtime", error))?;
     let trace = diagnostics::begin(phase, "open", Some(&uri));
     let result: DaftResult<_> = async {
-        let session = VortexSession::default().with_tokio();
+        let session = session_for_open(phase, &uri, shared_session);
         let reader = Arc::new(
             DaftReadAt::new_with_phase(uri.clone(), io_client, io_stats, options, phase).await?,
         );
+        let sdk_trace = diagnostics::begin(phase, "sdk_open", Some(&uri));
         let file = session
             .open_options()
             .with_initial_read_size(options.max_in_flight_bytes.min(65535))
             .open(reader.clone())
             .await
-            .map_err(|error| read_error(&uri, "open", error))?;
+            .map_err(|error| read_error(&uri, "open", error));
+        diagnostics::complete(sdk_trace, file.is_err());
+        let file = file?;
         reader.mark_data_phase();
         Ok((session, file))
     }
@@ -318,11 +341,38 @@ pub(crate) async fn read_metadata(
     read_options: VortexReadOptions,
     phase: Phase,
 ) -> DaftResult<(SchemaRef, u64)> {
-    let (session, file) = open_file(uri, io_client, io_stats, &read_options, phase).await?;
-    Ok((
-        schemas(&display_uri(uri), &session, file.dtype())?.1,
-        file.row_count(),
-    ))
+    let (schema, rows) =
+        read_metadata_inner(uri, io_client, io_stats, read_options, phase, true, None).await?;
+    Ok((schema.expect("schema conversion was requested"), rows))
+}
+
+async fn read_metadata_inner(
+    uri: &str,
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+    phase: Phase,
+    convert_schema: bool,
+    shared_session: Option<&OnceLock<VortexSession>>,
+) -> DaftResult<(Option<SchemaRef>, u64)> {
+    let (session, file) = open_file(
+        uri,
+        io_client,
+        io_stats,
+        &read_options,
+        phase,
+        shared_session,
+    )
+    .await?;
+    let schema = if convert_schema {
+        let trace = diagnostics::begin(phase, "schema_conversion", Some(uri));
+        let schema = schemas(&display_uri(uri), &session, file.dtype());
+        diagnostics::complete(trace, schema.is_err());
+        Some(schema?.1)
+    } else {
+        None
+    };
+    Ok((schema, file.row_count()))
 }
 
 /// Refresh metadata for several files, preserving their input order.
@@ -338,18 +388,79 @@ pub async fn read_vortex_metadata_bulk(
     read_options: VortexReadOptions,
     max_concurrent_files: usize,
 ) -> DaftResult<Vec<(SchemaRef, u64)>> {
+    Ok(read_metadata_bulk_inner(
+        uris,
+        io_client,
+        io_stats,
+        read_options,
+        max_concurrent_files,
+        true,
+    )
+    .await?
+    .into_iter()
+    .map(|(schema, rows)| (schema.expect("schema conversion was requested"), rows))
+    .collect())
+}
+
+/// Refresh row counts with one session per bulk call and no unused schema conversion.
+/// Execution still validates every full schema using its own session and reader.
+#[cfg(any(feature = "python", test))]
+pub(crate) async fn read_vortex_row_counts_bulk(
+    uris: &[String],
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+    max_concurrent_files: usize,
+) -> DaftResult<Vec<u64>> {
+    Ok(read_metadata_bulk_inner(
+        uris,
+        io_client,
+        io_stats,
+        read_options,
+        max_concurrent_files,
+        false,
+    )
+    .await?
+    .into_iter()
+    .map(|(_, rows)| rows)
+    .collect())
+}
+
+async fn read_metadata_bulk_inner(
+    uris: &[String],
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+    max_concurrent_files: usize,
+    convert_schema: bool,
+) -> DaftResult<Vec<(Option<SchemaRef>, u64)>> {
     validate_options(&read_options)?;
     if !(1..=MAX_CONCURRENT_METADATA_FILES).contains(&max_concurrent_files) {
         return Err(DaftError::ValueError(format!(
             "Vortex max_concurrent_files must be between 1 and {MAX_CONCURRENT_METADATA_FILES}"
         )));
     }
+    // Keep the full-schema path as the baseline. Lazy initialization preserves
+    // per-file validation order and avoids runtime work for empty input.
+    let shared_session = (!convert_schema).then(OnceLock::new);
     futures::stream::iter(uris.iter().cloned())
         .map(|uri| {
             let io_client = io_client.clone();
             let io_stats = io_stats.clone();
             let read_options = read_options.clone();
-            async move { read_vortex_metadata(&uri, io_client, io_stats, read_options).await }
+            let shared_session = shared_session.as_ref();
+            async move {
+                read_metadata_inner(
+                    &uri,
+                    io_client,
+                    io_stats,
+                    read_options,
+                    Phase::PlanningMetadata,
+                    convert_schema,
+                    shared_session,
+                )
+                .await
+            }
         })
         .buffered(max_concurrent_files)
         .try_collect()
@@ -368,6 +479,62 @@ pub async fn read_vortex_metadata_bulk_cached(
     max_concurrent_files: usize,
     max_snapshot_bytes: usize,
 ) -> DaftResult<Vec<VortexMetadataWithSnapshot>> {
+    Ok(read_metadata_bulk_cached_inner(
+        uris,
+        io_client,
+        io_stats,
+        read_options,
+        max_concurrent_files,
+        max_snapshot_bytes,
+        true,
+    )
+    .await?
+    .into_iter()
+    .map(|(schema, rows, snapshot)| {
+        (
+            schema.expect("schema conversion was requested"),
+            rows,
+            snapshot,
+        )
+    })
+    .collect())
+}
+
+#[cfg(any(feature = "python", test))]
+pub(crate) async fn read_vortex_row_counts_bulk_cached(
+    uris: &[String],
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+    max_concurrent_files: usize,
+    max_snapshot_bytes: usize,
+) -> DaftResult<Vec<(u64, Option<Vec<u8>>)>> {
+    Ok(read_metadata_bulk_cached_inner(
+        uris,
+        io_client,
+        io_stats,
+        read_options,
+        max_concurrent_files,
+        max_snapshot_bytes,
+        false,
+    )
+    .await?
+    .into_iter()
+    .map(|(_, rows, snapshot)| (rows, snapshot))
+    .collect())
+}
+
+type OptionalMetadataWithSnapshot = (Option<SchemaRef>, u64, Option<Vec<u8>>);
+
+async fn read_metadata_bulk_cached_inner(
+    uris: &[String],
+    io_client: Arc<IOClient>,
+    io_stats: IOStatsRef,
+    read_options: VortexReadOptions,
+    max_concurrent_files: usize,
+    max_snapshot_bytes: usize,
+    convert_schema: bool,
+) -> DaftResult<Vec<OptionalMetadataWithSnapshot>> {
     validate_options(&read_options)?;
     if !(1..=MAX_CONCURRENT_METADATA_FILES).contains(&max_concurrent_files)
         || max_snapshot_bytes > MAX_SNAPSHOT_BYTES
@@ -378,7 +545,9 @@ pub async fn read_vortex_metadata_bulk_cached(
         ));
     }
     let budget = Arc::new(Budget::new(max_snapshot_bytes));
+    let shared_session = (!convert_schema).then(OnceLock::new);
     let reads = futures::stream::iter(uris.iter().cloned()).map(|uri| {
+        let shared_session = shared_session.as_ref();
         let (client, stats, options, budget) = (
             io_client.clone(),
             io_stats.clone(),
@@ -392,7 +561,7 @@ pub async fn read_vortex_metadata_bulk_cached(
             let phase = Phase::PlanningMetadata;
             let trace = diagnostics::begin(phase, "open", Some(&uri));
             let result: DaftResult<_> = async {
-                let session = VortexSession::default().with_tokio();
+                let session = session_for_open(phase, &uri, shared_session);
                 let reader = Arc::new(
                     DaftReadAt::new_for_snapshot(
                         uri.clone(),
@@ -404,14 +573,27 @@ pub async fn read_vortex_metadata_bulk_cached(
                     )
                     .await?,
                 );
+                let sdk_trace = diagnostics::begin(phase, "sdk_open", Some(&uri));
                 let file = session
                     .open_options()
                     .with_initial_read_size(options.max_in_flight_bytes.min(65535))
                     .open(reader.clone())
                     .await
-                    .map_err(|error| read_error(&uri, "open", error))?;
-                let schema = schemas(&uri, &session, file.dtype())?.1;
-                let snapshot = reader.take_snapshot(max_snapshot_bytes)?;
+                    .map_err(|error| read_error(&uri, "open", error));
+                diagnostics::complete(sdk_trace, file.is_err());
+                let file = file?;
+                let schema = if convert_schema {
+                    let schema_trace = diagnostics::begin(phase, "schema_conversion", Some(&uri));
+                    let schema = schemas(&uri, &session, file.dtype());
+                    diagnostics::complete(schema_trace, schema.is_err());
+                    Some(schema?.1)
+                } else {
+                    None
+                };
+                let snapshot_trace = diagnostics::begin(phase, "snapshot_encode", Some(&uri));
+                let snapshot = reader.take_snapshot(max_snapshot_bytes);
+                diagnostics::complete(snapshot_trace, snapshot.is_err());
+                let snapshot = snapshot?;
                 Ok((schema, file.row_count(), snapshot))
             }
             .await;
@@ -469,6 +651,7 @@ pub async fn stream_vortex(
         io_stats,
         &read_options,
         Phase::ExecutionOpen,
+        None,
     )
     .await?;
     stream_opened_vortex(
@@ -491,37 +674,54 @@ fn stream_opened_vortex(
     convert_options: VortexConvertOptions,
     first_batch: Option<diagnostics::Span>,
 ) -> DaftResult<BoxStream<'static, DaftResult<RecordBatch>>> {
-    let (arrow_schema, actual_schema) = schemas(uri, &session, file.dtype())?;
-    validate_schema(uri, &convert_options.schema, &actual_schema)?;
+    let trace = diagnostics::begin(Phase::ExecutionOpen, "schema_conversion", Some(uri));
+    let schema = schemas(uri, &session, file.dtype());
+    diagnostics::complete(trace, schema.is_err());
+    let (arrow_schema, actual_schema) = schema?;
+    let trace = diagnostics::begin(Phase::ExecutionOpen, "schema_validation", Some(uri));
+    let valid = validate_schema(uri, &convert_options.schema, &actual_schema);
+    diagnostics::complete(trace, valid.is_err());
+    valid?;
+    let trace = diagnostics::begin(Phase::ExecutionOpen, "scan_planning", Some(uri));
     let plan = plan_scan(
         &actual_schema,
         file.dtype(),
         &read_options,
         &convert_options,
     )
-    .map_err(|error| read_error(uri, "scan planning", error))?;
-    let arrow_schema = Arc::new(
-        arrow_schema
-            .project(&plan.physical_indices)
-            .map_err(|error| read_error(uri, "physical Arrow schema", error))?,
-    );
-    // Even limit=0 validates the full schema, including projected-away fields.
-    if convert_options.limit == Some(0) {
+    .map_err(|error| read_error(uri, "scan planning", error));
+    diagnostics::complete(trace, plan.is_err());
+    let plan = plan?;
+    let trace = diagnostics::begin(Phase::ExecutionOpen, "stream_preparation", Some(uri));
+    let prepared = (|| -> DaftResult<_> {
+        let arrow_schema = Arc::new(
+            arrow_schema
+                .project(&plan.physical_indices)
+                .map_err(|error| read_error(uri, "physical Arrow schema", error))?,
+        );
+        // Even limit=0 validates the full schema, including projected-away fields.
+        if convert_options.limit == Some(0) {
+            return Ok(None);
+        }
+        let error_uri = uri.to_string();
+        let batches = file
+            .scan()
+            .map_err(|error| read_error(uri, "scan preparation", error))?
+            .with_projection(plan.projection)
+            .with_some_filter(plan.pushed_filter)
+            .with_split_by(SplitBy::RowCount(read_options.batch_size))
+            // Vortex interprets this per Vortex worker, not as a global I/O bound.
+            .with_concurrency(1)
+            .into_record_batch_stream(arrow_schema)
+            .map_err(|error| read_error(uri, "Arrow stream preparation", error))?
+            .map_err(move |error| read_error(&error_uri, "decode", error))
+            .boxed();
+        Ok(Some(batches))
+    })();
+    diagnostics::complete(trace, prepared.is_err());
+    let Some(batches) = prepared? else {
         return Ok(futures::stream::empty().boxed());
-    }
-    let error_uri = uri.to_string();
-    let batches = file
-        .scan()
-        .map_err(|error| read_error(uri, "scan preparation", error))?
-        .with_projection(plan.projection)
-        .with_some_filter(plan.pushed_filter)
-        .with_split_by(SplitBy::RowCount(read_options.batch_size))
-        // Vortex interprets this per Vortex worker, not as a global I/O bound.
-        .with_concurrency(1)
-        .into_record_batch_stream(arrow_schema)
-        .map_err(|error| read_error(uri, "Arrow stream preparation", error))?
-        .map_err(move |error| read_error(&error_uri, "decode", error))
-        .boxed();
+    };
     let state = ScanState {
         batches: Some(batches),
         reader: Some((session, file)),
@@ -537,9 +737,13 @@ fn stream_opened_vortex(
                 return Ok(None);
             };
             // Awaiting the next batch includes remote I/O and decode work.
-            let trace = diagnostics::begin(Phase::Execution, "batch_wait_decode", Some(&state.uri));
-            let decoded = source.try_next().await;
-            diagnostics::complete(trace, decoded.is_err());
+            let decoded = diagnostics::measure_async(
+                Phase::Execution,
+                "batch_wait_decode",
+                Some(&state.uri),
+                source.try_next(),
+            )
+            .await;
             let Some(arrow) = decoded? else {
                 return Ok(None);
             };

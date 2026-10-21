@@ -129,12 +129,17 @@ def test_discovery_metrics_are_opt_in(monkeypatch, active):
     assert recorded == ([({"num_inputs": 1}, capture_token)] if active else [])
 
 
-def test_discovery_metrics_stay_with_original_capture(monkeypatch):
+@pytest.mark.parametrize("shared_clock", [False, True])
+def test_discovery_metrics_stay_with_original_capture(monkeypatch, shared_clock):
     path = "https://host/data.vortex"
     completed = []
     monkeypatch.setattr(_vortex_diagnostics, "_capture", None)
     monkeypatch.setattr(native, "_vortex_diagnostics_start", lambda: None, raising=False)
-    monkeypatch.setattr(native, "_vortex_diagnostics_finish", lambda: {"events": []}, raising=False)
+    monkeypatch.setattr(native, "_vortex_diagnostics_finish", lambda: {"events": [], "elapsed_ns": 1000}, raising=False)
+    if shared_clock:
+        monkeypatch.setattr(native, "_vortex_diagnostics_clock", lambda: 100, raising=False)
+    else:
+        monkeypatch.delattr(native, "_vortex_diagnostics_clock", raising=False)
 
     def bulk(inputs, **kwargs):
         assert kwargs["collect_metrics"] is True

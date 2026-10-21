@@ -26,3 +26,11 @@
 
 - Titles: Conventional Commits format; enforced by `.github/workflows/pr-labeller.yml`.
 - Descriptions: follow `.github/pull_request_template.md`.
+
+# Vortex Performance Results
+
+Maintain `docs/contributing/parquet-vs-vortex.md` as the single current
+Parquet/Vortex comparison whenever a performance evaluation completes. Follow
+its update rules: verify saved evidence, include regressions, and keep different
+builds, process modes and concurrency settings separate. Link this comparison
+from new evaluation documentation instead of creating another current summary.

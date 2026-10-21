@@ -14,6 +14,7 @@ use futures::FutureExt;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 pub mod joinset;
+pub mod query_profile;
 
 #[cfg(feature = "python")]
 pub mod python;

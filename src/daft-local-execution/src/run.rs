@@ -13,7 +13,10 @@ use common_daft_config::DaftExecutionConfig;
 use common_display::{DisplayLevel, mermaid::MermaidDisplayOptions};
 use common_error::DaftResult;
 use common_metrics::{QueryEndState, QueryID};
-use common_runtime::RuntimeTask;
+use common_runtime::{
+    RuntimeTask,
+    query_profile::{self, Phase},
+};
 use common_tracing::flush_opentelemetry_providers;
 use daft_context::{
     DaftContext, Subscriber,
@@ -478,7 +481,10 @@ async fn run_execution_loop(
     let memory_manager = get_or_init_memory_manager();
     let mut runtime_handle =
         ExecutionRuntimeContext::new(memory_manager.clone(), stats_manager_handle);
-    let mut output_receiver = pipeline.start(maintain_order, &mut runtime_handle)?;
+    let trace = query_profile::begin(Phase::Engine, "pipeline_start", None);
+    let output = pipeline.start(maintain_order, &mut runtime_handle);
+    query_profile::complete(trace, output.is_err());
+    let mut output_receiver = output?;
 
     let mut message_router = MessageRouter::new();
     let mut input_senders = Some(input_senders);
@@ -550,6 +556,7 @@ async fn run_execution_loop(
     drop(message_router);
     drop(output_receiver);
     drop(input_senders);
+    let trace = query_profile::begin(Phase::Engine, "worker_shutdown", None);
     let (result, finish_status) = finish_runtime_tasks(
         &mut runtime_handle,
         &cancel,
@@ -558,8 +565,11 @@ async fn run_execution_loop(
         finish_status,
     )
     .await;
+    query_profile::complete(trace, result.is_err());
+    let trace = query_profile::begin(Phase::Engine, "stats_finalize", None);
     stats_manager.finish(finish_status).await;
     flush_opentelemetry_providers();
+    query_profile::complete(trace, false);
     result
 }
 
@@ -727,8 +737,11 @@ impl NativeExecutor {
                     .as_ref()
                     .map(|server| (server.clone(), shuffle_address.unwrap())),
             );
-            let (pipeline, input_senders) =
-                translate_physical_plan_to_pipeline(local_physical_plan, &exec_cfg, &ctx)?;
+            let trace = query_profile::begin(Phase::Engine, "pipeline_translation", None);
+            let translated =
+                translate_physical_plan_to_pipeline(local_physical_plan, &exec_cfg, &ctx);
+            query_profile::complete(trace, translated.is_err());
+            let (pipeline, input_senders) = translated?;
 
             let handle = get_global_runtime();
             let stats_manager = RuntimeStatsManager::try_new(

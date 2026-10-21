@@ -13,7 +13,10 @@ use chunk_source::{
     ChunkSource, ChunkSourceBuilder, LocalChunkSource, open_local_file, prepare_remote_chunk_source,
 };
 use common_error::DaftResult;
-use common_runtime::{JoinSet, get_compute_runtime};
+use common_runtime::{
+    JoinSet, get_compute_runtime,
+    query_profile::{self as profile, Phase},
+};
 use daft_core::prelude::*;
 use daft_dsl::{ExprRef, expr::bound_expr::BoundExpr, optimization::get_required_columns};
 use daft_recordbatch::RecordBatch;
@@ -70,31 +73,35 @@ async fn open_chunk_source(
     source: &ParquetSource<'_>,
     opts: &ParquetReadOptions,
 ) -> crate::Result<(ChunkSourceBuilder, ArrowReaderMetadata)> {
-    match source {
-        ParquetSource::Local { path } => {
-            let (file, file_len, arrow_metadata) = open_local_file(path).await?;
-            let cs = LocalChunkSource {
-                path: Arc::from(*path),
-                file,
-                file_len,
-                metadata: arrow_metadata.metadata().clone(),
-            };
-            Ok((ChunkSourceBuilder::Local(cs), arrow_metadata))
-        }
-        ParquetSource::Url {
-            uri,
-            io_client,
-            io_stats,
-        } => {
-            Box::pin(prepare_remote_chunk_source(
+    let trace = profile::begin(Phase::Parquet, "open_metadata", Some(source.label()));
+    profile::measure_future(trace, async {
+        match source {
+            ParquetSource::Local { path } => {
+                let (file, file_len, arrow_metadata) = open_local_file(path).await?;
+                let cs = LocalChunkSource {
+                    path: Arc::from(*path),
+                    file,
+                    file_len,
+                    metadata: arrow_metadata.metadata().clone(),
+                };
+                Ok((ChunkSourceBuilder::Local(cs), arrow_metadata))
+            }
+            ParquetSource::Url {
                 uri,
-                io_client.clone(),
-                io_stats.clone(),
-                opts,
-            ))
-            .await
+                io_client,
+                io_stats,
+            } => {
+                Box::pin(prepare_remote_chunk_source(
+                    uri,
+                    io_client.clone(),
+                    io_stats.clone(),
+                    opts,
+                ))
+                .await
+            }
         }
-    }
+    })
+    .await
 }
 
 struct PreparedMetadata {
@@ -108,26 +115,28 @@ fn prepare_metadata(
     opts: ParquetSchemaInferenceOptions,
     path: &str,
 ) -> crate::Result<PreparedMetadata> {
-    let mut parquet_metadata = arrow_metadata.metadata().clone();
-    if let Some(mapping) = field_id_mapping {
-        parquet_metadata =
-            apply_field_ids_to_arrowrs_parquet_metadata(parquet_metadata, mapping, path)?;
-    }
-    let raw_encoding = opts.string_encoding == StringEncoding::Raw;
-    if raw_encoding {
-        parquet_metadata = strip_string_types_from_parquet_metadata(parquet_metadata, path)?;
-    }
-    let arrow_schema = crate::schema_inference::infer_schema_from_parquet_metadata_arrowrs(
-        &parquet_metadata,
-        Some(opts.coerce_int96_timestamp_unit),
-        raw_encoding,
-    )
-    .with_context(|_| ArrowSnafu {
-        path: path.to_string(),
-    })?;
-    Ok(PreparedMetadata {
-        parquet_metadata,
-        arrow_schema: Arc::new(arrow_schema),
+    profile::measure(Phase::Parquet, "schema_conversion", Some(path), || {
+        let mut parquet_metadata = arrow_metadata.metadata().clone();
+        if let Some(mapping) = field_id_mapping {
+            parquet_metadata =
+                apply_field_ids_to_arrowrs_parquet_metadata(parquet_metadata, mapping, path)?;
+        }
+        let raw_encoding = opts.string_encoding == StringEncoding::Raw;
+        if raw_encoding {
+            parquet_metadata = strip_string_types_from_parquet_metadata(parquet_metadata, path)?;
+        }
+        let arrow_schema = crate::schema_inference::infer_schema_from_parquet_metadata_arrowrs(
+            &parquet_metadata,
+            Some(opts.coerce_int96_timestamp_unit),
+            raw_encoding,
+        )
+        .with_context(|_| ArrowSnafu {
+            path: path.to_string(),
+        })?;
+        Ok(PreparedMetadata {
+            parquet_metadata,
+            arrow_schema: Arc::new(arrow_schema),
+        })
     })
 }
 
@@ -151,71 +160,73 @@ fn resolve_column_plan(
     prepared: &PreparedMetadata,
     opts: &ParquetReadOptions,
 ) -> DaftResult<ColumnPlan> {
-    let daft_schema = Schema::try_from(prepared.arrow_schema.as_ref())?;
-    let user_cols = opts.columns.as_deref();
+    profile::measure(Phase::Parquet, "column_plan", None, || {
+        let daft_schema = Schema::try_from(prepared.arrow_schema.as_ref())?;
+        let user_cols = opts.columns.as_deref();
 
-    let mut read_col_names: HashSet<String> = match user_cols {
-        Some(cols) => cols.iter().cloned().collect(),
-        None => daft_schema.field_names().map(str::to_string).collect(),
-    };
+        let mut read_col_names: HashSet<String> = match user_cols {
+            Some(cols) => cols.iter().cloned().collect(),
+            None => daft_schema.field_names().map(str::to_string).collect(),
+        };
 
-    let (pred_cols, predicate_pushed) = match opts.predicate.as_ref() {
-        Some(pred) => match predicate_pushable_cols(pred, &daft_schema) {
-            Some(cols) => (Some(cols), true),
-            None => {
-                let extra: HashSet<String> = get_required_columns(pred)
-                    .into_iter()
-                    .filter(|c| daft_schema.get_field(c).is_ok())
-                    .collect();
-                (Some(extra), false)
-            }
-        },
-        None => (None, false),
-    };
+        let (pred_cols, predicate_pushed) = match opts.predicate.as_ref() {
+            Some(pred) => match predicate_pushable_cols(pred, &daft_schema) {
+                Some(cols) => (Some(cols), true),
+                None => {
+                    let extra: HashSet<String> = get_required_columns(pred)
+                        .into_iter()
+                        .filter(|c| daft_schema.get_field(c).is_ok())
+                        .collect();
+                    (Some(extra), false)
+                }
+            },
+            None => (None, false),
+        };
 
-    if let Some(filter_cols) = &pred_cols {
-        read_col_names.extend(filter_cols.iter().cloned());
-    }
+        if let Some(filter_cols) = &pred_cols {
+            read_col_names.extend(filter_cols.iter().cloned());
+        }
 
-    let read_daft_schema = project_schema(&daft_schema, &read_col_names);
-    let return_daft_schema = match user_cols {
-        Some(cols) => Arc::new(project_schema(
-            &daft_schema,
-            &cols.iter().cloned().collect(),
-        )),
-        None => Arc::new(daft_schema),
-    };
+        let read_daft_schema = project_schema(&daft_schema, &read_col_names);
+        let return_daft_schema = match user_cols {
+            Some(cols) => Arc::new(project_schema(
+                &daft_schema,
+                &cols.iter().cloned().collect(),
+            )),
+            None => Arc::new(daft_schema),
+        };
 
-    let arrow_fields = prepared.arrow_schema.fields();
-    let read_col_indices: Vec<usize> = arrow_fields
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| read_col_names.contains(f.name()))
-        .map(|(i, _)| i)
-        .collect();
-
-    let (pred_col_indices, data_col_indices): (Vec<usize>, Vec<usize>) = if predicate_pushed {
-        let pred_set: HashSet<&str> = pred_cols
-            .as_ref()
-            .unwrap()
+        let arrow_fields = prepared.arrow_schema.fields();
+        let read_col_indices: Vec<usize> = arrow_fields
             .iter()
-            .map(String::as_str)
+            .enumerate()
+            .filter(|(_, f)| read_col_names.contains(f.name()))
+            .map(|(i, _)| i)
             .collect();
-        read_col_indices
-            .iter()
-            .copied()
-            .partition(|&i| pred_set.contains(arrow_fields[i].name().as_str()))
-    } else {
-        (Vec::new(), read_col_indices.clone())
-    };
 
-    Ok(ColumnPlan {
-        read_col_indices,
-        pred_col_indices,
-        data_col_indices,
-        predicate_pushed,
-        return_daft_schema,
-        read_daft_schema,
+        let (pred_col_indices, data_col_indices): (Vec<usize>, Vec<usize>) = if predicate_pushed {
+            let pred_set: HashSet<&str> = pred_cols
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(String::as_str)
+                .collect();
+            read_col_indices
+                .iter()
+                .copied()
+                .partition(|&i| pred_set.contains(arrow_fields[i].name().as_str()))
+        } else {
+            (Vec::new(), read_col_indices.clone())
+        };
+
+        Ok(ColumnPlan {
+            read_col_indices,
+            pred_col_indices,
+            data_col_indices,
+            predicate_pushed,
+            return_daft_schema,
+            read_daft_schema,
+        })
     })
 }
 
@@ -575,74 +586,79 @@ pub async fn stream_parquet(
     source: ParquetSource<'_>,
     opts: &ParquetReadOptions,
 ) -> DaftResult<(Arc<Schema>, BoxStream<'static, DaftResult<RecordBatch>>)> {
-    let (cs_builder, arrow_metadata) = open_chunk_source(&source, opts).await?;
-    let path = cs_builder.path().clone();
+    let trace = profile::begin(Phase::Parquet, "scan_prepare", Some(source.label()));
+    profile::measure_future(trace, async {
+        let (cs_builder, arrow_metadata) = open_chunk_source(&source, opts).await?;
+        let path = cs_builder.path().clone();
 
-    let chunk_size = opts.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
-    let prepared = prepare_metadata(
-        arrow_metadata,
-        opts.field_id_mapping.as_ref(),
-        opts.schema_infer,
-        &path,
-    )?;
-    let plan = resolve_column_plan(&prepared, opts)?;
+        let chunk_size = opts.batch_size.unwrap_or(DEFAULT_BATCH_SIZE).max(1);
+        let prepared = prepare_metadata(
+            arrow_metadata,
+            opts.field_id_mapping.as_ref(),
+            opts.schema_infer,
+            &path,
+        )?;
+        let plan = resolve_column_plan(&prepared, opts)?;
 
-    // Single RG-level pruning pass: user row_groups + positional (start_offset,
-    // num_rows) + predicate stats. Must run before `cs_builder.build`, which is
-    // what spawns remote byte fetches.
-    let rg_indices = prune_row_groups(
-        &prepared.parquet_metadata,
-        opts.row_groups.as_deref(),
-        opts.start_offset.unwrap_or(0),
-        opts.num_rows,
-        opts.predicate.as_ref(),
-        &plan.read_daft_schema,
-        source.label(),
-    )?;
-    if rg_indices.is_empty() {
-        // Empty stream — NOT a single empty batch. Downstream sinks
-        // (e.g. iceberg writer) treat any received batch as "there's
-        // something to write" and emit metadata for it; a 0-row batch
-        // would still land an empty snapshot.
-        return Ok((
-            plan.return_daft_schema.clone(),
-            futures::stream::empty().boxed(),
-        ));
-    }
-    if plan.read_col_indices.is_empty() {
-        return count_only_stream(
+        // Single RG-level pruning pass: user row_groups + positional (start_offset,
+        // num_rows) + predicate stats. Must run before `cs_builder.build`, which is
+        // what spawns remote byte fetches.
+        let rg_indices = prune_row_groups(
             &prepared.parquet_metadata,
-            &rg_indices,
+            opts.row_groups.as_deref(),
+            opts.start_offset.unwrap_or(0),
             opts.num_rows,
-            plan.return_daft_schema,
-        );
-    }
+            opts.predicate.as_ref(),
+            &plan.read_daft_schema,
+            source.label(),
+        )?;
+        if rg_indices.is_empty() {
+            // Empty stream — NOT a single empty batch. Downstream sinks
+            // (e.g. iceberg writer) treat any received batch as "there's
+            // something to write" and emit metadata for it; a 0-row batch
+            // would still land an empty snapshot.
+            return Ok((
+                plan.return_daft_schema.clone(),
+                futures::stream::empty().boxed(),
+            ));
+        }
+        if plan.read_col_indices.is_empty() {
+            return count_only_stream(
+                &prepared.parquet_metadata,
+                &rg_indices,
+                opts.num_rows,
+                plan.return_daft_schema,
+            );
+        }
 
-    // Now spawn the byte-range fetches (remote) — pruned set only.
-    let chunk_source = Arc::new(cs_builder.build(prepared.parquet_metadata.clone(), &rg_indices));
+        // Now spawn the byte-range fetches (remote) — pruned set only.
+        let chunk_source =
+            Arc::new(cs_builder.build(prepared.parquet_metadata.clone(), &rg_indices));
 
-    let rg_inputs = build_rg_inputs(
-        &chunk_source,
-        &prepared.parquet_metadata,
-        &prepared.arrow_schema,
-        &rg_indices,
-        &plan,
-        opts,
-        &path,
-    )
-    .await?;
+        let rg_inputs = build_rg_inputs(
+            &chunk_source,
+            &prepared.parquet_metadata,
+            &prepared.arrow_schema,
+            &rg_indices,
+            &plan,
+            opts,
+            &path,
+        )
+        .await?;
 
-    let return_schema = plan.return_daft_schema.clone();
-    let ctx = Arc::new(RgTaskCtx {
-        path,
-        chunk_source,
-        metadata: prepared.parquet_metadata,
-        arrow_schema: prepared.arrow_schema,
-        plan,
-        predicate: opts.predicate.clone(),
-        chunk_size,
-    });
-    let stream = build_rg_stream(ctx, rg_indices, rg_inputs);
+        let return_schema = plan.return_daft_schema.clone();
+        let ctx = Arc::new(RgTaskCtx {
+            path,
+            chunk_source,
+            metadata: prepared.parquet_metadata,
+            arrow_schema: prepared.arrow_schema,
+            plan,
+            predicate: opts.predicate.clone(),
+            chunk_size,
+        });
+        let stream = build_rg_stream(ctx, rg_indices, rg_inputs);
 
-    Ok((return_schema, apply_cross_rg_limit(stream, opts.num_rows)))
+        Ok((return_schema, apply_cross_rg_limit(stream, opts.num_rows)))
+    })
+    .await
 }

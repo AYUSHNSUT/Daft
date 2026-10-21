@@ -305,6 +305,28 @@ async fn bulk_footer_metadata_preserves_order_duplicates_and_refreshes_counts() 
             metadata.iter().map(|(_, rows)| *rows).collect::<Vec<_>>(),
             [10, 3, 0, 10]
         );
+        let counts = crate::read::read_vortex_row_counts_bulk(
+            &uris,
+            client.clone(),
+            daft_io::IOStatsContext::new("Vortex row count parity test"),
+            VortexReadOptions::default(),
+            max_concurrent_files,
+        )
+        .await?;
+        assert_eq!(counts, [10, 3, 0, 10]);
+        let cached_counts = crate::read::read_vortex_row_counts_bulk_cached(
+            &uris,
+            client.clone(),
+            daft_io::IOStatsContext::new("Vortex cached row count parity test"),
+            VortexReadOptions::default(),
+            max_concurrent_files,
+            crate::snapshot::MAX_SNAPSHOT_BYTES,
+        )
+        .await?;
+        assert_eq!(
+            cached_counts,
+            vec![(10, None), (3, None), (0, None), (10, None)]
+        );
         assert!(stats.load_get_requests() >= uris.len());
         assert!(stats.load_bytes_read() > 0);
         assert_eq!(stats.load_list_requests(), 0);
@@ -325,7 +347,7 @@ async fn bulk_footer_metadata_preserves_order_duplicates_and_refreshes_counts() 
     std::fs::copy(replacement.path(), files[0].path())?;
     let refreshed = crate::read_vortex_metadata_bulk(
         &uris,
-        client,
+        client.clone(),
         daft_io::IOStatsContext::new("Vortex bulk metadata refresh test"),
         VortexReadOptions::default(),
         2,
@@ -333,6 +355,17 @@ async fn bulk_footer_metadata_preserves_order_duplicates_and_refreshes_counts() 
     .await?;
     assert_eq!(
         refreshed.iter().map(|(_, rows)| *rows).collect::<Vec<_>>(),
+        [10, 7, 0, 10]
+    );
+    assert_eq!(
+        crate::read::read_vortex_row_counts_bulk(
+            &uris,
+            client,
+            daft_io::IOStatsContext::new("Vortex row count refresh test"),
+            VortexReadOptions::default(),
+            2,
+        )
+        .await?,
         [10, 7, 0, 10]
     );
     Ok(())

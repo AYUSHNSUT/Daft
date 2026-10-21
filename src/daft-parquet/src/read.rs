@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use arrow::array::ArrayRef;
 use common_error::DaftResult;
-use common_runtime::{OrderedJoinSet, get_io_runtime};
+use common_runtime::{
+    OrderedJoinSet, get_io_runtime,
+    query_profile::{self as profile, Phase},
+};
 use daft_core::prelude::*;
 #[cfg(feature = "python")]
 use daft_core::python::PyTimeUnit;
@@ -456,18 +459,27 @@ pub async fn read_parquet_schema_and_metadata(
     schema_inference_options: ParquetSchemaInferenceOptions,
     field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
 ) -> DaftResult<(Schema, DaftParquetMetadata)> {
-    let metadata = crate::metadata::read_parquet_metadata(
-        uri,
-        None,
-        io_client,
-        io_stats,
-        field_id_mapping,
-        None,
-    )
-    .await?;
-    let adapter = DaftParquetMetadata::from_arrowrs(metadata);
-    let schema = infer_schema_from_daft_metadata(&adapter, schema_inference_options)?;
-    Ok((schema, adapter))
+    let trace = profile::begin(Phase::Parquet, "source_schema_inference", Some(uri));
+    profile::measure_future(trace, async {
+        let metadata = crate::metadata::read_parquet_metadata(
+            uri,
+            None,
+            io_client,
+            io_stats,
+            field_id_mapping,
+            None,
+        )
+        .await?;
+        let adapter = DaftParquetMetadata::from_arrowrs(metadata);
+        let schema = profile::measure(
+            Phase::Parquet,
+            "initial_schema_conversion",
+            Some(uri),
+            || infer_schema_from_daft_metadata(&adapter, schema_inference_options),
+        )?;
+        Ok((schema, adapter))
+    })
+    .await
 }
 
 pub async fn read_parquet_metadata(

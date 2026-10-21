@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow::{array::ArrayRef, datatypes::Field as ArrowField};
+use common_runtime::query_profile::{self as profile, Phase};
 use parquet::{
     arrow::{
         array_reader::{
@@ -730,15 +731,27 @@ pub(super) async fn decode_one_streaming(
     path: Arc<str>,
     sender: tokio::sync::mpsc::Sender<common_error::DaftResult<ArrayRef>>,
 ) {
+    // Row selections can contain hundreds of thousands of tiny skip/read runs.
+    // Keep one real decoder-lifetime envelope and two accumulated work counters,
+    // instead of filling the bounded query trace with one event per selector.
+    let mut work = profile::AccumulatedSpan::new(
+        Phase::Parquet,
+        "column_decoder_work",
+        Some(&path),
+        ["column_decode", "column_skip"],
+    );
     let result: ParquetResult<()> = async {
-        let (mut reader, total_rows) = build_top_field_reader(
-            chunks.as_ref(),
-            &metadata,
-            rg_idx,
-            top_field_idx,
-            &arrow_field,
-            chunk_size,
-        )?;
+        let (mut reader, total_rows) =
+            profile::measure(Phase::Parquet, "column_decoder_build", Some(&path), || {
+                build_top_field_reader(
+                    chunks.as_ref(),
+                    &metadata,
+                    rg_idx,
+                    top_field_idx,
+                    &arrow_field,
+                    chunk_size,
+                )
+            })?;
 
         use parquet::arrow::arrow_reader::RowSelector;
         let selectors: Vec<RowSelector> = match &selection {
@@ -749,19 +762,30 @@ pub(super) async fn decode_one_streaming(
         let mut acc = 0usize;
         for sel in selectors {
             if sel.skip {
-                reader.skip_records(sel.row_count)?;
+                work.measure(1, || reader.skip_records(sel.row_count))?;
                 continue;
             }
             let mut remaining = sel.row_count;
             while remaining > 0 {
                 let room = chunk_size - acc;
                 let take = remaining.min(room);
-                reader.read_records(take)?;
+                work.measure(0, || reader.read_records(take))?;
                 acc += take;
                 remaining -= take;
                 if acc == chunk_size {
-                    let arr = reader.consume_batch()?;
-                    if sender.send(Ok(arr)).await.is_err() {
+                    let arr =
+                        profile::measure(Phase::Parquet, "column_consume", Some(&path), || {
+                            reader.consume_batch()
+                        })?;
+                    if profile::measure_async(
+                        Phase::Parquet,
+                        "column_backpressure",
+                        Some(&path),
+                        sender.send(Ok(arr)),
+                    )
+                    .await
+                    .is_err()
+                    {
                         return Ok(());
                     }
                     acc = 0;
@@ -769,12 +793,21 @@ pub(super) async fn decode_one_streaming(
             }
         }
         if acc > 0 {
-            let arr = reader.consume_batch()?;
-            let _ = sender.send(Ok(arr)).await;
+            let arr = profile::measure(Phase::Parquet, "column_consume", Some(&path), || {
+                reader.consume_batch()
+            })?;
+            let _ = profile::measure_async(
+                Phase::Parquet,
+                "column_backpressure",
+                Some(&path),
+                sender.send(Ok(arr)),
+            )
+            .await;
         }
         Ok(())
     }
     .await;
+    work.finish(result.is_err());
 
     if let Err(e) = result {
         let wrapped: crate::Error = Err::<(), _>(e)
@@ -783,5 +816,123 @@ pub(super) async fn decode_one_streaming(
             })
             .unwrap_err();
         let _ = sender.send(Err(wrapped.into())).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::{
+        array::{Int32Array, RecordBatch},
+        datatypes::{DataType, Schema},
+    };
+    use parquet::arrow::{ArrowWriter, arrow_reader::RowSelector};
+
+    use super::*;
+    use crate::reader::chunk_source::{ChunkSource, LocalChunkSource, open_local_file};
+
+    #[tokio::test]
+    async fn fragmented_selection_profiles_decode_work_without_event_flood() {
+        // One read and one skip per pair used to emit >MAX_EVENTS records.
+        let pairs = profile::MAX_EVENTS / 2 + 1;
+        let rows = i32::try_from(pairs * 2).unwrap();
+        let field = ArrowField::new("id", DataType::Int32, false);
+        let schema = Arc::new(Schema::new(vec![field.clone()]));
+        let file_path = std::env::temp_dir().join(format!(
+            "daft-fragmented-profile-{}.parquet",
+            fastrand::u64(..)
+        ));
+        let file = std::fs::File::create(&file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).unwrap();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from_iter_values(0..rows))],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let path: Arc<str> = file_path.to_str().unwrap().into();
+        let (file, file_len, arrow_metadata) = open_local_file(&path).await.unwrap();
+        let metadata = arrow_metadata.metadata().clone();
+        let chunks = ChunkSource::Local(LocalChunkSource {
+            path: path.clone(),
+            file,
+            file_len,
+            metadata: metadata.clone(),
+        })
+        .read_rg_chunks(0, Arc::from([0]))
+        .await
+        .unwrap();
+        let selection = RowSelection::from(
+            (0..pairs)
+                .flat_map(|_| [RowSelector::select(1), RowSelector::skip(1)])
+                .collect::<Vec<_>>(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        profile::start().unwrap();
+        profile::complete(
+            profile::begin(Phase::Parquet, "fragmented_decoder_fixture", Some(&path)),
+            false,
+        );
+        decode_one_streaming(
+            Arc::new(chunks),
+            metadata,
+            0,
+            0,
+            field,
+            Some(selection),
+            4096,
+            path,
+            tx,
+        )
+        .await;
+        let snapshot = profile::finish().unwrap();
+        assert_eq!(snapshot.dropped_events, 0);
+        assert_eq!(snapshot.unfinished_events, 0);
+        let mut actual = Vec::new();
+        while let Some(array) = rx.recv().await {
+            let array = array.unwrap();
+            actual.extend_from_slice(
+                array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values(),
+            );
+        }
+        assert_eq!(actual, (0..rows).step_by(2).collect::<Vec<_>>());
+        let file_id = snapshot
+            .events
+            .iter()
+            .find(|event| event.operation == "fragmented_decoder_fixture")
+            .unwrap()
+            .file_id;
+        let events = snapshot
+            .events
+            .iter()
+            .filter(|event| event.file_id == file_id)
+            .collect::<Vec<_>>();
+        assert!(events.len() < 32);
+        assert!(events.iter().all(|event| !event.error && !event.cancelled));
+        let work = events
+            .iter()
+            .find(|event| event.operation == "column_decoder_work")
+            .unwrap();
+        assert_eq!(work.accumulated_work.len(), 2);
+        for (counter, operation) in work
+            .accumulated_work
+            .iter()
+            .zip(["column_decode", "column_skip"])
+        {
+            assert_eq!(counter.operation, operation);
+            assert_eq!(counter.calls, pairs as u64);
+        }
+        assert!(
+            work.accumulated_work
+                .iter()
+                .map(|counter| counter.wall_ns)
+                .sum::<u64>()
+                <= work.duration_ns
+        );
+        std::fs::remove_file(file_path).unwrap();
     }
 }

@@ -25,7 +25,10 @@ use std::{
 
 use arc_swap::ArcSwap;
 use common_error::{DaftError, DaftResult};
-use common_runtime::{JoinSet, RuntimeRef, RuntimeTask};
+use common_runtime::{
+    JoinSet, RuntimeRef, RuntimeTask,
+    query_profile::{self, Phase},
+};
 use console::style;
 use resource_manager::MemoryManager;
 pub use run::ExecutionEngineResult;
@@ -189,9 +192,23 @@ impl ExecutionTaskSpawner {
     {
         let outer_span = self.outer_span.clone();
         let memory_manager = self.memory_manager.clone();
+        let queued = query_profile::begin(Phase::Engine, "compute_queue_wait", None);
         self.runtime_ref.spawn(async move {
-            let _permit = memory_manager.request_bytes(memory_request).await?;
-            future.instrument(span).instrument(outer_span).await
+            query_profile::complete(queued, false);
+            let _permit = query_profile::measure_async(
+                Phase::Engine,
+                "memory_permit_wait",
+                None,
+                memory_manager.request_bytes(memory_request),
+            )
+            .await?;
+            query_profile::measure_async(
+                Phase::Engine,
+                "compute_task",
+                None,
+                future.instrument(span).instrument(outer_span),
+            )
+            .await
         })
     }
 
@@ -200,11 +217,18 @@ impl ExecutionTaskSpawner {
         F: Future<Output = DaftResult<O>> + Send + 'static,
         O: Send + 'static,
     {
-        self.runtime_ref.spawn(
-            future
-                .instrument(inner_span)
-                .instrument(self.outer_span.clone()),
-        )
+        let queued = query_profile::begin(Phase::Engine, "compute_queue_wait", None);
+        let outer_span = self.outer_span.clone();
+        self.runtime_ref.spawn(async move {
+            query_profile::complete(queued, false);
+            query_profile::measure_async(
+                Phase::Engine,
+                "compute_task",
+                None,
+                future.instrument(inner_span).instrument(outer_span),
+            )
+            .await
+        })
     }
 }
 

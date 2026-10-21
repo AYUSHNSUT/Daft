@@ -3,6 +3,7 @@ use std::{any::Any, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use bytes::Bytes;
 use common_error::DaftError;
+use common_runtime::query_profile::{self as profile, Span};
 use futures::{
     StreamExt,
     stream::{BoxStream, Stream},
@@ -73,18 +74,26 @@ impl StreamingRetryParams {
     }
 
     async fn get(&self, range: Option<GetRange>) -> super::Result<GetResult> {
-        match &self.version {
-            Some(version) => {
-                self.source
-                    .get_if_match(&self.input, range, version, self.io_stats.clone())
-                    .await
-            }
-            None => {
-                self.source
-                    .get(&self.input, range, self.io_stats.clone())
-                    .await
-            }
-        }
+        profile::measure_async(
+            profile::Phase::Io,
+            "resume_headers",
+            Some(&self.input),
+            async {
+                match &self.version {
+                    Some(version) => {
+                        self.source
+                            .get_if_match(&self.input, range, version, self.io_stats.clone())
+                            .await
+                    }
+                    None => {
+                        self.source
+                            .get(&self.input, range, self.io_stats.clone())
+                            .await
+                    }
+                }
+            },
+        )
+        .await
     }
 }
 
@@ -106,26 +115,47 @@ async fn collect_bytes<S>(
 where
     S: Stream<Item = super::Result<Bytes>> + Send + Unpin,
 {
-    let first = stream.next().await.transpose()?.unwrap_or_default();
-    // Avoid copying if single response
-    match stream.next().await.transpose()? {
-        None => Ok(first),
-        Some(second) => {
-            let size_hint = size_hint.unwrap_or_else(|| first.len() + second.len());
-            let mut buf = Vec::with_capacity(size_hint);
-            buf.extend_from_slice(&first);
-            buf.extend_from_slice(&second);
+    profile::measure_async(profile::Phase::Io, "body_collect", None, async {
+        let first = stream.next().await.transpose()?.unwrap_or_default();
+        // Avoid copying if single response
+        match stream.next().await.transpose()? {
+            None => Ok(first),
+            Some(second) => {
+                let size_hint = size_hint.unwrap_or_else(|| first.len() + second.len());
+                let mut buf = Vec::with_capacity(size_hint);
+                buf.extend_from_slice(&first);
+                buf.extend_from_slice(&second);
 
-            while let Some(maybe_bytes) = stream.next().await {
-                buf.extend_from_slice(&maybe_bytes?);
+                while let Some(maybe_bytes) = stream.next().await {
+                    buf.extend_from_slice(&maybe_bytes?);
+                }
+
+                Ok(buf.into())
             }
-
-            Ok(buf.into())
         }
-    }
+    })
+    .await
 }
 
 impl GetResult {
+    /// Observe the response lifetime and bytes delivered at the shared I/O boundary.
+    /// Elapsed time includes consumer/scheduler delay; poll time is not wire time.
+    pub(crate) fn with_profile(self, span: Option<Span>) -> Self {
+        match (self, span) {
+            (Self::Stream(stream, size, permit, retry), Some(span)) => Self::Stream(
+                Box::pin(ProfiledByteStream {
+                    stream,
+                    span: Some(span),
+                    delivered: 0,
+                }),
+                size,
+                permit,
+                retry,
+            ),
+            (result, _) => result,
+        }
+    }
+
     pub async fn bytes(self) -> super::Result<Bytes> {
         use GetResult::{File, Stream};
         let mut get_result = self;
@@ -154,7 +184,10 @@ impl GetResult {
                                 "Received Socket Error when streaming bytes! Attempt {attempt} out of {NUM_TRIES} tries. Trying again in {jitter}ms\nDetails\n{}",
                                 result.err().unwrap()
                             );
+                            let trace =
+                                profile::begin(profile::Phase::Io, "body_retry_backoff", None);
                             tokio::time::sleep(Duration::from_millis(jitter)).await;
+                            profile::complete(trace, false);
 
                             get_result = rp.get(rp.range.clone()).await?;
                             if let Stream(stream, size, permit, _) = get_result {
@@ -180,6 +213,39 @@ impl GetResult {
                 Self::Stream(resumable, size, None, None)
             }
         }
+    }
+}
+
+struct ProfiledByteStream {
+    stream: BoxStream<'static, super::Result<Bytes>>,
+    span: Option<Span>,
+    delivered: usize,
+}
+
+impl Stream for ProfiledByteStream {
+    type Item = super::Result<Bytes>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let started = self.span.as_ref().map(|_| std::time::Instant::now());
+        let result = self.stream.as_mut().poll_next(cx);
+        if let (Some(span), Some(started)) = (&mut self.span, started) {
+            span.polled(started.elapsed());
+        }
+        match &result {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                self.delivered += bytes.len();
+                let delivered = self.delivered;
+                if let Some(span) = &mut self.span {
+                    span.returned(delivered);
+                }
+            }
+            std::task::Poll::Ready(end) => profile::complete(self.span.take(), end.is_some()),
+            std::task::Poll::Pending => {}
+        }
+        result
     }
 }
 
@@ -260,7 +326,9 @@ impl ResumableByteStream {
                                 let jitter = rand::rng()
                                     .random_range(0..((1 << (self.attempt - 1)) * JITTER_MS));
                                 let backoff_ms = jitter.min(MAX_BACKOFF_MS);
+                                let trace = profile::begin(profile::Phase::Io, "body_retry_backoff", None);
                                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                                profile::complete(trace, false);
 
                                 let range = self.make_range();
                                 log::warn!("Received Socket Error when streaming bytes! Attempt {} out of {} tries. Trying again in {}ms with range {:?}",
@@ -475,4 +543,62 @@ pub trait ObjectSource: Sync + Send {
     }
 
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn response_profiles_keep_bytes_errors_and_cancellation() {
+        profile::start().unwrap();
+        let make = |operation, stream: BoxStream<'static, crate::Result<Bytes>>| {
+            GetResult::Stream(stream, None, None, None).with_profile(profile::begin(
+                profile::Phase::Io,
+                operation,
+                Some("s3://secret:test@bucket/object?credential=hidden"),
+            ))
+        };
+        let bytes = make(
+            "body_ok_fixture",
+            futures::stream::iter([Ok(Bytes::from_static(b"12")), Ok(Bytes::from_static(b"34"))])
+                .boxed(),
+        )
+        .bytes()
+        .await
+        .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"1234"));
+        let error = crate::Error::InvalidArgument {
+            msg: "private backend detail".into(),
+        };
+        assert!(
+            make(
+                "body_error_fixture",
+                futures::stream::iter([Err(error)]).boxed()
+            )
+            .bytes()
+            .await
+            .is_err()
+        );
+        let pending = make("body_cancel_fixture", futures::stream::pending().boxed());
+        let mut collecting = Box::pin(pending.bytes());
+        assert!(futures::poll!(collecting.as_mut()).is_pending());
+        drop(collecting);
+        let snapshot = profile::finish().unwrap();
+        let event = |name| {
+            snapshot
+                .events
+                .iter()
+                .find(|e| e.operation == name)
+                .unwrap()
+        };
+        let ok = event("body_ok_fixture");
+        assert_eq!(ok.returned_bytes, Some(4));
+        assert_eq!(ok.poll_count, Some(3));
+        assert!(ok.active_poll_ns.unwrap() <= ok.duration_ns);
+        assert!(!ok.error && !ok.cancelled);
+        assert!(event("body_error_fixture").error);
+        assert!(event("body_cancel_fixture").cancelled);
+        assert!(event("body_cancel_fixture").poll_count.unwrap() >= 1);
+    }
 }

@@ -3,6 +3,7 @@ common-error = {path = "../error", default-features = false}
 futures = {workspace = true}
 log = {workspace = true}
 oneshot = "0.1.8"
+pin-project-lite = "0.2.16"
 pyo3 = {workspace = true, optional = true}
 pyo3-async-runtimes = {workspace = true, optional = true}
 tokio = {workspace = true}

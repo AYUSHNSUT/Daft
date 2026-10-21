@@ -35,7 +35,10 @@ use aws_smithy_runtime_api::{
 };
 use bytes::Bytes;
 use common_io_config::S3Config;
-use common_runtime::get_io_pool_num_threads;
+use common_runtime::{
+    get_io_pool_num_threads,
+    query_profile::{self as profile, Phase},
+};
 use futures::stream::BoxStream;
 use s3::{
     config::{Credentials, Region},
@@ -803,12 +806,14 @@ impl S3LikeSource {
         io_stats: Option<IOStatsRef>,
         version: Option<&ObjectVersion>,
     ) -> super::Result<GetResult> {
-        let permit = self
-            .connection_pool_sema
-            .clone()
-            .acquire_owned()
-            .await
-            .context(UnableToGrabSemaphoreSnafu)?;
+        let permit = profile::measure_async(
+            Phase::Io,
+            "s3_pool_wait",
+            Some(uri),
+            self.connection_pool_sema.clone().acquire_owned(),
+        )
+        .await
+        .context(UnableToGrabSemaphoreSnafu)?;
         let get_result = self
             .get_impl(permit, uri, range, &self.default_region, version)
             .await?;
@@ -877,7 +882,9 @@ impl S3LikeSource {
                 request
             };
 
-            let response = request.send().await;
+            let response =
+                profile::measure_async(Phase::Io, "s3_get_headers", Some(uri), request.send())
+                    .await;
 
             match response {
                 Ok(v) => {
@@ -995,7 +1002,9 @@ impl S3LikeSource {
                 request
             };
 
-            let response = request.send().await;
+            let response =
+                profile::measure_async(Phase::Io, "s3_head_headers", Some(uri), request.send())
+                    .await;
 
             match response {
                 Ok(v) => match v.content_length() {
@@ -1093,8 +1102,9 @@ impl S3LikeSource {
             request
         };
 
-        let response = request.send().await;
         let uri = &format!("{scheme}://{bucket}/{key}");
+        let response =
+            profile::measure_async(Phase::Io, "s3_list_headers", Some(uri), request.send()).await;
         match response {
             Ok(v) => {
                 let dirs = v.common_prefixes();
@@ -1469,11 +1479,14 @@ impl ObjectSource for S3LikeSource {
         uri: &str,
         io_stats: Option<IOStatsRef>,
     ) -> super::Result<ObjectReadMetadata> {
-        let permit = self
-            .connection_pool_sema
-            .acquire()
-            .await
-            .context(UnableToGrabSemaphoreSnafu)?;
+        let permit = profile::measure_async(
+            Phase::Io,
+            "s3_pool_wait",
+            Some(uri),
+            self.connection_pool_sema.acquire(),
+        )
+        .await
+        .context(UnableToGrabSemaphoreSnafu)?;
         let head_result = self.head_impl(permit, uri, &self.default_region).await?;
         if let Some(is) = io_stats.as_ref() {
             is.mark_head_requests(1);
@@ -1529,11 +1542,14 @@ impl ObjectSource for S3LikeSource {
                 format!("{}{S3_DELIMITER}", key.trim_end_matches(S3_DELIMITER))
             };
             let mut lsr = {
-                let permit = self
-                    .connection_pool_sema
-                    .acquire()
-                    .await
-                    .context(UnableToGrabSemaphoreSnafu)?;
+                let permit = profile::measure_async(
+                    Phase::Io,
+                    "s3_list_pool_wait",
+                    Some(path),
+                    self.connection_pool_sema.acquire(),
+                )
+                .await
+                .context(UnableToGrabSemaphoreSnafu)?;
 
                 self.list_impl(
                     permit,
@@ -1583,11 +1599,14 @@ impl ObjectSource for S3LikeSource {
         } else {
             // Perform a prefix-based list of all entries with this prefix
             let lsr = {
-                let permit = self
-                    .connection_pool_sema
-                    .acquire()
-                    .await
-                    .context(UnableToGrabSemaphoreSnafu)?;
+                let permit = profile::measure_async(
+                    Phase::Io,
+                    "s3_list_pool_wait",
+                    Some(path),
+                    self.connection_pool_sema.acquire(),
+                )
+                .await
+                .context(UnableToGrabSemaphoreSnafu)?;
 
                 self.list_impl(
                     permit,

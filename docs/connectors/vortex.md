@@ -252,6 +252,9 @@ thresholds.
 
 ## Compare with Parquet
 
+See the maintained [Parquet vs Vortex comparison](../contributing/parquet-vs-vortex.md)
+for complete current results, earlier measurements and the exact tested settings.
+
 The evaluation harness compares Parquet and four Vortex switch combinations in
 the same Daft build, with equal logical rows and independently checked results.
 Install the fixture-writer requirements above first. The recorded build command

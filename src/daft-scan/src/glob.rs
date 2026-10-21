@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, sync::Arc, vec};
 
 use common_error::{DaftError, DaftResult};
 use common_file_formats::FileFormat;
-use common_runtime::RuntimeRef;
+use common_runtime::{
+    RuntimeRef,
+    query_profile::{self as profile, Phase},
+};
 use daft_core::{prelude::Utf8Array, series::IntoSeries};
 use daft_csv::CsvParseOptions;
 use daft_dsl::expr::bound_expr::BoundExpr;
@@ -52,8 +55,13 @@ impl<T> Iterator for BoxStreamIterator<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.runtime_handle
-            .block_on_current_thread(async { self.boxstream.next().await })
+        // Time each finite next() call, excluding consumer work between yields.
+        let trace = profile::begin(Phase::Engine, "task_discovery_next", None);
+        let item = self
+            .runtime_handle
+            .block_on_current_thread(async { self.boxstream.next().await });
+        profile::complete(trace, false);
+        item
     }
 }
 
@@ -128,11 +136,21 @@ fn run_glob_parallel(
         let io_stats = io_stats.clone();
 
         runtime.spawn(async move {
-            let stream = io_client
-                .glob(glob_input, None, None, None, io_stats, Some(file_format))
-                .await?;
-            let results = stream.map_err(|e| e.into()).collect::<Vec<_>>().await;
-            DaftResult::Ok(futures::stream::iter(results))
+            // Materialize one input's discovery stream. This includes listing
+            // and scheduler wait, and ends before scan-task consumers run.
+            let trace = profile::begin(
+                Phase::Engine,
+                "discovery_materialization",
+                Some(&glob_input),
+            );
+            profile::measure_future(trace, async {
+                let stream = io_client
+                    .glob(glob_input, None, None, None, io_stats, Some(file_format))
+                    .await?;
+                let results = stream.map_err(|e| e.into()).collect::<Vec<_>>().await;
+                DaftResult::Ok(futures::stream::iter(results))
+            })
+            .await
         })
     }))
     .buffered(num_parallel_tasks)
@@ -183,25 +201,35 @@ impl GlobScanOperator {
         let (schema, first_metadata, first_filepath) = if infer_schema {
             // Limit to 1 so the background listing task blocks after the first result,
             // avoiding unnecessary S3 list-objects calls during schema inference.
-            let mut paths = run_glob(
-                first_glob_path.clone(),
-                Some(1),
-                io_client.clone(),
-                Some(io_stats.clone()),
-                file_format,
+            // Covers glob setup through the first item, not the stream's lifetime.
+            let (_paths, first_file) = profile::measure_async(
+                Phase::Engine,
+                "source_discovery",
+                Some(first_glob_path),
+                async {
+                    let mut paths = run_glob(
+                        first_glob_path.clone(),
+                        Some(1),
+                        io_client.clone(),
+                        Some(io_stats.clone()),
+                        file_format,
+                    )
+                    .await?;
+                    let first_file = match paths.next().await {
+                        Some(file_metadata) => file_metadata,
+                        None => Err(Error::GlobNoMatch {
+                            glob_path: first_glob_path.clone(),
+                        }
+                        .into()),
+                    }?;
+                    DaftResult::Ok((paths, first_file))
+                },
             )
             .await?;
-
             let FileMetadata {
                 filepath: first_filepath,
                 ..
-            } = match paths.next().await {
-                Some(file_metadata) => file_metadata,
-                None => Err(Error::GlobNoMatch {
-                    glob_path: first_glob_path.clone(),
-                }
-                .into()),
-            }?;
+            } = first_file;
 
             // Infer schema from the candidate file, with minimal behavior: only skip empty JSON files when configured.
             let (inferred_schema, first_metadata, first_filepath) = match file_format_config
@@ -667,138 +695,143 @@ impl ScanOperator for GlobScanOperator {
     }
 
     fn to_scan_tasks(&self, pushdowns: Pushdowns) -> DaftResult<Vec<ScanTaskRef>> {
-        let (io_runtime, io_client) = self.storage_config.get_io_client_and_runtime()?;
-        let io_stats = IOStatsContext::new(format!(
-            "GlobScanOperator::to_scan_tasks for {:#?}",
-            self.glob_paths
-        ));
-        let file_format = self.file_format_config.file_format();
+        profile::measure(Phase::Engine, "scan_tasks_materialization", None, || {
+            let (io_runtime, io_client) = self.storage_config.get_io_client_and_runtime()?;
+            let io_stats = IOStatsContext::new(format!(
+                "GlobScanOperator::to_scan_tasks for {:#?}",
+                self.glob_paths
+            ));
+            let file_format = self.file_format_config.file_format();
 
-        let files: Box<dyn Iterator<Item = DaftResult<FileMetadata>>> = if self.skip_glob {
-            Box::new(generate_metadata_from_manifest(&self.glob_paths))
-        } else {
-            Box::new(run_glob_parallel(
-                self.glob_paths.clone(),
-                io_client,
-                io_runtime,
-                Some(io_stats),
-                file_format,
-            )?)
-        };
-
-        let source_config = Arc::new(SourceConfig::File(self.file_format_config.as_ref().clone()));
-        let schema = self.schema.clone();
-        let storage_config = self.storage_config.clone();
-
-        let row_groups = if let FileFormatConfig::Parquet(ParquetSourceConfig {
-            row_groups: Some(row_groups),
-            ..
-        }) = self.file_format_config.as_ref()
-        {
-            Some(row_groups.clone())
-        } else {
-            None
-        };
-        let file_path_column = self.file_path_column.clone();
-        let hive_partitioning = self.hive_partitioning;
-        let partition_fields = self
-            .partitioning_keys
-            .iter()
-            .map(|partition_spec| partition_spec.clone_field());
-        let partition_schema = Schema::new(partition_fields);
-        let (first_filepath, first_metadata) =
-            if let Some((first_filepath, first_metadata)) = &self.first_metadata {
-                (Some(first_filepath), Some(first_metadata))
+            let files: Box<dyn Iterator<Item = DaftResult<FileMetadata>>> = if self.skip_glob {
+                Box::new(generate_metadata_from_manifest(&self.glob_paths))
             } else {
-                (None, None)
+                Box::new(run_glob_parallel(
+                    self.glob_paths.clone(),
+                    io_client,
+                    io_runtime,
+                    Some(io_stats),
+                    file_format,
+                )?)
             };
-        // Create one ScanTask per file.
-        files
-            .enumerate()
-            .filter_map(|(idx, f)| {
-                let scan_task_result = (|| {
-                    let FileMetadata {
-                        filepath: path,
-                        size: size_bytes,
-                        ..
-                    } = f?;
-                    // Create partition values from hive partitions, if any.
-                    let mut partition_values = if hive_partitioning {
-                        let hive_partitions = parse_hive_partitioning(&path)?;
-                        hive_partitions_to_series(&hive_partitions, &partition_schema)?
-                    } else {
-                        vec![]
-                    };
-                    // Extend partition values based on whether a file_path_column is set (this column is inherently a partition).
-                    if let Some(fp_col) = &file_path_column {
-                        let trimmed =
-                            daft_io::strip_file_uri_to_path(&path).unwrap_or(path.as_str());
-                        let file_paths_column_series =
-                            Utf8Array::from_iter(fp_col, std::iter::once(Some(trimmed)))
-                                .into_series();
-                        partition_values.push(file_paths_column_series);
-                    }
-                    let (partition_spec, generated_fields) = if !partition_values.is_empty() {
-                        let partition_values_table =
-                            RecordBatch::from_nonempty_columns(partition_values)?;
-                        // If there are partition values, evaluate them against partition filters, if any.
-                        if let Some(partition_filters) = &pushdowns.partition_filters {
-                            let partition_filters = BoundExpr::try_new(
-                                partition_filters.clone(),
-                                &partition_values_table.schema,
-                            )?;
-                            let filter_result =
-                                partition_values_table.filter(&[partition_filters])?;
-                            if filter_result.is_empty() {
-                                // Skip the current file since it does not satisfy the partition filters.
-                                return Ok(None);
-                            }
-                        }
-                        let generated_fields = partition_values_table.schema.clone();
-                        let partition_spec = PartitionSpec {
-                            keys: partition_values_table,
-                        };
-                        (Some(partition_spec), Some(generated_fields))
-                    } else {
-                        (None, None)
-                    };
-                    let row_group = row_groups
-                        .as_ref()
-                        .and_then(|rgs| rgs.get(idx).cloned())
-                        .flatten();
-                    let chunk_spec = row_group.map(ChunkSpec::Parquet);
-                    Ok(Some(ScanTask::new(
-                        vec![ScanSource {
-                            metadata: if let Some(first_filepath) = first_filepath
-                                && path == *first_filepath
-                            {
-                                first_metadata.cloned()
+
+            let source_config =
+                Arc::new(SourceConfig::File(self.file_format_config.as_ref().clone()));
+            let schema = self.schema.clone();
+            let storage_config = self.storage_config.clone();
+
+            let row_groups = if let FileFormatConfig::Parquet(ParquetSourceConfig {
+                row_groups: Some(row_groups),
+                ..
+            }) = self.file_format_config.as_ref()
+            {
+                Some(row_groups.clone())
+            } else {
+                None
+            };
+            let file_path_column = self.file_path_column.clone();
+            let hive_partitioning = self.hive_partitioning;
+            let partition_fields = self
+                .partitioning_keys
+                .iter()
+                .map(|partition_spec| partition_spec.clone_field());
+            let partition_schema = Schema::new(partition_fields);
+            let (first_filepath, first_metadata) =
+                if let Some((first_filepath, first_metadata)) = &self.first_metadata {
+                    (Some(first_filepath), Some(first_metadata))
+                } else {
+                    (None, None)
+                };
+            // Create one ScanTask per file.
+            files
+                .enumerate()
+                .filter_map(|(idx, f)| {
+                    let scan_task_result =
+                        profile::measure(Phase::Engine, "scan_task_build", None, || {
+                            let FileMetadata {
+                                filepath: path,
+                                size: size_bytes,
+                                ..
+                            } = f?;
+                            // Create partition values from hive partitions, if any.
+                            let mut partition_values = if hive_partitioning {
+                                let hive_partitions = parse_hive_partitioning(&path)?;
+                                hive_partitions_to_series(&hive_partitions, &partition_schema)?
                             } else {
-                                None
-                            },
-                            size_bytes,
-                            partition_spec,
-                            statistics: None,
-                            kind: ScanSourceKind::File {
-                                path,
-                                chunk_spec,
-                                iceberg_delete_files: None,
-                                parquet_metadata: None,
-                            },
-                        }],
-                        source_config.clone(),
-                        schema.clone(),
-                        storage_config.clone(),
-                        pushdowns.clone(),
-                        generated_fields,
-                    )))
-                })();
-                match scan_task_result {
-                    Ok(Some(scan_task)) => Some(Ok(Arc::new(scan_task))),
-                    Ok(None) => None,
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .collect()
+                                vec![]
+                            };
+                            // Extend partition values based on whether a file_path_column is set (this column is inherently a partition).
+                            if let Some(fp_col) = &file_path_column {
+                                let trimmed =
+                                    daft_io::strip_file_uri_to_path(&path).unwrap_or(path.as_str());
+                                let file_paths_column_series =
+                                    Utf8Array::from_iter(fp_col, std::iter::once(Some(trimmed)))
+                                        .into_series();
+                                partition_values.push(file_paths_column_series);
+                            }
+                            let (partition_spec, generated_fields) = if !partition_values.is_empty()
+                            {
+                                let partition_values_table =
+                                    RecordBatch::from_nonempty_columns(partition_values)?;
+                                // If there are partition values, evaluate them against partition filters, if any.
+                                if let Some(partition_filters) = &pushdowns.partition_filters {
+                                    let partition_filters = BoundExpr::try_new(
+                                        partition_filters.clone(),
+                                        &partition_values_table.schema,
+                                    )?;
+                                    let filter_result =
+                                        partition_values_table.filter(&[partition_filters])?;
+                                    if filter_result.is_empty() {
+                                        // Skip the current file since it does not satisfy the partition filters.
+                                        return Ok(None);
+                                    }
+                                }
+                                let generated_fields = partition_values_table.schema.clone();
+                                let partition_spec = PartitionSpec {
+                                    keys: partition_values_table,
+                                };
+                                (Some(partition_spec), Some(generated_fields))
+                            } else {
+                                (None, None)
+                            };
+                            let row_group = row_groups
+                                .as_ref()
+                                .and_then(|rgs| rgs.get(idx).cloned())
+                                .flatten();
+                            let chunk_spec = row_group.map(ChunkSpec::Parquet);
+                            Ok(Some(ScanTask::new(
+                                vec![ScanSource {
+                                    metadata: if let Some(first_filepath) = first_filepath
+                                        && path == *first_filepath
+                                    {
+                                        first_metadata.cloned()
+                                    } else {
+                                        None
+                                    },
+                                    size_bytes,
+                                    partition_spec,
+                                    statistics: None,
+                                    kind: ScanSourceKind::File {
+                                        path,
+                                        chunk_spec,
+                                        iceberg_delete_files: None,
+                                        parquet_metadata: None,
+                                    },
+                                }],
+                                source_config.clone(),
+                                schema.clone(),
+                                storage_config.clone(),
+                                pushdowns.clone(),
+                                generated_fields,
+                            )))
+                        });
+                    match scan_task_result {
+                        Ok(Some(scan_task)) => Some(Ok(Arc::new(scan_task))),
+                        Ok(None) => None,
+                        Err(e) => Some(Err(e)),
+                    }
+                })
+                .collect()
+        })
     }
 }
