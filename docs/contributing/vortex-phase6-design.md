@@ -5,6 +5,10 @@ on `poc/vortex-phase6` at Phase 5 commit
 `a6d60cdc6635111b158185e8506700986f95cb9c`; its first review targets
 `poc/vortex-phase5`. Status: implementation and validation in progress.
 
+The [first acceptance results](vortex-phase6-results.md) miss the remote median
+gate. Correctness, local regression guards, ORC/MCAP, and the unfiltered Rust
+workspace pass; the remaining work is documented with that failed run.
+
 The [Phase 5 results](vortex-phase5-results.md) leave Vortex median query latency
 approximately 0.8–12 ms above Parquet on the local authenticated MinIO corpus.
 Projected queries already return fewer execution-source bytes. Request/setup
