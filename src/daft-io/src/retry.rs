@@ -1,5 +1,6 @@
 use std::{future::Future, time::Duration};
 
+use common_runtime::query_profile::{self as profile, Phase};
 use rand::Rng;
 
 pub enum RetryError<T> {
@@ -68,7 +69,9 @@ impl ExponentialBackoff {
                 )
                 .min(self.max_backoff_ms);
 
+            let span = profile::begin(Phase::Io, "retry_backoff", None);
             tokio::time::sleep(Duration::from_millis(jitter)).await;
+            profile::complete(span, false);
         }
     }
 }

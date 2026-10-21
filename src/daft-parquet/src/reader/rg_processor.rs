@@ -5,7 +5,10 @@ use arrow::{
     datatypes::Schema as ArrowSchema,
 };
 use common_error::DaftResult;
-use common_runtime::{JoinSet, get_compute_runtime};
+use common_runtime::{
+    JoinSet, get_compute_runtime,
+    query_profile::{self as profile, Phase},
+};
 use daft_core::prelude::*;
 use daft_dsl::expr::bound_expr::BoundExpr;
 use daft_recordbatch::RecordBatch;
@@ -37,13 +40,17 @@ fn err_stream<T: Send + 'static>(e: common_error::DaftError) -> BoxStream<'stati
 /// - `Ok(None)` — at least one receiver closed (stream end). Decoders close their
 ///   channel after the final chunk, so the first `None` we see ends the RG.
 pub(super) async fn recv_one_chunk(receivers: &mut [ColRx]) -> DaftResult<Option<Vec<ArrayRef>>> {
-    try_join_all(
-        receivers
-            .iter_mut()
-            .map(|r| async { r.recv().await.transpose() }),
-    )
+    let trace = profile::begin(Phase::Parquet, "batch_wait", None);
+    profile::measure_future(trace, async {
+        try_join_all(
+            receivers
+                .iter_mut()
+                .map(|r| async { r.recv().await.transpose() }),
+        )
+        .await
+        .map(|chunks| chunks.into_iter().collect())
+    })
     .await
-    .map(|chunks| chunks.into_iter().collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -75,7 +82,14 @@ pub(super) async fn spawn_col_decoders(
         let col_leaves: Arc<[usize]> = leaves_for_top_fields(metadata.as_ref(), &[col_idx]).into();
         joinset.spawn_on(
             async move {
-                let chunks = match rg_reader.read_col(col_leaves).await {
+                let chunks = match profile::measure_async(
+                    Phase::Parquet,
+                    "column_chunk_wait",
+                    Some(&path),
+                    rg_reader.read_col(col_leaves),
+                )
+                .await
+                {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(Err(e.into())).await;
@@ -183,10 +197,12 @@ pub(super) async fn process_rg_with_data_cols(
         if let Some(pred) = ctx.predicate.as_ref()
             && !plan.predicate_pushed
         {
-            let eval = substitute_missing_cols(pred, &daft_batch.schema)
-                .and_then(|p| BoundExpr::try_new(p, &daft_batch.schema))
-                .and_then(|bound| daft_batch.eval_expression(&bound))
-                .and_then(|mask| daft_batch.mask_filter(&mask));
+            let eval = profile::measure(Phase::Parquet, "residual_filter", Some(&ctx.path), || {
+                substitute_missing_cols(pred, &daft_batch.schema)
+                    .and_then(|p| BoundExpr::try_new(p, &daft_batch.schema))
+                    .and_then(|bound| daft_batch.eval_expression(&bound))
+                    .and_then(|mask| daft_batch.mask_filter(&mask))
+            });
             daft_batch = match eval {
                 Ok(b) => b,
                 Err(e) => return Some((Err(e), state)),

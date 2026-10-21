@@ -52,7 +52,7 @@ def _validate_read_controls(enabled: bool, gap: int, maximum: int, discovery: in
         raise ValueError(f"discovery_concurrency must be an integer from 1 through 64, received {discovery!r}")
 
 
-def _require_vortex(*, metadata_reuse: bool = False) -> None:
+def _require_vortex(*, metadata_reuse: bool = False, row_count_planning: bool = False) -> None:
     if (
         not hasattr(_native, "read_vortex_schema")
         or not hasattr(_native, "read_vortex_metadata")
@@ -61,6 +61,8 @@ def _require_vortex(*, metadata_reuse: bool = False) -> None:
         or not hasattr(_native.PyDataSourceTask, "vortex")
         or not hasattr(getattr(_native, "VortexSourceConfig", None), "metadata_snapshot")
         or (metadata_reuse and not hasattr(_native, "_read_vortex_metadata_bulk_cached"))
+        or (row_count_planning and not hasattr(_native, "_read_vortex_row_counts_bulk"))
+        or (row_count_planning and metadata_reuse and not hasattr(_native, "_read_vortex_row_counts_bulk_cached"))
     ):
         raise ImportError(_FEATURE_ERROR)
 
@@ -279,6 +281,7 @@ def read_vortex(
     read_coalesce_max_bytes: int = 4194304,
     discovery_concurrency: int = 8,
     enable_metadata_reuse: bool = False,
+    enable_row_count_planning: bool = False,
 ) -> DataFrame:
     """Read Vortex files with the experimental native reader.
 
@@ -325,6 +328,10 @@ def read_vortex(
             64 MiB of encoded opening bytes across the materialization's tasks. Each executing reader validates
             fresh size, ETag and version metadata before reuse, and conditionally fetches uncached ranges.
             Changed objects fail explicitly. HTTP/local inputs and S3 objects without strong ETags use fresh reads.
+        enable_row_count_planning: Experimental footer row-count-only planning, default False.
+            Omits conversion of unused per-file planning schemas. Every executed file still receives full
+            schema validation before projection; unsupported schemas can therefore fail during execution
+            instead of planning. Row counts refresh on each materialization and retain join statistics.
 
     Note:
         Requires a build with Rust features ``python,vortex``. The Python
@@ -377,8 +384,10 @@ def read_vortex(
             raise TypeError(f"{name} must be a bool, received {value!r}")
     if not isinstance(enable_metadata_reuse, bool):
         raise TypeError("enable_metadata_reuse must be a bool")
+    if not isinstance(enable_row_count_planning, bool):
+        raise TypeError("enable_row_count_planning must be a bool")
     paths = _input_paths(path)
-    _require_vortex(metadata_reuse=enable_metadata_reuse)
+    _require_vortex(metadata_reuse=enable_metadata_reuse, row_count_planning=enable_row_count_planning)
     io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
     return VortexSource(
         paths,
@@ -394,6 +403,7 @@ def read_vortex(
         read_coalesce_max_bytes=read_coalesce_max_bytes,
         discovery_concurrency=discovery_concurrency,
         enable_metadata_reuse=enable_metadata_reuse,
+        enable_row_count_planning=enable_row_count_planning,
     ).read()
 
 
@@ -414,6 +424,7 @@ class VortexSource(DataSource):
         read_coalesce_max_bytes: int = 4194304,
         discovery_concurrency: int = 8,
         enable_metadata_reuse: bool = False,
+        enable_row_count_planning: bool = False,
     ) -> None:
         _validate_metadata_concurrency(metadata_concurrency)
         _validate_read_controls(
@@ -421,6 +432,9 @@ class VortexSource(DataSource):
         )
         if not isinstance(enable_metadata_reuse, bool):
             raise TypeError("enable_metadata_reuse must be a bool")
+        if not isinstance(enable_row_count_planning, bool):
+            raise TypeError("enable_row_count_planning must be a bool")
+        self._enable_row_count_planning = enable_row_count_planning
         self._enable_metadata_reuse = enable_metadata_reuse
         self._paths = _resolve_vortex_paths(paths, io_config, discovery_concurrency)
         self._batch_size = batch_size
@@ -436,26 +450,29 @@ class VortexSource(DataSource):
         self._discovery_concurrency = discovery_concurrency
         # Preserve native metadata: it carries original field nullability for
         # strict matching, which Daft's logical types alone cannot represent.
-        self._scan_schema = Schema._from_pyschema(
-            _native.read_vortex_schema(
-                self._paths[0],
-                io_config=io_config,
-                max_concurrent_requests=max_concurrent_requests,
-                max_in_flight_bytes=max_in_flight_bytes,
-                enable_read_coalescing=enable_read_coalescing,
-                read_coalesce_gap_bytes=read_coalesce_gap_bytes,
-                read_coalesce_max_bytes=read_coalesce_max_bytes,
+        from daft.io import _vortex_diagnostics as diagnostics
+
+        with diagnostics.stage("schema_inference"):
+            self._scan_schema = Schema._from_pyschema(
+                _native.read_vortex_schema(
+                    self._paths[0],
+                    io_config=io_config,
+                    max_concurrent_requests=max_concurrent_requests,
+                    max_in_flight_bytes=max_in_flight_bytes,
+                    enable_read_coalescing=enable_read_coalescing,
+                    read_coalesce_gap_bytes=read_coalesce_gap_bytes,
+                    read_coalesce_max_bytes=read_coalesce_max_bytes,
+                )
             )
-        )
-        public_fields = []
-        for field, arrow_field in zip(self._scan_schema, self._scan_schema.to_pyarrow_schema()):
-            metadata = {
-                key.decode(): value.decode()
-                for key, value in (arrow_field.metadata or {}).items()
-                if key != b"daft.vortex.nullable"
-            }
-            public_fields.append(Field.create(field.name, field.dtype, metadata))
-        self._schema = Schema._from_fields(public_fields)
+            public_fields = []
+            for field, arrow_field in zip(self._scan_schema, self._scan_schema.to_pyarrow_schema()):
+                metadata = {
+                    key.decode(): value.decode()
+                    for key, value in (arrow_field.metadata or {}).items()
+                    if key != b"daft.vortex.nullable"
+                }
+                public_fields.append(Field.create(field.name, field.dtype, metadata))
+            self._schema = Schema._from_fields(public_fields)
 
     @property
     def name(self) -> str:
@@ -467,65 +484,69 @@ class VortexSource(DataSource):
 
     async def get_tasks(self, pushdowns: Pushdowns) -> AsyncIterator[DataSourceTask]:
         from daft.daft import VortexSourceConfig
+        from daft.io import _vortex_diagnostics as diagnostics
 
         remaining_snapshot_bytes = _MAX_METADATA_SNAPSHOT_BYTES
         for start in range(0, len(self._paths), self._metadata_concurrency):
             paths = self._paths[start : start + self._metadata_concurrency]
             entries: list[tuple[int, bytes | None]]
-            if (
-                self._enable_metadata_reuse
-                and remaining_snapshot_bytes
-                and any(urlsplit(path).scheme == "s3" for path in paths)
-            ):
-                cached, _metrics = _native._read_vortex_metadata_bulk_cached(
-                    paths,
-                    io_config=self._io_config,
-                    max_concurrent_files=self._metadata_concurrency,
-                    max_snapshot_bytes=remaining_snapshot_bytes,
-                    max_concurrent_requests=self._max_concurrent_requests,
-                    max_in_flight_bytes=self._max_in_flight_bytes,
-                    enable_read_coalescing=self._enable_read_coalescing,
-                    read_coalesce_gap_bytes=self._read_coalesce_gap_bytes,
-                    read_coalesce_max_bytes=self._read_coalesce_max_bytes,
-                )
-                entries = [(num_rows, snapshot) for _, num_rows, snapshot in cached]
-                del cached
-            else:
-                metadata, _metrics = _native.read_vortex_metadata_bulk(
-                    paths,
-                    io_config=self._io_config,
-                    max_concurrent_files=self._metadata_concurrency,
-                    max_concurrent_requests=self._max_concurrent_requests,
-                    max_in_flight_bytes=self._max_in_flight_bytes,
-                    enable_read_coalescing=self._enable_read_coalescing,
-                    read_coalesce_gap_bytes=self._read_coalesce_gap_bytes,
-                    read_coalesce_max_bytes=self._read_coalesce_max_bytes,
-                )
-                entries = [(num_rows, None) for _, num_rows in metadata]
-                del metadata
-            for path, (num_rows, snapshot) in zip(paths, entries, strict=True):
-                if snapshot is not None:
-                    if len(snapshot) > remaining_snapshot_bytes:
-                        snapshot = None
+            options: dict[str, Any] = {
+                "io_config": self._io_config,
+                "max_concurrent_files": self._metadata_concurrency,
+                "max_concurrent_requests": self._max_concurrent_requests,
+                "max_in_flight_bytes": self._max_in_flight_bytes,
+                "enable_read_coalescing": self._enable_read_coalescing,
+                "read_coalesce_gap_bytes": self._read_coalesce_gap_bytes,
+                "read_coalesce_max_bytes": self._read_coalesce_max_bytes,
+            }
+            with diagnostics.stage("planning_metadata"):
+                if (
+                    self._enable_metadata_reuse
+                    and remaining_snapshot_bytes
+                    and any(urlsplit(path).scheme == "s3" for path in paths)
+                ):
+                    if self._enable_row_count_planning:
+                        entries, _metrics = _native._read_vortex_row_counts_bulk_cached(
+                            paths, max_snapshot_bytes=remaining_snapshot_bytes, **options
+                        )
                     else:
-                        remaining_snapshot_bytes -= len(snapshot)
-                # Execution validates the full schema before optimization and
-                # retains residual dependencies before final projection.
-                yield DataSourceTask.vortex(
-                    path=path,
-                    schema=self._scan_schema,
-                    num_rows=num_rows,
-                    vortex_config=VortexSourceConfig(
-                        batch_size=self._batch_size,
-                        enable_projection_pushdown=self._enable_projection_pushdown,
-                        enable_filter_pushdown=self._enable_filter_pushdown,
-                        max_concurrent_requests=self._max_concurrent_requests,
-                        max_in_flight_bytes=self._max_in_flight_bytes,
-                        enable_read_coalescing=self._enable_read_coalescing,
-                        read_coalesce_gap_bytes=self._read_coalesce_gap_bytes,
-                        read_coalesce_max_bytes=self._read_coalesce_max_bytes,
-                        metadata_snapshot=snapshot,
-                    ),
-                    pushdowns=pushdowns,
-                    storage_config=StorageConfig(multithreaded_io=True, io_config=self._io_config),
-                )
+                        cached, _metrics = _native._read_vortex_metadata_bulk_cached(
+                            paths, max_snapshot_bytes=remaining_snapshot_bytes, **options
+                        )
+                        entries = [(num_rows, snapshot) for _, num_rows, snapshot in cached]
+                        del cached
+                elif self._enable_row_count_planning:
+                    counts, _metrics = _native._read_vortex_row_counts_bulk(paths, **options)
+                    entries = [(num_rows, None) for num_rows in counts]
+                else:
+                    metadata, _metrics = _native.read_vortex_metadata_bulk(paths, **options)
+                    entries = [(num_rows, None) for _, num_rows in metadata]
+                    del metadata
+            for path, (num_rows, snapshot) in zip(paths, entries, strict=True):
+                with diagnostics.stage("task_creation"):
+                    if snapshot is not None:
+                        if len(snapshot) > remaining_snapshot_bytes:
+                            snapshot = None
+                        else:
+                            remaining_snapshot_bytes -= len(snapshot)
+                    # Execution validates every full schema before optimization,
+                    # including when planning only requested footer row counts.
+                    task = DataSourceTask.vortex(
+                        path=path,
+                        schema=self._scan_schema,
+                        num_rows=num_rows,
+                        vortex_config=VortexSourceConfig(
+                            batch_size=self._batch_size,
+                            enable_projection_pushdown=self._enable_projection_pushdown,
+                            enable_filter_pushdown=self._enable_filter_pushdown,
+                            max_concurrent_requests=self._max_concurrent_requests,
+                            max_in_flight_bytes=self._max_in_flight_bytes,
+                            enable_read_coalescing=self._enable_read_coalescing,
+                            read_coalesce_gap_bytes=self._read_coalesce_gap_bytes,
+                            read_coalesce_max_bytes=self._read_coalesce_max_bytes,
+                            metadata_snapshot=snapshot,
+                        ),
+                        pushdowns=pushdowns,
+                        storage_config=StorageConfig(multithreaded_io=True, io_config=self._io_config),
+                    )
+                yield task

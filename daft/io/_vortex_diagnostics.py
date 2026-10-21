@@ -18,7 +18,28 @@ from typing import Any
 from daft import daft as _native
 
 _MAX_EVENTS = 50_000
-_STAGES = frozenset({"discovery", "discovery_fallback", "source_creation", "collection"})
+_STAGES = frozenset(
+    {
+        "query",
+        "discovery",
+        "discovery_fallback",
+        "source_creation",
+        "source_discovery_and_schema",
+        "collection",
+        "schema_inference",
+        "planning_metadata",
+        "task_creation",
+        "logical_optimization",
+        "physical_planning",
+        "executor_setup",
+        "executor_next",
+        "consumer_wait",
+        "runner_finalize",
+        "native_submit",
+        "native_finalize",
+        "event_loop_wait",
+    }
+)
 _COUNTERS = ("head_requests", "get_requests", "list_requests", "bytes_read")
 _lock = threading.RLock()
 
@@ -26,6 +47,7 @@ _lock = threading.RLock()
 @dataclass(slots=True)
 class _Capture:
     started_ns: int
+    shared_clock: bool = False
     events: list[dict[str, Any]] = field(default_factory=list)
     discovery: dict[str, int] = field(default_factory=lambda: {name: 0 for name in _COUNTERS})
     bulk_calls: int = 0
@@ -55,7 +77,7 @@ def start() -> None:
         if begin is None:
             raise RuntimeError("Rebuild with the Phase 6 native Vortex diagnostics feature")
         begin()
-        _capture = _Capture(time.perf_counter_ns())
+        _capture = _Capture(time.perf_counter_ns(), shared_clock=hasattr(_native, "_vortex_diagnostics_clock"))
 
 
 def finish() -> dict[str, Any]:
@@ -67,11 +89,17 @@ def finish() -> dict[str, Any]:
             raise RuntimeError("No Vortex diagnostic capture is active")
         try:
             native = _native._vortex_diagnostics_finish()
-            elapsed = time.perf_counter_ns() - current.started_ns
+            elapsed = native["elapsed_ns"] if current.shared_clock else time.perf_counter_ns() - current.started_ns
         finally:
             _capture = None
         return {
-            "schema_version": 1,
+            "schema_version": 2 if current.shared_clock else 1,
+            "clock": "native_monotonic" if current.shared_clock else "separate_origins",
+            "clock_alignment": (
+                {"native_origin_python_ns": 0, "uncertainty_ns": 0, "method": "shared_native_clock"}
+                if current.shared_clock
+                else None
+            ),
             "scope": "one native-runner query; process-local logical I/O, not physical network traffic",
             "elapsed_ns": elapsed,
             "native": native,
@@ -88,8 +116,9 @@ def finish() -> dict[str, Any]:
             "retry_attempts": None,
             "retry_attempts_unavailable_reason": "This capture does not export physical transport retry attempts",
             "timing_note": (
-                "Native and Python timestamps have separate capture origins; "
-                "nested/concurrent durations overlap and must not be summed into a query breakdown"
+                "Native and Python events use the same monotonic clock when clock=native_monotonic. "
+                "Capture/FFI overhead remains in diagnostic times. Nested/concurrent durations overlap; "
+                "use interval unions, not sums, for wall coverage. Uninstrumented time is unattributed."
             ),
         }
 
@@ -103,26 +132,33 @@ def stage(name: str) -> Iterator[None]:
     if current is None:
         yield
         return
-    started = time.perf_counter_ns()
+    started = _native._vortex_diagnostics_clock() if current.shared_clock else time.perf_counter_ns()
+    if started is None:
+        raise RuntimeError("Native diagnostic clock is inactive")
     error = False
     try:
         yield
+    except (StopIteration, StopAsyncIteration, GeneratorExit):
+        raise
     except BaseException:
         error = True
         raise
     finally:
-        elapsed = time.perf_counter_ns() - started
         with _lock:
             # A late context from a finished capture must not pollute a new one.
             if _capture is current:
+                ended = _native._vortex_diagnostics_clock() if current.shared_clock else time.perf_counter_ns()
+                if ended is None:
+                    raise RuntimeError("Native diagnostic clock is inactive")
                 if len(current.events) >= _MAX_EVENTS:
                     current.dropped_events += 1
                 else:
                     current.events.append(
                         {
                             "phase": name,
-                            "started_ns": started - current.started_ns,
-                            "duration_ns": elapsed,
+                            "started_ns": started if current.shared_clock else started - current.started_ns,
+                            "duration_ns": ended - started,
+                            "thread_id": threading.get_ident(),
                             "error": error,
                         }
                     )

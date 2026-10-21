@@ -1,7 +1,10 @@
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use bytes::Bytes;
-use common_runtime::{RuntimeTask, get_io_runtime};
+use common_runtime::{
+    RuntimeTask, get_io_runtime,
+    query_profile::{self as profile, Phase},
+};
 use daft_dsl::optimization::get_required_columns;
 use parquet::{
     arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions},
@@ -68,31 +71,40 @@ async fn drive_group(slot: &GroupSlot, path: &str) -> GroupResult {
 pub(super) async fn open_local_file(
     path: &str,
 ) -> crate::Result<(Arc<std::fs::File>, u64, ArrowReaderMetadata)> {
-    let path_owned = path.to_string();
-    let path_for_join = path.to_string();
-    get_io_runtime(true)
-        .spawn_blocking(move || {
-            let file = std::fs::File::open(&path_owned).map_err(|e| crate::Error::LocalIO {
-                path: path_owned.clone(),
-                source: e,
-            })?;
-            let file_len = file
-                .metadata()
-                .map_err(|e| crate::Error::LocalIO {
+    let trace = profile::begin(Phase::Parquet, "local_open_metadata", Some(path));
+    profile::measure_future(trace, async {
+        let path_owned = path.to_string();
+        let path_for_join = path.to_string();
+        let queued = profile::begin(Phase::Parquet, "local_open_queue", Some(path));
+        get_io_runtime(true)
+            .spawn_blocking(move || {
+                profile::complete(queued, false);
+                let file = std::fs::File::open(&path_owned).map_err(|e| crate::Error::LocalIO {
                     path: path_owned.clone(),
                     source: e,
-                })?
-                .len();
-            let meta =
-                ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).with_context(|_| {
-                    ParquetMetadataSnafu {
-                        path: path_owned.clone(),
-                    }
                 })?;
-            crate::Result::Ok((Arc::new(file), file_len, meta))
-        })
-        .await
-        .map_err(task_err(path_for_join))?
+                let file_len = file
+                    .metadata()
+                    .map_err(|e| crate::Error::LocalIO {
+                        path: path_owned.clone(),
+                        source: e,
+                    })?
+                    .len();
+                let meta = profile::measure(
+                    Phase::Parquet,
+                    "local_footer_read_decode",
+                    Some(&path_owned),
+                    || ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()),
+                )
+                .with_context(|_| ParquetMetadataSnafu {
+                    path: path_owned.clone(),
+                })?;
+                crate::Result::Ok((Arc::new(file), file_len, meta))
+            })
+            .await
+            .map_err(task_err(path_for_join))?
+    })
+    .await
 }
 
 pub(super) async fn prepare_remote_chunk_source(
@@ -400,79 +412,86 @@ impl LocalChunkSource {
         rg_idx: usize,
         leaves: &[usize],
     ) -> crate::Result<HashMap<usize, OffsetBytes>> {
-        if leaves.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let rg = self.metadata.row_group(rg_idx);
-        let leaf_ranges: Vec<LeafRange> = leaves
-            .iter()
-            .map(|&l| {
-                let (start, len) = rg.column(l).byte_range();
-                LeafRange {
-                    leaf: l,
-                    start,
-                    len,
+        profile::measure(
+            Phase::Parquet,
+            "local_read_chunks",
+            Some(&self.path),
+            || {
+                if leaves.is_empty() {
+                    return Ok(HashMap::new());
                 }
-            })
-            .collect();
-        let groups = coalesce_ranges(leaf_ranges, Self::MAX_COALESCE_GAP);
-        let mut out = HashMap::with_capacity(leaves.len());
-        for RangeGroup {
-            start: group_start,
-            end: group_end,
-            members,
-        } in groups
-        {
-            let group_len = (group_end - group_start) as usize;
-            let mut buf = vec![0u8; group_len];
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::FileExt;
-                self.file
-                    .read_at(&mut buf, group_start)
-                    .map_err(|e| crate::Error::LocalIO {
-                        path: self.path.to_string(),
-                        source: std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "pread for rg={} coalesced range {}..{}: {}",
-                                rg_idx, group_start, group_end, e
-                            ),
-                        ),
-                    })?;
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::FileExt;
-                self.file
-                    .seek_read(&mut buf, group_start)
-                    .map_err(|e| crate::Error::LocalIO {
-                        path: self.path.to_string(),
-                        source: std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "seek_read for rg={} coalesced range {}..{}: {}",
-                                rg_idx, group_start, group_end, e
-                            ),
-                        ),
-                    })?;
-            }
-            let group_bytes = Bytes::from(buf);
-            for LeafRange { leaf, start, len } in members {
-                let local_start = (start - group_start) as usize;
-                let local_end = local_start + len as usize;
-                let slice = group_bytes.slice(local_start..local_end);
-                out.insert(
-                    leaf,
-                    OffsetBytes {
-                        base: start,
-                        file_len: self.file_len,
-                        bytes: slice,
-                    },
-                );
-            }
-        }
-        Ok(out)
+                let rg = self.metadata.row_group(rg_idx);
+                let leaf_ranges: Vec<LeafRange> = leaves
+                    .iter()
+                    .map(|&l| {
+                        let (start, len) = rg.column(l).byte_range();
+                        LeafRange {
+                            leaf: l,
+                            start,
+                            len,
+                        }
+                    })
+                    .collect();
+                let groups = coalesce_ranges(leaf_ranges, Self::MAX_COALESCE_GAP);
+                let mut out = HashMap::with_capacity(leaves.len());
+                for RangeGroup {
+                    start: group_start,
+                    end: group_end,
+                    members,
+                } in groups
+                {
+                    let group_len = (group_end - group_start) as usize;
+                    let mut buf = vec![0u8; group_len];
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::FileExt;
+                        self.file.read_at(&mut buf, group_start).map_err(|e| {
+                            crate::Error::LocalIO {
+                                path: self.path.to_string(),
+                                source: std::io::Error::new(
+                                    e.kind(),
+                                    format!(
+                                        "pread for rg={} coalesced range {}..{}: {}",
+                                        rg_idx, group_start, group_end, e
+                                    ),
+                                ),
+                            }
+                        })?;
+                    }
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::fs::FileExt;
+                        self.file.seek_read(&mut buf, group_start).map_err(|e| {
+                            crate::Error::LocalIO {
+                                path: self.path.to_string(),
+                                source: std::io::Error::new(
+                                    e.kind(),
+                                    format!(
+                                        "seek_read for rg={} coalesced range {}..{}: {}",
+                                        rg_idx, group_start, group_end, e
+                                    ),
+                                ),
+                            }
+                        })?;
+                    }
+                    let group_bytes = Bytes::from(buf);
+                    for LeafRange { leaf, start, len } in members {
+                        let local_start = (start - group_start) as usize;
+                        let local_end = local_start + len as usize;
+                        let slice = group_bytes.slice(local_start..local_end);
+                        out.insert(
+                            leaf,
+                            OffsetBytes {
+                                base: start,
+                                file_len: self.file_len,
+                                bytes: slice,
+                            },
+                        );
+                    }
+                }
+                Ok(out)
+            },
+        )
     }
 }
 
@@ -573,16 +592,25 @@ impl RemoteChunkSource {
                 let io_stats = io_stats.clone();
                 let uri = uri.clone();
                 let range = group_start as usize..group_end as usize;
+                let queued = profile::begin(Phase::Parquet, "data_range_queue", Some(&uri));
                 let task = io_runtime.spawn(async move {
-                    let get_result = io_client
-                        .single_url_get(
-                            uri,
-                            Some(daft_io::range::GetRange::Bounded(range)),
-                            io_stats,
-                        )
-                        .await?;
-                    let bytes = get_result.bytes().await?;
-                    crate::Result::Ok(bytes)
+                    profile::complete(queued, false);
+                    let mut trace = profile::begin(Phase::Parquet, "data_range", Some(&uri));
+                    if let Some(trace) = &mut trace {
+                        trace.range(group_start, range.len());
+                    }
+                    profile::measure_future(trace, async {
+                        let get_result = io_client
+                            .single_url_get(
+                                uri,
+                                Some(daft_io::range::GetRange::Bounded(range)),
+                                io_stats,
+                            )
+                            .await?;
+                        let bytes = get_result.bytes().await?;
+                        crate::Result::Ok(bytes)
+                    })
+                    .await
                 });
                 group_slots.push(GroupSlot {
                     group_start,

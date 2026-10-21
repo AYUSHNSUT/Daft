@@ -1,7 +1,8 @@
 # Phase 6 follow-up: amortized remote query cost
 
-Status: implemented and locally checked; persistent-process remote acceptance
-is pending. This experiment belongs to the personal fork.
+Status: implemented and accepted for correctness; the completed persistent-process
+run failed the remote and local performance gates. This experiment belongs to the
+personal fork. Phase 7 investigates these misses; it does not replace this result.
 
 The completed Phase 6 comparisons start a fresh process for every query. That
 measures first-query latency, including first-use S3 client initialization. The
@@ -93,3 +94,18 @@ final comparison and the four-layout guard. These are correctness checks with
 validation and all-features/all-targets Clippy passed. The S3 socket fixtures
 compile, but this agent session cannot bind localhost ports; live service and
 unfiltered Rust acceptance must run in the unrestricted terminal.
+
+## Completed persistent-process run
+
+Run `acceptance-20261021T093621Z-37703` passed all correctness checks: 32 service
+tests, 641 focused tests, 112 ORC/MCAP tests (one optional S3 skip), seven S3
+pooling tests and 2,315 Rust tests (20 ignored). All 3,000 benchmark trial outputs
+matched the independent oracle; all 120 diagnostic queries completed.
+
+With coalescing off, discovery/metadata concurrency eight and opening-range reuse,
+remote Vortex medians were 24.25 / 15.46 / 15.39 / 34.40 / 204.33 ms for narrow,
+range, equality, join and full reduction; Parquet was 31.61 / 13.97 / 13.44 /
+37.80 / 196.37 ms. Vortex won two of five cases. The local guard missed three
+Phase5-equivalent comparisons by 5.70%, 10.15% and 6.49%; absolute differences
+were 1.15, 1.62 and 0.44 ms. No thresholds were changed and no failed samples
+were removed. See the [Phase 7 design](vortex-phase7-design.md).

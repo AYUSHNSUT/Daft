@@ -18,6 +18,8 @@ use crate::{
     read::{MAX_CONCURRENT_METADATA_FILES, NULLABILITY_METADATA_KEY},
 };
 
+type PyCachedRowCountBatch<'py> = (Vec<(u64, Option<Py<PyBytes>>)>, Bound<'py, PyDict>);
+
 type PyMetadataBatch<'py> = (Vec<(PySchema, u64)>, Bound<'py, PyDict>);
 type PyCachedMetadataBatch<'py> = (
     Vec<(PySchema, u64, Option<Py<PyBytes>>)>,
@@ -155,12 +157,21 @@ fn metadata_inference(
     let uri = uri.to_string();
     py.detach(move || {
         crate::io::validate_options(&options)?;
-        let client = daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())?;
+        let client = diagnostics::measure(phase, "client_lookup", None, || {
+            daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())
+        })?;
         let stats = daft_io::IOStatsContext::new("Vortex metadata inference");
         let runtime = common_runtime::get_io_runtime(true);
-        let (schema, num_rows) = runtime.block_within_async_context(async move {
-            crate::read::read_metadata(&uri, client, stats, options, phase).await
-        })??;
+        let (schema, num_rows) = diagnostics::measure(
+            phase,
+            "metadata_runtime_dispatch",
+            None,
+            || -> PyResult<_> {
+                Ok(runtime.block_within_async_context(async move {
+                    crate::read::read_metadata(&uri, client, stats, options, phase).await
+                })??)
+            },
+        )?;
         Ok((schema.into(), num_rows))
     })
 }
@@ -202,20 +213,29 @@ fn read_vortex_metadata_bulk(
             ..Default::default()
         };
         crate::io::validate_options(&options)?;
-        let client = daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())?;
+        let client = diagnostics::measure(Phase::PlanningMetadata, "client_lookup", None, || {
+            daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())
+        })?;
         let stats = daft_io::IOStatsContext::new("Vortex bulk metadata inference");
         let bulk_stats = stats.clone();
         let runtime = common_runtime::get_io_runtime(true);
-        let metadata = runtime.block_within_async_context(async move {
-            crate::read_vortex_metadata_bulk(
-                &uris,
-                client,
-                bulk_stats,
-                options,
-                max_concurrent_files,
-            )
-            .await
-        })??;
+        let metadata = diagnostics::measure(
+            Phase::PlanningMetadata,
+            "metadata_runtime_dispatch",
+            None,
+            || -> PyResult<_> {
+                Ok(runtime.block_within_async_context(async move {
+                    crate::read_vortex_metadata_bulk(
+                        &uris,
+                        client,
+                        bulk_stats,
+                        options,
+                        max_concurrent_files,
+                    )
+                    .await
+                })??)
+            },
+        )?;
         Ok((metadata, stats, started.elapsed().as_secs_f64()))
     })?;
     let metrics = PyDict::new(py);
@@ -272,21 +292,30 @@ fn _read_vortex_metadata_bulk_cached(
             ..Default::default()
         };
         crate::io::validate_options(&options)?;
-        let client = daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())?;
+        let client = diagnostics::measure(Phase::PlanningMetadata, "client_lookup", None, || {
+            daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())
+        })?;
         let stats = daft_io::IOStatsContext::new("Vortex bulk metadata inference");
         let bulk_stats = stats.clone();
         let runtime = common_runtime::get_io_runtime(true);
-        let metadata = runtime.block_within_async_context(async move {
-            crate::read_vortex_metadata_bulk_cached(
-                &uris,
-                client,
-                bulk_stats,
-                options,
-                max_concurrent_files,
-                max_snapshot_bytes,
-            )
-            .await
-        })??;
+        let metadata = diagnostics::measure(
+            Phase::PlanningMetadata,
+            "metadata_runtime_dispatch",
+            None,
+            || -> PyResult<_> {
+                Ok(runtime.block_within_async_context(async move {
+                    crate::read_vortex_metadata_bulk_cached(
+                        &uris,
+                        client,
+                        bulk_stats,
+                        options,
+                        max_concurrent_files,
+                        max_snapshot_bytes,
+                    )
+                    .await
+                })??)
+            },
+        )?;
         Ok((metadata, stats, started.elapsed().as_secs_f64()))
     })?;
     let metrics = PyDict::new(py);
@@ -302,6 +331,164 @@ fn _read_vortex_metadata_bulk_cached(
         .map(|(schema, num_rows, snapshot)| {
             (
                 schema.into(),
+                num_rows,
+                snapshot.map(|bytes| PyBytes::new(py, &bytes).unbind()),
+            )
+        })
+        .collect();
+    Ok((metadata, metrics))
+}
+
+/// Read fresh metadata with bounded file concurrency and report this pass's I/O.
+/// Counters come from IOStatsContext, not wire requests or unique file bytes.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction(signature = (
+    uris,
+    io_config=None,
+    *,
+    max_concurrent_files=8,
+    max_concurrent_requests=8,
+    max_in_flight_bytes=67108864,
+    enable_read_coalescing=true,
+    read_coalesce_gap_bytes=65536,
+    read_coalesce_max_bytes=4194304,
+))]
+fn _read_vortex_row_counts_bulk(
+    py: Python<'_>,
+    uris: Vec<String>,
+    io_config: Option<IOConfig>,
+    #[pyo3(from_py_with = strict_metadata_concurrency)] max_concurrent_files: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_concurrent_requests: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_in_flight_bytes: usize,
+    #[pyo3(from_py_with = strict_vortex_bool)] enable_read_coalescing: bool,
+    #[pyo3(from_py_with = strict_coalesce_gap)] read_coalesce_gap_bytes: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] read_coalesce_max_bytes: usize,
+) -> PyResult<(Vec<u64>, Bound<'_, PyDict>)> {
+    let num_files = uris.len();
+    let (metadata, stats, elapsed_seconds) = py.detach(move || -> PyResult<_> {
+        let started = Instant::now();
+        let options = VortexReadOptions {
+            max_concurrent_requests,
+            max_in_flight_bytes,
+            enable_read_coalescing,
+            read_coalesce_gap_bytes,
+            read_coalesce_max_bytes,
+            ..Default::default()
+        };
+        crate::io::validate_options(&options)?;
+        let client = diagnostics::measure(Phase::PlanningMetadata, "client_lookup", None, || {
+            daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())
+        })?;
+        let stats = daft_io::IOStatsContext::new("Vortex bulk metadata inference");
+        let bulk_stats = stats.clone();
+        let runtime = common_runtime::get_io_runtime(true);
+        let metadata = diagnostics::measure(
+            Phase::PlanningMetadata,
+            "metadata_runtime_dispatch",
+            None,
+            || -> PyResult<_> {
+                Ok(runtime.block_within_async_context(async move {
+                    crate::read::read_vortex_row_counts_bulk(
+                        &uris,
+                        client,
+                        bulk_stats,
+                        options,
+                        max_concurrent_files,
+                    )
+                    .await
+                })??)
+            },
+        )?;
+        Ok((metadata, stats, started.elapsed().as_secs_f64()))
+    })?;
+    let metrics = PyDict::new(py);
+    metrics.set_item("num_files", num_files)?;
+    metrics.set_item("max_concurrent_files", max_concurrent_files)?;
+    metrics.set_item("elapsed_seconds", elapsed_seconds)?;
+    metrics.set_item("head_requests", stats.load_head_requests())?;
+    metrics.set_item("get_requests", stats.load_get_requests())?;
+    metrics.set_item("list_requests", stats.load_list_requests())?;
+    metrics.set_item("bytes_read", stats.load_bytes_read())?;
+    Ok((metadata, metrics))
+}
+
+/// Read fresh metadata with bounded file concurrency and report this pass's I/O.
+/// Counters come from IOStatsContext, not wire requests or unique file bytes.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction(signature = (
+    uris,
+    io_config=None,
+    *,
+    max_concurrent_files=8,
+    max_snapshot_bytes=67_108_864,
+    max_concurrent_requests=8,
+    max_in_flight_bytes=67108864,
+    enable_read_coalescing=true,
+    read_coalesce_gap_bytes=65536,
+    read_coalesce_max_bytes=4194304,
+))]
+fn _read_vortex_row_counts_bulk_cached(
+    py: Python<'_>,
+    uris: Vec<String>,
+    io_config: Option<IOConfig>,
+    #[pyo3(from_py_with = strict_metadata_concurrency)] max_concurrent_files: usize,
+    #[pyo3(from_py_with = strict_snapshot_budget)] max_snapshot_bytes: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_concurrent_requests: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] max_in_flight_bytes: usize,
+    #[pyo3(from_py_with = strict_vortex_bool)] enable_read_coalescing: bool,
+    #[pyo3(from_py_with = strict_coalesce_gap)] read_coalesce_gap_bytes: usize,
+    #[pyo3(from_py_with = strict_vortex_budget)] read_coalesce_max_bytes: usize,
+) -> PyResult<PyCachedRowCountBatch<'_>> {
+    let num_files = uris.len();
+    let (metadata, stats, elapsed_seconds) = py.detach(move || -> PyResult<_> {
+        let started = Instant::now();
+        let options = VortexReadOptions {
+            max_concurrent_requests,
+            max_in_flight_bytes,
+            enable_read_coalescing,
+            read_coalesce_gap_bytes,
+            read_coalesce_max_bytes,
+            ..Default::default()
+        };
+        crate::io::validate_options(&options)?;
+        let client = diagnostics::measure(Phase::PlanningMetadata, "client_lookup", None, || {
+            daft_io::get_io_client(true, io_config.unwrap_or_default().config.into())
+        })?;
+        let stats = daft_io::IOStatsContext::new("Vortex bulk metadata inference");
+        let bulk_stats = stats.clone();
+        let runtime = common_runtime::get_io_runtime(true);
+        let metadata = diagnostics::measure(
+            Phase::PlanningMetadata,
+            "metadata_runtime_dispatch",
+            None,
+            || -> PyResult<_> {
+                Ok(runtime.block_within_async_context(async move {
+                    crate::read::read_vortex_row_counts_bulk_cached(
+                        &uris,
+                        client,
+                        bulk_stats,
+                        options,
+                        max_concurrent_files,
+                        max_snapshot_bytes,
+                    )
+                    .await
+                })??)
+            },
+        )?;
+        Ok((metadata, stats, started.elapsed().as_secs_f64()))
+    })?;
+    let metrics = PyDict::new(py);
+    metrics.set_item("num_files", num_files)?;
+    metrics.set_item("max_concurrent_files", max_concurrent_files)?;
+    metrics.set_item("elapsed_seconds", elapsed_seconds)?;
+    metrics.set_item("head_requests", stats.load_head_requests())?;
+    metrics.set_item("get_requests", stats.load_get_requests())?;
+    metrics.set_item("list_requests", stats.load_list_requests())?;
+    metrics.set_item("bytes_read", stats.load_bytes_read())?;
+    let metadata = metadata
+        .into_iter()
+        .map(|(num_rows, snapshot)| {
+            (
                 num_rows,
                 snapshot.map(|bytes| PyBytes::new(py, &bytes).unbind()),
             )
@@ -398,10 +585,15 @@ fn _vortex_diagnostics_start() -> PyResult<()> {
 }
 
 #[pyfunction]
+fn _vortex_diagnostics_clock() -> Option<u64> {
+    diagnostics::instant_ns()
+}
+
+#[pyfunction]
 fn _vortex_diagnostics_finish(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let snapshot = diagnostics::finish()?;
     let result = PyDict::new(py);
-    result.set_item("schema_version", 1)?;
+    result.set_item("schema_version", 2)?;
     result.set_item("scope", "process_local_logical_operations")?;
     result.set_item("scope_note", "Logical API operations; SDK/transport retries are not separate events. batch_wait_decode includes I/O wait. Timings are wall time and overlapping spans must not be summed.")?;
     result.set_item("max_events", diagnostics::MAX_EVENTS)?;
@@ -412,11 +604,15 @@ fn _vortex_diagnostics_finish(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let events = PyList::empty(py);
     for event in snapshot.events {
         let record = PyDict::new(py);
+        record.set_item("span_id", event.span_id)?;
+        record.set_item("thread_id", event.thread_id)?;
         record.set_item("file_id", event.file_id)?;
         record.set_item("phase", event.phase.name())?;
         record.set_item("operation", event.operation)?;
         record.set_item("started_ns", event.started_ns)?;
         record.set_item("duration_ns", event.duration_ns)?;
+        record.set_item("active_poll_ns", event.active_poll_ns)?;
+        record.set_item("poll_count", event.poll_count)?;
         record.set_item("offset", event.offset)?;
         record.set_item("requested_bytes", event.requested_bytes)?;
         record.set_item("returned_bytes", event.returned_bytes)?;
@@ -437,8 +633,14 @@ pub fn register_python(parent: &Bound<'_, PyModule>) -> PyResult<()> {
     parent.add_function(wrap_pyfunction!(read_vortex_metadata, parent)?)?;
     parent.add_function(wrap_pyfunction!(read_vortex_metadata_bulk, parent)?)?;
     parent.add_function(wrap_pyfunction!(_read_vortex_metadata_bulk_cached, parent)?)?;
+    parent.add_function(wrap_pyfunction!(_read_vortex_row_counts_bulk, parent)?)?;
+    parent.add_function(wrap_pyfunction!(
+        _read_vortex_row_counts_bulk_cached,
+        parent
+    )?)?;
     parent.add_function(wrap_pyfunction!(_vortex_scan_diagnostics, parent)?)?;
     parent.add_function(wrap_pyfunction!(_vortex_diagnostics_start, parent)?)?;
     parent.add_function(wrap_pyfunction!(_vortex_diagnostics_finish, parent)?)?;
+    parent.add_function(wrap_pyfunction!(_vortex_diagnostics_clock, parent)?)?;
     Ok(())
 }

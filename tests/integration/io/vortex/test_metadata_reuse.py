@@ -35,13 +35,18 @@ def _client(config):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_minio_reuses_only_validated_opening_ranges(vortex_minio, enabled):
+@pytest.mark.parametrize("row_count_planning", [False, True])
+def test_minio_reuses_only_validated_opening_ranges(vortex_minio, enabled, row_count_planning):
     base, config, table = vortex_minio
     diagnostics.start()
     try:
         result = (
             daft.read_vortex(
-                base + "/prefix/explicit.bin", io_config=config, enable_metadata_reuse=enabled, batch_size=3
+                base + "/prefix/explicit.bin",
+                io_config=config,
+                enable_metadata_reuse=enabled,
+                batch_size=3,
+                enable_row_count_planning=row_count_planning,
             )
             .where(daft.col("value") >= 4)
             .select("id")
@@ -62,44 +67,61 @@ def test_minio_reuses_only_validated_opening_ranges(vortex_minio, enabled):
     assert capture["native"]["unfinished_events"] == capture["native"]["dropped_events"] == 0
 
 
-def test_minio_same_size_replacement_after_planning_is_rejected(vortex_minio, vortex_service_file, monkeypatch):
+@pytest.mark.parametrize("row_count_planning", [False, True])
+def test_minio_same_size_replacement_after_planning_is_rejected(
+    vortex_minio, vortex_service_file, monkeypatch, row_count_planning
+):
     base, config, _ = vortex_minio
     path, _ = vortex_service_file
     payload = path.read_bytes()
     changed = payload[:-1] + bytes([payload[-1] ^ 1])
     client = _client(config)
-    original = native._read_vortex_metadata_bulk_cached
+    api_name = "_read_vortex_row_counts_bulk_cached" if row_count_planning else "_read_vortex_metadata_bulk_cached"
+    original = getattr(native, api_name)
     snapshots = []
 
     def replace_after_planning(*args, **kwargs):
         metadata = original(*args, **kwargs)
-        snapshots.extend(snapshot for _, _, snapshot in metadata[0] if snapshot is not None)
+        snapshots.extend(entry[-1] for entry in metadata[0] if entry[-1] is not None)
         client.put_object(Bucket=base.removeprefix("s3://"), Key="prefix/explicit.bin", Body=changed)
         return metadata
 
-    monkeypatch.setattr(native, "_read_vortex_metadata_bulk_cached", replace_after_planning)
+    monkeypatch.setattr(native, api_name, replace_after_planning)
     with pytest.raises(Exception, match="(?i)object changed"):
-        daft.read_vortex(base + "/prefix/explicit.bin", io_config=config, enable_metadata_reuse=True).select(
-            "id"
-        ).collect()
+        daft.read_vortex(
+            base + "/prefix/explicit.bin",
+            io_config=config,
+            enable_metadata_reuse=True,
+            enable_row_count_planning=row_count_planning,
+        ).select("id").collect()
     assert snapshots, "the task must actually carry a validated snapshot"
 
 
-def test_minio_reused_source_reads_fresh_footer_counts_each_time(vortex_minio, tmp_path, monkeypatch):
+@pytest.mark.parametrize("row_count_planning", [False, True])
+def test_minio_reused_source_reads_fresh_footer_counts_each_time(
+    vortex_minio, tmp_path, monkeypatch, row_count_planning
+):
     import vortex
 
     base, config, table = vortex_minio
-    source = _vortex.VortexSource([base + "/prefix/explicit.bin"], config, 3, enable_metadata_reuse=True)
-    original = native._read_vortex_metadata_bulk_cached
+    source = _vortex.VortexSource(
+        [base + "/prefix/explicit.bin"],
+        config,
+        3,
+        enable_metadata_reuse=True,
+        enable_row_count_planning=row_count_planning,
+    )
+    api_name = "_read_vortex_row_counts_bulk_cached" if row_count_planning else "_read_vortex_metadata_bulk_cached"
+    original = getattr(native, api_name)
     counts = []
 
     def record(*args, **kwargs):
         result = original(*args, **kwargs)
-        counts.extend(rows for _, rows, _ in result[0])
-        assert all(snapshot is not None for _, _, snapshot in result[0])
+        counts.extend(entry[0] if row_count_planning else entry[1] for entry in result[0])
+        assert all(entry[-1] is not None for entry in result[0])
         return result
 
-    monkeypatch.setattr(native, "_read_vortex_metadata_bulk_cached", record)
+    monkeypatch.setattr(native, api_name, record)
 
     async def materialize():
         return [task async for task in source.get_tasks(Pushdowns())]
@@ -113,7 +135,8 @@ def test_minio_reused_source_reads_fresh_footer_counts_each_time(vortex_minio, t
     assert counts == [len(table), len(replacement)]
 
 
-def test_s3_replacement_after_validation_rejects_uncached_data(tmp_path, monkeypatch):
+@pytest.mark.parametrize("row_count_planning", [False, True])
+def test_s3_replacement_after_validation_rejects_uncached_data(tmp_path, monkeypatch, row_count_planning):
     """Force the HEAD/GET race through the real SDK and Vortex adapter."""
     import pyarrow as pa
     import vortex
@@ -170,15 +193,16 @@ def test_s3_replacement_after_validation_rejects_uncached_data(tmp_path, monkeyp
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    original = native._read_vortex_metadata_bulk_cached
+    api_name = "_read_vortex_row_counts_bulk_cached" if row_count_planning else "_read_vortex_metadata_bulk_cached"
+    original = getattr(native, api_name)
 
     def arm_after_planning(*args, **kwargs):
         result = original(*args, **kwargs)
-        assert result[0][0][2] is not None
+        assert result[0][0][-1] is not None
         state["armed"] = True
         return result
 
-    monkeypatch.setattr(native, "_read_vortex_metadata_bulk_cached", arm_after_planning)
+    monkeypatch.setattr(native, api_name, arm_after_planning)
     config = daft.io.IOConfig(
         s3=daft.io.S3Config(
             endpoint_url=f"http://127.0.0.1:{server.server_port}",
@@ -194,7 +218,10 @@ def test_s3_replacement_after_validation_rejects_uncached_data(tmp_path, monkeyp
         try:
             with pytest.raises(Exception, match="(?i)object changed"):
                 daft.read_vortex(
-                    "s3://metadata-race/large.vortex", io_config=config, enable_metadata_reuse=True
+                    "s3://metadata-race/large.vortex",
+                    io_config=config,
+                    enable_metadata_reuse=True,
+                    enable_row_count_planning=row_count_planning,
                 ).select("payload").collect()
         finally:
             capture = diagnostics.finish()

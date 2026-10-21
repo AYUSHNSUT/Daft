@@ -384,3 +384,37 @@ preserves completed samples; the worker is not restarted and trials are not
 retried. There is no inter-trial pacing. The local Docker service is not an
 AWS/WAN benchmark; caches are retained, and client RSS excludes MinIO/Docker
 resources.
+
+## Phase 7: paired diagnosis and full-layer traces
+
+See [the Phase 7 design](../../docs/contributing/vortex-phase7-design.md). The new
+release build exposes shared-clock Python/native diagnostic events for both
+formats. Run profiling separately from performance samples; do not run builds or
+tests concurrently with a comparison.
+
+```bash
+.venv/bin/python -m benchmarking.vortex.phase7 \
+  --manifest examples/vortex_eval/artifacts/phase4/fixtures-1g/manifest.json \
+  --output examples/vortex_eval/artifacts/phase7/local \
+  --datasets sorted/single sorted/multi shuffled/single shuffled/multi \
+  --experiments aa row-count parquet
+
+.venv/bin/python -m examples.vortex_eval.run_phase7_services \
+  --manifest examples/vortex_eval/artifacts/phase4/remote-fixtures/manifest.json \
+  --output examples/vortex_eval/artifacts/phase7/remote \
+  --docker-image draft-vortex-minio:phase3
+```
+
+Release diagnosis requires a clean tracked checkout and
+`DAFT_VORTEX_BENCH_BUILD_COMMAND` set to the actual release build command. Use a
+new output directory on each deliberate experiment. Defaults are 20 adjacent
+balanced measured pairs, one warmup and three later diagnostic repetitions.
+Comparisons isolate row-count-only planning and request caps (1/2/4 versus 8 per
+file); A/A uses identical configurations. All queries construct fresh sources in
+one persistent process; source creation remains included.
+
+Each `profiles/NNNNN/` contains accounting JSON/Markdown/HTML and a Chrome trace.
+The top-level report links each diagnostic to its exact workload/configuration.
+Wall unions, summed event durations and active-poll time have different meanings;
+read the coverage notes before attributing cost. This is exploratory evidence,
+not a replacement for the unchanged final acceptance gates.

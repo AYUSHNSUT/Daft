@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use arrow::{array::ArrayRef, datatypes::Field as ArrowField};
+use common_runtime::query_profile::{self as profile, Phase};
 use parquet::{
     arrow::{
         array_reader::{
@@ -731,14 +732,17 @@ pub(super) async fn decode_one_streaming(
     sender: tokio::sync::mpsc::Sender<common_error::DaftResult<ArrayRef>>,
 ) {
     let result: ParquetResult<()> = async {
-        let (mut reader, total_rows) = build_top_field_reader(
-            chunks.as_ref(),
-            &metadata,
-            rg_idx,
-            top_field_idx,
-            &arrow_field,
-            chunk_size,
-        )?;
+        let (mut reader, total_rows) =
+            profile::measure(Phase::Parquet, "column_decoder_build", Some(&path), || {
+                build_top_field_reader(
+                    chunks.as_ref(),
+                    &metadata,
+                    rg_idx,
+                    top_field_idx,
+                    &arrow_field,
+                    chunk_size,
+                )
+            })?;
 
         use parquet::arrow::arrow_reader::RowSelector;
         let selectors: Vec<RowSelector> = match &selection {
@@ -749,19 +753,34 @@ pub(super) async fn decode_one_streaming(
         let mut acc = 0usize;
         for sel in selectors {
             if sel.skip {
-                reader.skip_records(sel.row_count)?;
+                profile::measure(Phase::Parquet, "column_skip", Some(&path), || {
+                    reader.skip_records(sel.row_count)
+                })?;
                 continue;
             }
             let mut remaining = sel.row_count;
             while remaining > 0 {
                 let room = chunk_size - acc;
                 let take = remaining.min(room);
-                reader.read_records(take)?;
+                profile::measure(Phase::Parquet, "column_decode", Some(&path), || {
+                    reader.read_records(take)
+                })?;
                 acc += take;
                 remaining -= take;
                 if acc == chunk_size {
-                    let arr = reader.consume_batch()?;
-                    if sender.send(Ok(arr)).await.is_err() {
+                    let arr =
+                        profile::measure(Phase::Parquet, "column_consume", Some(&path), || {
+                            reader.consume_batch()
+                        })?;
+                    if profile::measure_async(
+                        Phase::Parquet,
+                        "column_backpressure",
+                        Some(&path),
+                        sender.send(Ok(arr)),
+                    )
+                    .await
+                    .is_err()
+                    {
                         return Ok(());
                     }
                     acc = 0;
@@ -769,8 +788,16 @@ pub(super) async fn decode_one_streaming(
             }
         }
         if acc > 0 {
-            let arr = reader.consume_batch()?;
-            let _ = sender.send(Ok(arr)).await;
+            let arr = profile::measure(Phase::Parquet, "column_consume", Some(&path), || {
+                reader.consume_batch()
+            })?;
+            let _ = profile::measure_async(
+                Phase::Parquet,
+                "column_backpressure",
+                Some(&path),
+                sender.send(Ok(arr)),
+            )
+            .await;
         }
         Ok(())
     }

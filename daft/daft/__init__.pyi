@@ -1415,6 +1415,33 @@ def _read_vortex_metadata_bulk_cached(
 ) -> tuple[list[tuple[PySchema, int, bytes | None]], dict[str, int | float]]:
     """Read ordered fresh footers with bounded concurrency and metadata-only I/O diagnostics."""
 
+def _read_vortex_row_counts_bulk(
+    uris: list[str],
+    io_config: IOConfig | None = None,
+    *,
+    max_concurrent_files: int = 8,
+    max_concurrent_requests: int = 8,
+    max_in_flight_bytes: int = 67108864,
+    enable_read_coalescing: bool = True,
+    read_coalesce_gap_bytes: int = 65536,
+    read_coalesce_max_bytes: int = 4194304,
+) -> tuple[list[int], dict[str, int | float]]:
+    """Read fresh footer row counts without converting unused planning schemas."""
+
+def _read_vortex_row_counts_bulk_cached(
+    uris: list[str],
+    io_config: IOConfig | None = None,
+    *,
+    max_concurrent_files: int = 8,
+    max_snapshot_bytes: int = 67108864,
+    max_concurrent_requests: int = 8,
+    max_in_flight_bytes: int = 67108864,
+    enable_read_coalescing: bool = True,
+    read_coalesce_gap_bytes: int = 65536,
+    read_coalesce_max_bytes: int = 4194304,
+) -> tuple[list[tuple[int, bytes | None]], dict[str, int | float]]:
+    """Read fresh footer row counts and bounded snapshots for conditional execution."""
+
 def _vortex_scan_diagnostics(
     schema: PySchema,
     columns: list[str] | None = None,
@@ -1427,6 +1454,9 @@ def _vortex_scan_diagnostics(
 
 def _vortex_diagnostics_start() -> None:
     """Begin one bounded, process-local native benchmark trace."""
+
+def _vortex_diagnostics_clock() -> int | None:
+    """Read the active native capture's shared monotonic clock in nanoseconds."""
 
 def _vortex_diagnostics_finish() -> dict[str, Any]:
     """Stop the native collector and return logical-operation timings without URIs."""

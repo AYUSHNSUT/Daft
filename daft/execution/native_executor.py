@@ -38,6 +38,8 @@ class NativeExecutor:
         *,
         results_buffer_size: int | None = None,
     ) -> Generator[LocalMaterializedResult, None, tuple[str, PyExecutionStats]]:
+        from daft.io import _vortex_diagnostics as diagnostics
+
         if results_buffer_size is not None and (
             isinstance(results_buffer_size, bool)
             or not isinstance(results_buffer_size, int)
@@ -47,15 +49,16 @@ class NativeExecutor:
         stats: PyExecutionStats | None = None
 
         async def stream_results() -> AsyncGenerator[PyMicroPartition | FlightPartitions | None, None]:
-            result_handle = await self._executor.run(
-                local_physical_plan,
-                ctx._ctx,
-                0,
-                dict(inputs),
-                context,
-                ctx.daft_execution_config.maintain_order,
-                results_buffer_size=results_buffer_size,
-            )
+            with diagnostics.stage("native_submit"):
+                result_handle = await self._executor.run(
+                    local_physical_plan,
+                    ctx._ctx,
+                    0,
+                    dict(inputs),
+                    context,
+                    ctx.daft_execution_config.maintain_order,
+                    results_buffer_size=results_buffer_size,
+                )
             nonlocal stats
             completed = False
             try:
@@ -65,10 +68,11 @@ class NativeExecutor:
                         break
                     yield batch
             finally:
-                if completed:
-                    stats = await result_handle.try_finish()
-                else:
-                    await result_handle.aclose()
+                with diagnostics.stage("native_finalize"):
+                    if completed:
+                        stats = await result_handle.try_finish()
+                    else:
+                        await result_handle.aclose()
             yield None
 
         event_loop = get_or_init_event_loop()
@@ -76,7 +80,8 @@ class NativeExecutor:
         should_raise_errors_from_close = True
         try:
             while True:
-                part = event_loop.run(async_exec.__anext__())
+                with diagnostics.stage("event_loop_wait"):
+                    part = event_loop.run(async_exec.__anext__())
                 if part is None:
                     break
                 yield LocalMaterializedResult(MicroPartition._from_pymicropartition(part))

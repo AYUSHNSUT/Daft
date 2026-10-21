@@ -23,6 +23,7 @@ use std::sync::LazyLock;
 
 use azure_blob::AzureBlobSource;
 use common_file_formats::FileFormat;
+use common_runtime::query_profile::{self as profile, Phase};
 pub use counting_reader::CountingReader;
 use google_cloud::GCSSource;
 #[cfg(feature = "python")]
@@ -237,136 +238,144 @@ impl IOClient {
         &self,
         input: &str,
     ) -> Result<(Arc<dyn ObjectSource>, String)> {
-        let resolved = resolve_url_alias(input, &self.config);
-        let (source_type, path) = parse_url(&resolved)?;
+        let trace = profile::begin(Phase::Io, "source_acquisition", Some(input));
+        profile::measure_future(trace, async {
+            let resolved = resolve_url_alias(input, &self.config);
+            let (source_type, path) = parse_url(&resolved)?;
 
-        {
-            if let Some(client) = self.source_type_to_store.read().await.get(&source_type) {
+            {
+                if let Some(client) = self.source_type_to_store.read().await.get(&source_type) {
+                    return Ok((client.clone(), path.to_string()));
+                }
+            }
+            let mut w_handle = self.source_type_to_store.write().await;
+
+            if let Some(client) = w_handle.get(&source_type) {
                 return Ok((client.clone(), path.to_string()));
             }
-        }
-        let mut w_handle = self.source_type_to_store.write().await;
 
-        if let Some(client) = w_handle.get(&source_type) {
-            return Ok((client.clone(), path.to_string()));
-        }
+            let new_source = match &source_type {
+                SourceType::File => LocalSource::get_client().await? as Arc<dyn ObjectSource>,
+                SourceType::Http => {
+                    let url = url::Url::parse(&path).context(InvalidUrlSnafu { path: input })?;
 
-        let new_source = match &source_type {
-            SourceType::File => LocalSource::get_client().await? as Arc<dyn ObjectSource>,
-            SourceType::Http => {
-                let url = url::Url::parse(&path).context(InvalidUrlSnafu { path: input })?;
-
-                // Hugging Face requires special logic around cache busting. That logic is encapsulated in the HFSource.
-                match url.domain() {
-                    Some("huggingface.co") => {
-                        HFSource::get_client(&self.config.hf, &self.config.http).await?
-                            as Arc<dyn ObjectSource>
-                    }
-                    _ => HttpSource::get_client(&self.config.http).await? as Arc<dyn ObjectSource>,
-                }
-            }
-            SourceType::S3 => {
-                S3LikeSource::get_client(&self.config.s3).await? as Arc<dyn ObjectSource>
-            }
-            SourceType::AzureBlob => {
-                AzureBlobSource::get_client(&self.config.azure, &path).await?
-                    as Arc<dyn ObjectSource>
-            }
-
-            SourceType::GCS => {
-                GCSSource::get_client(&self.config.gcs).await? as Arc<dyn ObjectSource>
-            }
-            SourceType::HF => {
-                HFSource::get_client(&self.config.hf, &self.config.http).await?
-                    as Arc<dyn ObjectSource>
-            }
-            SourceType::Unity => {
-                #[cfg(feature = "python")]
-                {
-                    UnitySource::get_client(&self.config.unity).await? as Arc<dyn ObjectSource>
-                }
-                #[cfg(not(feature = "python"))]
-                {
-                    unimplemented!("Unity Catalog source currently requires Python");
-                }
-            }
-            SourceType::Gravitino => {
-                #[cfg(feature = "python")]
-                {
-                    GravitinoSource::get_client(&self.config.gravitino).await?
-                        as Arc<dyn ObjectSource>
-                }
-                #[cfg(not(feature = "python"))]
-                {
-                    unimplemented!("Gravitino source currently requires Python");
-                }
-            }
-            SourceType::OpenDAL { scheme } => {
-                let empty_config = std::collections::BTreeMap::new();
-                let mut backend_config = match scheme.as_str() {
-                    "cos" | "tos" => {
-                        let parsed_url =
-                            url::Url::parse(&path).context(InvalidUrlSnafu { path: input })?;
-                        let bucket = parsed_url.host_str().unwrap_or_default();
-                        match scheme.as_str() {
-                            "cos" => self.config.cos.to_opendal_config(bucket),
-                            _ => self.config.tos.to_opendal_config(bucket),
+                    // Hugging Face requires special logic around cache busting. That logic is encapsulated in the HFSource.
+                    match url.domain() {
+                        Some("huggingface.co") => {
+                            HFSource::get_client(&self.config.hf, &self.config.http).await?
+                                as Arc<dyn ObjectSource>
+                        }
+                        _ => {
+                            HttpSource::get_client(&self.config.http).await?
+                                as Arc<dyn ObjectSource>
                         }
                     }
-                    "goosefs" => {
-                        // Extract authority (host:port) from URL as default master_addr.
-                        let parsed_url =
-                            url::Url::parse(&path).context(InvalidUrlSnafu { path: input })?;
-                        let authority = match parsed_url.port() {
-                            Some(port) => {
-                                format!("{}:{}", parsed_url.host_str().unwrap_or(""), port)
-                            }
-                            None => parsed_url.host_str().unwrap_or("").to_string(),
-                        };
-                        self.config.goosefs.to_opendal_config(&authority)
+                }
+                SourceType::S3 => {
+                    S3LikeSource::get_client(&self.config.s3).await? as Arc<dyn ObjectSource>
+                }
+                SourceType::AzureBlob => {
+                    AzureBlobSource::get_client(&self.config.azure, &path).await?
+                        as Arc<dyn ObjectSource>
+                }
+
+                SourceType::GCS => {
+                    GCSSource::get_client(&self.config.gcs).await? as Arc<dyn ObjectSource>
+                }
+                SourceType::HF => {
+                    HFSource::get_client(&self.config.hf, &self.config.http).await?
+                        as Arc<dyn ObjectSource>
+                }
+                SourceType::Unity => {
+                    #[cfg(feature = "python")]
+                    {
+                        UnitySource::get_client(&self.config.unity).await? as Arc<dyn ObjectSource>
                     }
-                    #[cfg(feature = "hdfs")]
-                    "hdfs" => {
-                        // Extract name_node (scheme + authority) from URL,
-                        // e.g. "hdfs://namenode:9000" from "hdfs://namenode:9000/path".
-                        let parsed_url =
-                            url::Url::parse(&path).context(InvalidUrlSnafu { path: input })?;
-                        let name_node =
-                            format!("{}://{}", parsed_url.scheme(), parsed_url.authority());
-                        self.config.hdfs.to_opendal_config(&name_node)
-                    }
-                    #[cfg(not(feature = "hdfs"))]
-                    "hdfs" => {
-                        log::warn!(
-                            "HDFS support is not compiled in. \
-                             Rebuild with `--features hdfs` to enable it."
-                        );
-                        self.config
-                            .opendal_backends
-                            .get("hdfs")
-                            .unwrap_or(&empty_config)
-                            .clone()
-                    }
-                    _ => self
-                        .config
-                        .opendal_backends
-                        .get(scheme)
-                        .unwrap_or(&empty_config)
-                        .clone(),
-                };
-                if let Some(extra) = self.config.opendal_backends.get(scheme) {
-                    for (k, v) in extra {
-                        backend_config.insert(k.clone(), v.clone());
+                    #[cfg(not(feature = "python"))]
+                    {
+                        unimplemented!("Unity Catalog source currently requires Python");
                     }
                 }
-                OpenDALSource::get_client(scheme, &backend_config).await? as Arc<dyn ObjectSource>
-            }
-        };
+                SourceType::Gravitino => {
+                    #[cfg(feature = "python")]
+                    {
+                        GravitinoSource::get_client(&self.config.gravitino).await?
+                            as Arc<dyn ObjectSource>
+                    }
+                    #[cfg(not(feature = "python"))]
+                    {
+                        unimplemented!("Gravitino source currently requires Python");
+                    }
+                }
+                SourceType::OpenDAL { scheme } => {
+                    let empty_config = std::collections::BTreeMap::new();
+                    let mut backend_config = match scheme.as_str() {
+                        "cos" | "tos" => {
+                            let parsed_url =
+                                url::Url::parse(&path).context(InvalidUrlSnafu { path: input })?;
+                            let bucket = parsed_url.host_str().unwrap_or_default();
+                            match scheme.as_str() {
+                                "cos" => self.config.cos.to_opendal_config(bucket),
+                                _ => self.config.tos.to_opendal_config(bucket),
+                            }
+                        }
+                        "goosefs" => {
+                            // Extract authority (host:port) from URL as default master_addr.
+                            let parsed_url =
+                                url::Url::parse(&path).context(InvalidUrlSnafu { path: input })?;
+                            let authority = match parsed_url.port() {
+                                Some(port) => {
+                                    format!("{}:{}", parsed_url.host_str().unwrap_or(""), port)
+                                }
+                                None => parsed_url.host_str().unwrap_or("").to_string(),
+                            };
+                            self.config.goosefs.to_opendal_config(&authority)
+                        }
+                        #[cfg(feature = "hdfs")]
+                        "hdfs" => {
+                            // Extract name_node (scheme + authority) from URL,
+                            // e.g. "hdfs://namenode:9000" from "hdfs://namenode:9000/path".
+                            let parsed_url =
+                                url::Url::parse(&path).context(InvalidUrlSnafu { path: input })?;
+                            let name_node =
+                                format!("{}://{}", parsed_url.scheme(), parsed_url.authority());
+                            self.config.hdfs.to_opendal_config(&name_node)
+                        }
+                        #[cfg(not(feature = "hdfs"))]
+                        "hdfs" => {
+                            log::warn!(
+                                "HDFS support is not compiled in. \
+                             Rebuild with `--features hdfs` to enable it."
+                            );
+                            self.config
+                                .opendal_backends
+                                .get("hdfs")
+                                .unwrap_or(&empty_config)
+                                .clone()
+                        }
+                        _ => self
+                            .config
+                            .opendal_backends
+                            .get(scheme)
+                            .unwrap_or(&empty_config)
+                            .clone(),
+                    };
+                    if let Some(extra) = self.config.opendal_backends.get(scheme) {
+                        for (k, v) in extra {
+                            backend_config.insert(k.clone(), v.clone());
+                        }
+                    }
+                    OpenDALSource::get_client(scheme, &backend_config).await?
+                        as Arc<dyn ObjectSource>
+                }
+            };
 
-        if w_handle.get(&source_type).is_none() {
-            w_handle.insert(source_type, new_source.clone());
-        }
-        Ok((new_source, path.to_string()))
+            if w_handle.get(&source_type).is_none() {
+                w_handle.insert(source_type, new_source.clone());
+            }
+            Ok((new_source, path.to_string()))
+        })
+        .await
     }
 
     pub async fn get_source(&self, input: &str) -> Result<Arc<dyn ObjectSource>> {
@@ -431,48 +440,63 @@ impl IOClient {
         io_stats: Option<IOStatsRef>,
         version: Option<ObjectVersion>,
     ) -> Result<GetResult> {
-        let resolved = resolve_url_alias(&input, &self.config);
-        let (_, path) = parse_url(&resolved)?;
-        let source = self.get_source(&resolved).await?;
+        let trace = profile::begin(Phase::Io, "get_headers", Some(&input));
+        profile::measure_future(trace, async {
+            let resolved = resolve_url_alias(&input, &self.config);
+            let (_, path) = parse_url(&resolved)?;
+            let source = self.get_source(&resolved).await?;
 
-        if let Some(GetRange::Suffix(_)) = range
-            && !self.support_suffix_range()
-        {
-            return Err(InvalidRangeRequest {
-                source: InvalidGetRange::UnsupportedSuffixRange,
-            });
-        }
+            if let Some(GetRange::Suffix(_)) = range
+                && !self.support_suffix_range()
+            {
+                return Err(InvalidRangeRequest {
+                    source: InvalidGetRange::UnsupportedSuffixRange,
+                });
+            }
 
-        let path: Arc<str> = Arc::from(path.as_ref());
-        let get_result = crate::retry::ExponentialBackoff::default()
-            .retry(|| {
-                let source = source.clone();
-                let path = path.clone();
-                let range = range.clone();
-                let io_stats = io_stats.clone();
-                let version = version.clone();
-                async move {
-                    let result = match version {
-                        Some(version) => {
-                            source.get_if_match(&path, range, &version, io_stats).await
-                        }
-                        None => source.get(&path, range, io_stats).await,
-                    };
-                    result.map_err(|e| match &e {
-                        Error::MiscTransient { .. }
-                        | Error::SocketError { .. }
-                        | Error::ConnectTimeout { .. } => {
-                            log::warn!("Transient error during GET, will retry: {}", e);
-                            crate::retry::RetryError::Transient(e)
-                        }
-                        _ => crate::retry::RetryError::Permanent(e),
-                    })
-                }
-            })
-            .await?;
-        Ok(get_result.with_retry(
-            StreamingRetryParams::new(source, input, range, io_stats).with_version(version),
-        ))
+            let path: Arc<str> = Arc::from(path.as_ref());
+            let get_result = crate::retry::ExponentialBackoff::default()
+                .retry(|| {
+                    let source = source.clone();
+                    let path = path.clone();
+                    let range = range.clone();
+                    let io_stats = io_stats.clone();
+                    let version = version.clone();
+                    async move {
+                        let trace = profile::begin(Phase::Io, "get_attempt_headers", Some(&path));
+                        let result = profile::measure_future(trace, async {
+                            match version {
+                                Some(version) => {
+                                    source.get_if_match(&path, range, &version, io_stats).await
+                                }
+                                None => source.get(&path, range, io_stats).await,
+                            }
+                        })
+                        .await;
+                        result.map_err(|e| match &e {
+                            Error::MiscTransient { .. }
+                            | Error::SocketError { .. }
+                            | Error::ConnectTimeout { .. } => {
+                                log::warn!("Transient error during GET, will retry: {}", e);
+                                crate::retry::RetryError::Transient(e)
+                            }
+                            _ => crate::retry::RetryError::Permanent(e),
+                        })
+                    }
+                })
+                .await?;
+            let body_trace = if matches!(&get_result, GetResult::Stream(..)) {
+                profile::begin(Phase::Io, "response_body", Some(&input))
+            } else {
+                None
+            };
+            Ok(get_result
+                .with_retry(
+                    StreamingRetryParams::new(source, input, range, io_stats).with_version(version),
+                )
+                .with_profile(body_trace))
+        })
+        .await
     }
 
     pub async fn single_url_put(
@@ -492,10 +516,14 @@ impl IOClient {
         input: String,
         io_stats: Option<IOStatsRef>,
     ) -> Result<usize> {
-        let resolved = resolve_url_alias(&input, &self.config);
-        let (_, path) = parse_url(&resolved)?;
-        let source = self.get_source(&resolved).await?;
-        source.get_size(path.as_ref(), io_stats).await
+        let trace = profile::begin(Phase::Io, "head", Some(&input));
+        profile::measure_future(trace, async {
+            let resolved = resolve_url_alias(&input, &self.config);
+            let (_, path) = parse_url(&resolved)?;
+            let source = self.get_source(&resolved).await?;
+            source.get_size(path.as_ref(), io_stats).await
+        })
+        .await
     }
 
     pub async fn single_url_get_read_metadata(
@@ -503,12 +531,16 @@ impl IOClient {
         input: String,
         io_stats: Option<IOStatsRef>,
     ) -> Result<ObjectReadMetadata> {
-        let resolved = resolve_url_alias(&input, &self.config);
-        let (_, path) = parse_url(&resolved)?;
-        self.get_source(&resolved)
-            .await?
-            .get_read_metadata(path.as_ref(), io_stats)
-            .await
+        let trace = profile::begin(Phase::Io, "head", Some(&input));
+        profile::measure_future(trace, async {
+            let resolved = resolve_url_alias(&input, &self.config);
+            let (_, path) = parse_url(&resolved)?;
+            self.get_source(&resolved)
+                .await?
+                .get_read_metadata(path.as_ref(), io_stats)
+                .await
+        })
+        .await
     }
 
     pub async fn single_url_download(
@@ -763,22 +795,24 @@ static CLIENT_CACHE: LazyLock<std::sync::RwLock<HashMap<CacheKey, Arc<IOClient>>
     LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 
 pub fn get_io_client(multi_thread: bool, config: Arc<IOConfig>) -> DaftResult<Arc<IOClient>> {
-    let read_handle = CLIENT_CACHE.read().unwrap();
-    let key = (multi_thread, config.clone());
-    if let Some(client) = read_handle.get(&key) {
-        Ok(client.clone())
-    } else {
-        drop(read_handle);
-
-        let mut w_handle = CLIENT_CACHE.write().unwrap();
-        if let Some(client) = w_handle.get(&key) {
+    profile::measure(Phase::Io, "client_acquisition", None, || {
+        let read_handle = CLIENT_CACHE.read().unwrap();
+        let key = (multi_thread, config.clone());
+        if let Some(client) = read_handle.get(&key) {
             Ok(client.clone())
         } else {
-            let client = Arc::new(IOClient::new(config)?);
-            w_handle.insert(key, client.clone());
-            Ok(client)
+            drop(read_handle);
+
+            let mut w_handle = CLIENT_CACHE.write().unwrap();
+            if let Some(client) = w_handle.get(&key) {
+                Ok(client.clone())
+            } else {
+                let client = Arc::new(IOClient::new(config)?);
+                w_handle.insert(key, client.clone());
+                Ok(client)
+            }
         }
-    }
+    })
 }
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;

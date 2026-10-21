@@ -131,6 +131,8 @@ class NativeRunner(Runner[MicroPartition]):
     def _optimize_and_execute(
         self, builder: LogicalPlanBuilder, query_id: str, results_buffer_size: int | None = None
     ) -> Generator[LocalMaterializedResult, None, ExecutionMetadata]:
+        from daft.io import _vortex_diagnostics as diagnostics
+
         ctx = get_context()
 
         try:
@@ -138,31 +140,37 @@ class NativeRunner(Runner[MicroPartition]):
         except Exception as e:
             logger.warning("Failed to send optimization start notification: %s", e)
 
-        builder = builder.optimize(ctx.daft_execution_config)
+        with diagnostics.stage("logical_optimization"):
+            builder = builder.optimize(ctx.daft_execution_config)
 
         try:
             ctx._notify_optimization_end(query_id, builder.repr_json())
         except Exception as e:
             logger.warning("Failed to send optimization end notification: %s", e)
 
-        psets = {
-            k: [v.micropartition()._micropartition for v in v.values()]
-            for k, v in self._part_set_cache.get_all_partition_sets().items()
-        }
-        plan, inputs = LocalPhysicalPlan.from_logical_plan_builder(builder._builder, psets)
+        with diagnostics.stage("physical_planning"):
+            psets = {
+                k: [v.micropartition()._micropartition for v in v.values()]
+                for k, v in self._part_set_cache.get_all_partition_sets().items()
+            }
+            plan, inputs = LocalPhysicalPlan.from_logical_plan_builder(builder._builder, psets)
 
-        results_gen = self.native_executor.run(
-            plan,
-            inputs,
-            ctx,
-            {"query_id": query_id},
-            results_buffer_size=results_buffer_size,
-        )
+        with diagnostics.stage("executor_setup"):
+            results_gen = self.native_executor.run(
+                plan,
+                inputs,
+                ctx,
+                {"query_id": query_id},
+                results_buffer_size=results_buffer_size,
+            )
 
         try:
             while True:
-                result = next(results_gen)
-                yield result
+                with diagnostics.stage("executor_next"):
+                    result = next(results_gen)
+                # Suspension includes downstream consumption until this generator resumes.
+                with diagnostics.stage("consumer_wait"):
+                    yield result
         except GeneratorExit:
             # Generator was abandoned (e.g., .show() breaking out early after collecting
             # enough rows). Notify subscribers so the dashboard transitions out of Finalizing.
@@ -193,7 +201,8 @@ class NativeRunner(Runner[MicroPartition]):
             raise e
         finally:
             # Propagate abandonment explicitly through the async/native bridge.
-            results_gen.close()
+            with diagnostics.stage("runner_finalize"):
+                results_gen.close()
 
     def run_iter_tables(
         self, builder: LogicalPlanBuilder, results_buffer_size: int | None = None

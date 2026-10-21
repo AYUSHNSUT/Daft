@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 
 import pytest
@@ -14,10 +15,12 @@ def capture_backend(monkeypatch):
     calls = []
     monkeypatch.setattr(diagnostics, "_capture", None)
     monkeypatch.setattr(diagnostics._native, "_vortex_diagnostics_start", lambda: calls.append("start"), raising=False)
+    ticks = itertools.count(100, 10)
+    monkeypatch.setattr(diagnostics._native, "_vortex_diagnostics_clock", lambda: next(ticks), raising=False)
     monkeypatch.setattr(
         diagnostics._native,
         "_vortex_diagnostics_finish",
-        lambda: {"schema_version": 1, "events": [], "dropped_events": 0},
+        lambda: {"schema_version": 2, "events": [], "dropped_events": 0, "elapsed_ns": 10000},
         raising=False,
     )
     yield calls
@@ -40,9 +43,29 @@ def test_disabled_capture_does_not_read_clock_or_store_metrics(monkeypatch, capt
         raise AssertionError("Disabled capture performed event timing")
 
     monkeypatch.setattr(diagnostics.time, "perf_counter_ns", unexpected_clock)
+    monkeypatch.setattr(diagnostics._native, "_vortex_diagnostics_clock", unexpected_clock)
     with diagnostics.stage("discovery"):
         diagnostics.record_discovery({"head_requests": "not collected while disabled"}, token=None)
     assert capture_backend == []
+
+
+def test_python_events_use_native_clock_without_offset_estimates(capture_backend):
+    diagnostics.start()
+    with diagnostics.stage("query"), diagnostics.stage("logical_optimization"):
+        pass
+    result = diagnostics.finish()
+    assert result["clock"] == "native_monotonic"
+    assert result["clock_alignment"]["uncertainty_ns"] == 0
+    inner, outer = result["python"]["events"]
+    assert (inner["started_ns"], inner["duration_ns"]) == (110, 10)
+    assert (outer["started_ns"], outer["duration_ns"]) == (100, 30)
+
+
+def test_normal_iterator_completion_is_not_reported_as_error(capture_backend):
+    diagnostics.start()
+    with pytest.raises(StopIteration), diagnostics.stage("executor_next"):
+        next(iter(()))
+    assert diagnostics.finish()["python"]["events"][0]["error"] is False
 
 
 def test_capture_collects_counts_and_failure_without_url_or_exception_text(capture_backend):
@@ -52,9 +75,8 @@ def test_capture_collects_counts_and_failure_without_url_or_exception_text(captu
         {"num_inputs": 2, "head_requests": 2, "get_requests": 1, "bytes_read": 512, "uri": secret},
         token=diagnostics.capture_token(),
     )
-    with pytest.raises(OSError):
-        with diagnostics.stage("discovery"):
-            raise OSError(secret)
+    with pytest.raises(OSError), diagnostics.stage("discovery"):
+        raise OSError(secret)
     result = diagnostics.finish()
     assert result["python"]["discovery"] == {
         "bulk_calls": 1,

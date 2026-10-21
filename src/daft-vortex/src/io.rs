@@ -409,7 +409,11 @@ impl VortexReadAt for DaftReadAt {
         let cached_ranges = self.cached_ranges.clone();
         let capture = self.capture.clone();
         let phase = Phase::from_u8(self.diagnostic_phase.load(Ordering::Relaxed));
+        // Includes waiting in read_ranges' buffer_unordered before first poll.
+        // Semaphore wait alone cannot see this earlier driver-side queue.
+        let queued = diagnostics::begin(phase, "adapter_poll_queue", Some(&diagnostic_uri));
         async move {
+            diagnostics::complete(queued, false);
             let cached = cached_ranges.iter().find_map(|range| {
                 let start = usize::try_from(offset.checked_sub(range.offset)?).ok()?;
                 range.bytes.get(start..start.checked_add(length)?)
@@ -523,6 +527,7 @@ async fn collect_exact(
     stats: &IOStatsRef,
     uri: &str,
 ) -> VortexResult<ByteBuffer> {
+    diagnostics::measure_async(Phase::Io, "vortex_body_collect", Some(uri), async {
     match result {
         GetResult::File(file) => {
             // LocalSource returns a file descriptor rather than a counted
@@ -570,6 +575,8 @@ async fn collect_exact(
             Ok(buffer.freeze())
         }
     }
+
+    }).await
 }
 
 #[cfg(test)]

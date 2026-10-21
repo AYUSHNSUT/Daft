@@ -321,10 +321,11 @@ def worker(spec, *, prepared=False):
     cpu, began = time.process_time_ns(), time.perf_counter_ns()
     execution_error = None
     try:
-        with recorder.stage("source_creation") if recorder is not None else nullcontext():
-            frame = query(spec, manifest)
-        with recorder.stage("collection") if recorder is not None else nullcontext():
-            frame.collect()
+        with recorder.stage("query") if recorder is not None else nullcontext():
+            with recorder.stage("source_creation") if recorder is not None else nullcontext():
+                frame = query(spec, manifest)
+            with recorder.stage("collection") if recorder is not None else nullcontext():
+                frame.collect()
     except Exception as error:
         execution_error = error
     finally:
@@ -390,7 +391,7 @@ def worker(spec, *, prepared=False):
             diagnostics=trace,
             diagnostics_complete=complete,
             diagnostics_coverage=(
-                "source_creation_and_collection_only; native Parquet phases and request counters are not instrumented"
+                "Python source/runner and native Parquet/shared I/O events; physical retries unavailable"
                 if spec["configuration"]["reader"] == "parquet"
                 else "Python discovery/source/collection and native Vortex events; physical retries unavailable"
             ),
@@ -581,7 +582,7 @@ def markdown(report):
         "",
         "All samples and errors are retained. Ratios below one favor Vortex; ranges/paired counts are descriptive.",
         "Diagnostic captures are separate executed queries after performance trials, excluded from all timing summaries.",
-        "Parquet diagnostics cover outer source creation/collection only; absent internal-phase/request events are unavailable, not zero cost.",
+        "Parquet internal coverage depends on the native build; absent reader/request events are unavailable, not zero cost.",
         "Caches are retained; fresh processes do not establish cold-cache conditions. Source bytes exclude discovery/planning and are not physical traffic.",
         "CPU is a per-query client-process delta. RSS is a worker lifetime high-water; per-trial RSS is unavailable in persistent mode. MinIO/VM resources are excluded.",
         "Persistent mode retains clients/connections across warmups and measured rounds, with fresh sources and queries. Source creation remains timed.",

@@ -28,6 +28,8 @@ def get_tabular_files_scan(
     skip_glob: bool = False,
 ) -> LogicalPlanBuilder:
     """Returns a TabularFilesScan LogicalPlan for a given glob filepath."""
+    from daft.io import _vortex_diagnostics as diagnostics
+
     # Glob the path using the Runner
 
     if isinstance(path, list):
@@ -37,16 +39,17 @@ def get_tabular_files_scan(
     else:
         raise NotImplementedError(f"get_tabular_files_scan cannot construct ScanOperatorHandle for input: {path}")
 
-    scan_op = ScanOperatorHandle.glob_scan(
-        paths,
-        file_format_config,
-        storage_config,
-        infer_schema=infer_schema,
-        schema=_get_schema_from_dict(schema)._schema if schema is not None else None,
-        file_path_column=file_path_column,
-        hive_partitioning=hive_partitioning,
-        skip_glob=skip_glob,
-    )
+    with diagnostics.stage("source_discovery_and_schema"):
+        scan_op = ScanOperatorHandle.glob_scan(
+            paths,
+            file_format_config,
+            storage_config,
+            infer_schema=infer_schema,
+            schema=_get_schema_from_dict(schema)._schema if schema is not None else None,
+            file_path_column=file_path_column,
+            hive_partitioning=hive_partitioning,
+            skip_glob=skip_glob,
+        )
 
     builder = LogicalPlanBuilder.from_tabular_scan(
         scan_operator=scan_op,

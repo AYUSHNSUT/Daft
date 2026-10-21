@@ -1,7 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
-use common_runtime::get_io_runtime;
+use common_runtime::{
+    get_io_runtime,
+    query_profile::{self as profile, Phase},
+};
 use daft_core::datatypes::Field;
 use daft_io::{GetRange, IOClient, IOStatsRef};
 use snafu::ResultExt;
@@ -415,97 +418,102 @@ async fn fetch_parquet_footer_bytes(
     io_stats: Option<IOStatsRef>,
     default_footer_read_size: Option<usize>,
 ) -> super::Result<(Bytes, usize)> {
-    async fn fetch_data(
-        io_client: Arc<IOClient>,
-        uri: &str,
-        range: GetRange,
-        io_stats: Option<IOStatsRef>,
-    ) -> daft_io::Result<Bytes> {
-        io_client
-            .single_url_get(uri.into(), Some(range), io_stats)
-            .await?
-            .bytes()
-            .await
-    }
-
-    let file_size_opt: Option<usize> = if file_size.is_none() && !io_client.support_suffix_range() {
-        // suffix range unsupported, get object length for future I/O
-        let size = io_client
-            .single_url_get_size(uri.into(), io_stats.clone())
-            .await?;
-        Some(size)
-    } else {
-        file_size
-    };
-
-    // Check the minimum value of file size if provided
-    if let Some(size) = file_size_opt
-        && size < 12
-    {
-        return Err(Error::FileTooSmall {
-            path: uri.into(),
-            file_size: size,
-        });
-    }
-
-    /// The number of bytes read at the end of the parquet file on first read
-    const DEFAULT_FOOTER_READ_SIZE: usize = 128 * 1024;
-    let footer_read_size = default_footer_read_size
-        .unwrap_or(DEFAULT_FOOTER_READ_SIZE)
-        .max(FOOTER_SIZE);
-    let range = match file_size_opt {
-        None => GetRange::Suffix(footer_read_size),
-        Some(size) => {
-            let default_end_len = std::cmp::min(footer_read_size, size);
-            let start = size - default_end_len;
-            (start..size).into()
+    let trace = profile::begin(Phase::Parquet, "footer_read", Some(uri));
+    profile::measure_future(trace, async {
+        async fn fetch_data(
+            io_client: Arc<IOClient>,
+            uri: &str,
+            range: GetRange,
+            io_stats: Option<IOStatsRef>,
+        ) -> daft_io::Result<Bytes> {
+            io_client
+                .single_url_get(uri.into(), Some(range), io_stats)
+                .await?
+                .bytes()
+                .await
         }
-    };
-    let mut data = fetch_data(io_client.clone(), uri, range, io_stats.clone()).await?;
-    let buffer = data.as_ref();
-    validate_footer_magic(uri, buffer)?;
 
-    let metadata_size = i32::from_le_bytes(
-        buffer[buffer.len() - 8..buffer.len() - 4]
-            .try_into()
-            .unwrap(),
-    );
-    let footer_len = FOOTER_SIZE + metadata_size as usize;
-    if let Some(size) = file_size_opt
-        && size < footer_len
-    {
-        return Err(Error::InvalidParquetFooterSize {
-            path: uri.into(),
-            footer_size: footer_len,
-            file_size: size,
-        });
-    }
+        let file_size_opt: Option<usize> =
+            if file_size.is_none() && !io_client.support_suffix_range() {
+                // suffix range unsupported, get object length for future I/O
+                let size = io_client
+                    .single_url_get_size(uri.into(), io_stats.clone())
+                    .await?;
+                Some(size)
+            } else {
+                file_size
+            };
 
-    let remaining = if footer_len <= buffer.len() {
-        // the whole metadata is in the bytes we already read
-        buffer.len() - footer_len
-    } else {
-        // the end of file read by default is not long enough, read more bytes of metadata.
-        data = match file_size_opt {
-            None => fetch_data(io_client, uri, GetRange::Suffix(footer_len), io_stats).await?,
+        // Check the minimum value of file size if provided
+        if let Some(size) = file_size_opt
+            && size < 12
+        {
+            return Err(Error::FileTooSmall {
+                path: uri.into(),
+                file_size: size,
+            });
+        }
+
+        /// The number of bytes read at the end of the parquet file on first read
+        const DEFAULT_FOOTER_READ_SIZE: usize = 128 * 1024;
+        let footer_read_size = default_footer_read_size
+            .unwrap_or(DEFAULT_FOOTER_READ_SIZE)
+            .max(FOOTER_SIZE);
+        let range = match file_size_opt {
+            None => GetRange::Suffix(footer_read_size),
             Some(size) => {
-                let range =
-                    (size.saturating_sub(footer_len)..size.saturating_sub(buffer.len())).into();
-                let new_data = fetch_data(io_client, uri, range, io_stats).await?;
-
-                let mut buffer = BytesMut::with_capacity(new_data.len() + data.len());
-                buffer.extend_from_slice(&new_data);
-                buffer.extend_from_slice(&data);
-                buffer.freeze()
+                let default_end_len = std::cmp::min(footer_read_size, size);
+                let start = size - default_end_len;
+                (start..size).into()
             }
         };
-        0
-    };
+        let mut data = fetch_data(io_client.clone(), uri, range, io_stats.clone()).await?;
+        let buffer = data.as_ref();
+        validate_footer_magic(uri, buffer)?;
 
-    let buffer = data.as_ref();
-    validate_footer_magic(uri, buffer)?;
+        let metadata_size = i32::from_le_bytes(
+            buffer[buffer.len() - 8..buffer.len() - 4]
+                .try_into()
+                .unwrap(),
+        );
+        let footer_len = FOOTER_SIZE + metadata_size as usize;
+        if let Some(size) = file_size_opt
+            && size < footer_len
+        {
+            return Err(Error::InvalidParquetFooterSize {
+                path: uri.into(),
+                footer_size: footer_len,
+                file_size: size,
+            });
+        }
 
-    Ok((data, remaining))
+        let remaining = if footer_len <= buffer.len() {
+            // the whole metadata is in the bytes we already read
+            buffer.len() - footer_len
+        } else {
+            // the end of file read by default is not long enough, read more bytes of metadata.
+            data = match file_size_opt {
+                None => fetch_data(io_client, uri, GetRange::Suffix(footer_len), io_stats).await?,
+                Some(size) => {
+                    let range =
+                        (size.saturating_sub(footer_len)..size.saturating_sub(buffer.len())).into();
+                    let new_data = fetch_data(io_client, uri, range, io_stats).await?;
+
+                    let mut buffer = BytesMut::with_capacity(new_data.len() + data.len());
+                    buffer.extend_from_slice(&new_data);
+                    buffer.extend_from_slice(&data);
+                    buffer.freeze()
+                }
+            };
+            0
+        };
+
+        let buffer = data.as_ref();
+        validate_footer_magic(uri, buffer)?;
+
+        Ok((data, remaining))
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -523,34 +531,42 @@ pub(crate) async fn read_parquet_metadata(
     field_id_mapping: Option<Arc<BTreeMap<i32, Field>>>,
     default_footer_read_size: Option<usize>,
 ) -> super::Result<Arc<parquet::file::metadata::ParquetMetaData>> {
-    let (data, remaining) = fetch_parquet_footer_bytes(
-        uri,
-        file_size,
-        io_client,
-        io_stats,
-        default_footer_read_size,
-    )
-    .await?;
+    let trace = profile::begin(Phase::Parquet, "metadata_read", Some(uri));
+    profile::measure_future(trace, async {
+        let (data, remaining) = fetch_parquet_footer_bytes(
+            uri,
+            file_size,
+            io_client,
+            io_stats,
+            default_footer_read_size,
+        )
+        .await?;
 
-    let metadata = get_io_runtime(true)
-        .spawn_blocking(move || {
-            let thrift_bytes = &data.as_ref()[remaining..data.len() - FOOTER_SIZE];
-            parquet::file::metadata::ParquetMetaDataReader::decode_metadata(thrift_bytes)
-        })
-        .await
-        .map_err(task_err(uri))?
-        .map_err(|e| Error::ParquetMetadata {
-            path: uri.to_string(),
-            source: e,
-        })?;
+        let queued = profile::begin(Phase::Parquet, "metadata_decode_queue", Some(uri));
+        let metadata = get_io_runtime(true)
+            .spawn_blocking(move || {
+                profile::complete(queued, false);
+                let thrift_bytes = &data.as_ref()[remaining..data.len() - FOOTER_SIZE];
+                profile::measure(Phase::Parquet, "metadata_decode", None, || {
+                    parquet::file::metadata::ParquetMetaDataReader::decode_metadata(thrift_bytes)
+                })
+            })
+            .await
+            .map_err(task_err(uri))?
+            .map_err(|e| Error::ParquetMetadata {
+                path: uri.to_string(),
+                source: e,
+            })?;
 
-    let metadata = Arc::new(metadata);
+        let metadata = Arc::new(metadata);
 
-    if let Some(field_id_mapping) = field_id_mapping {
-        apply_field_ids_to_arrowrs_parquet_metadata(metadata, field_id_mapping.as_ref(), uri)
-    } else {
-        Ok(metadata)
-    }
+        if let Some(field_id_mapping) = field_id_mapping {
+            apply_field_ids_to_arrowrs_parquet_metadata(metadata, field_id_mapping.as_ref(), uri)
+        } else {
+            Ok(metadata)
+        }
+    })
+    .await
 }
 
 #[cfg(test)]

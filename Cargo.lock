@@ -2176,6 +2176,7 @@ dependencies = [
  "futures",
  "log",
  "oneshot",
+ "pin-project-lite",
  "pyo3",
  "pyo3-async-runtimes",
  "rand 0.9.2",

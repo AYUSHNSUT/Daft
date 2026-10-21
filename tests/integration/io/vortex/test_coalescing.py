@@ -155,7 +155,15 @@ def test_vortex_delayed_http_coalescing_preserves_rows_and_bounds_real_ranges(co
             capture = diagnostics.finish()
         assert result == expected
         native_capture = capture["native"]
-        assert native_capture["file_count"] == 1
+        # The shared collector also sees discovery inputs and normalized I/O URIs.
+        # Count reader identities rather than aliases observed by other layers.
+        reader_files = {
+            event["file_id"]
+            for event in native_capture["events"]
+            if event["phase"] in {"schema", "planning_metadata", "execution_open", "data", "execution"}
+            and event["file_id"] is not None
+        }
+        assert len(reader_files) == 1
         assert native_capture["dropped_events"] == native_capture["unfinished_events"] == 0
         assert capture["python"]["dropped_events"] == 0
         events = native_capture["events"]
