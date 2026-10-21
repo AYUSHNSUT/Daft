@@ -137,7 +137,7 @@ def test_original_performance_thresholds_are_preserved(stage, ratio, expected):
 
 def release_report():
     configs = phase8.configurations()
-    pairs = phase8.comparisons(["combined", "parquet"])
+    pairs = phase8.comparisons(["aa", "sessions", "combined", "parquet"])
     cases, datasets, rounds = list(phase8.QUERY_CASES), ["sorted/multi"], 20
     trials = phase7.schedule(cases, datasets, pairs, 1, rounds, 11)
     for trial in trials:
@@ -172,10 +172,32 @@ def release_report():
     }
 
 
+def test_diagnosis_retains_comparison_order_after_sorted_json_roundtrip():
+    report = release_report()
+    original_order = list(report["settings"]["comparisons"])
+    saved = json.loads(json.dumps(report, sort_keys=True))
+    assert list(saved["settings"]["comparisons"]) != original_order
+    phase8.validate_diagnosis(saved)
+
+
+def test_diagnosis_rejects_duplicate_comparison_order():
+    report = release_report()
+    report["summary"][1] = copy.deepcopy(report["summary"][0])
+    with pytest.raises(ValueError, match="exactly once"):
+        phase8.validate_diagnosis(report)
+
+
+def test_diagnosis_rejects_summary_order_that_differs_from_raw_schedule():
+    report = release_report()
+    report["summary"][:2] = reversed(report["summary"][:2])
+    with pytest.raises(ValueError, match="schedule"):
+        phase8.validate_diagnosis(report)
+
+
 def test_frozen_candidate_loads_exact_options_and_rejects_modified_evidence(tmp_path):
     report = release_report()
     path, selected = tmp_path / "report.json", tmp_path / "selection.json"
-    path.write_text(json.dumps(report))
+    path.write_text(json.dumps(report, sort_keys=True))
     phase8.freeze(path, "combined", selected)
     provenance = report["environment"]
     assert (

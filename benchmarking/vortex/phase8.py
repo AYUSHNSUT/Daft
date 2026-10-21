@@ -176,10 +176,20 @@ def validate_diagnosis(report):
         600,
         False,
     )
+    # JSON reports sort object keys, while the summary list retains the exact
+    # comparison order used to generate the seeded trial schedule.
+    comparison_order = [
+        row["comparison"]
+        for row in report["summary"]
+        if (row["dataset"], row["case"]) == (settings["datasets"][0], settings["cases"][0])
+    ]
+    if len(comparison_order) != len(settings["comparisons"]) or set(comparison_order) != set(settings["comparisons"]):
+        raise ValueError("Diagnosis summary must retain every scheduled comparison exactly once")
+    pairs = {name: settings["comparisons"][name] for name in comparison_order}
     jobs = phase7.schedule(
         settings["cases"],
         settings["datasets"],
-        settings["comparisons"],
+        pairs,
         settings["warmups"],
         settings["rounds"],
         settings["seed"],
@@ -193,9 +203,7 @@ def validate_diagnosis(report):
         for trial, job in zip(report["trials"], jobs)
     ):
         raise ValueError("Diagnosis trials/configurations differ from the complete frozen schedule")
-    recomputed = phase7.summarize(
-        report["trials"], settings["cases"], settings["datasets"], settings["comparisons"], settings["rounds"]
-    )
+    recomputed = phase7.summarize(report["trials"], settings["cases"], settings["datasets"], pairs, settings["rounds"])
     if recomputed != report["summary"] or any(row["status"] != "passed" for row in recomputed):
         raise ValueError("Diagnosis summary must match complete paired raw trials")
 
