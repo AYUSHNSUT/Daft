@@ -5,6 +5,9 @@ native readers in the personal Daft fork. Results are organized by workload,
 storage and execution settings. All ratios compare Parquet with Vortex in the
 same measured build.
 
+The [performance worklist](vortex-performance-worklist.md) tracks the next
+investigations and proposed improvements separately from measured results.
+
 **Speed ratio = Parquet median query time / Vortex median query time.** Above
 1 favors Vortex; below 1 favors Parquet. For example, 2.0× means Vortex takes
 half the time. Ratios are calculated before rounding the displayed times.
