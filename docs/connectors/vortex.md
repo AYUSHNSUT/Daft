@@ -79,7 +79,8 @@ does not provide snapshot isolation.
 
 The metadata follow-up branch adds `enable_metadata_reuse=True` as an opt-in S3
 experiment. Planning records bounded encoded opening ranges in each file task,
-with a 64 MiB limit across the materialization. Execution checks a fresh size,
+with a 64 MiB limit per source materialization. Separate sources have separate
+budgets. Execution checks a fresh size,
 strong ETag and optional version ID before using those bytes. Uncached range
 requests retain the same identity conditions, including retries. Changed objects
 fail explicitly. Sources without usable validators, and HTTP/local sources,

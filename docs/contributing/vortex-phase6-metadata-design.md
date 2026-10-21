@@ -19,8 +19,10 @@ Arrow arrays.
 The recorded ranges preserve Vortex's normal initial footer buffer, including
 encoded segments that happen to be in that buffer. Reusing only a parsed footer
 would discard those prefetched segments and could introduce new data requests.
-Retained serialized snapshots are limited to 64 MiB across one materialization;
-files outside the remaining budget use their normal fresh-open path.
+Retained serialized snapshots are limited to 64 MiB across one Vortex source
+materialization; files outside the remaining budget use their normal fresh-open
+path. Separate sources have separate budgets, so this is not a query-wide
+memory limit.
 
 Execution performs a fresh metadata request before using any saved bytes. The
 URI, object size, ETag and version ID must match. A changed or unavailable
